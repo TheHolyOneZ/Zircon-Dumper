@@ -183,7 +183,7 @@ public:
                            has_full_memory_ ? "" : " (NOT a full-memory dump)");
     }
 
-    // --- parsing ------------------------------------------------------------------
+    // --- parssing ------------------------------------------------------------------
 
     bool Parse(std::string& error) {
         std::uint32_t signature{}, version{}, stream_count{}, directory_rva{};

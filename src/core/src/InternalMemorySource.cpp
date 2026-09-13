@@ -51,6 +51,11 @@ public:
         return ReadPageWise(addr, out, size);
     }
 
+    bool EnableWrites(bool enable) override {
+        writes_enabled_ = enable;
+        return writes_enabled_;
+    }
+
     bool Write(Address addr, const void* in, std::size_t size) override {
         if (!writes_enabled_ || IsNull(addr)) return false;
 

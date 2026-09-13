@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.1.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.2.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # It matters more for the payload than for the shells: an injected DLL that imports
 # MSVCP140.dll lands in a process that may already have a different version of it loaded,
 # and the game owns that decision. Carrying our own removes the question.
+# One version, taken from project() above and handed to everything that prints one: the
+# CLI, the dump header, and the VERSIONINFO block in the .rc files.
+#
+# It was written out by hand three times before. Two of them were fixed and the third, the
+# .rc, was missed, which is how the dump header announced 0.1.0 for the whole of 0.2.0.
+# Nothing compares them, so nothing catches it.
+#
+# A release build drops the -dev suffix: cmake -B build -DZIRCON_RELEASE=ON
+option(ZIRCON_RELEASE "Build as a release: drop the -dev suffix from the version" OFF)
+if(ZIRCON_RELEASE)
+  set(ZIRCON_VERSION_STRING "${PROJECT_VERSION}")
+else()
+  set(ZIRCON_VERSION_STRING "${PROJECT_VERSION}-dev")
+endif()
+
+add_compile_definitions(
+  ZIRCON_VERSION="${ZIRCON_VERSION_STRING}"
+  ZIRCON_VER_MAJOR=${PROJECT_VERSION_MAJOR}
+  ZIRCON_VER_MINOR=${PROJECT_VERSION_MINOR}
+  ZIRCON_VER_PATCH=${PROJECT_VERSION_PATCH}
+)
+message(STATUS "Zircon version: ${ZIRCON_VERSION_STRING}")
+
 option(ZIRCON_STATIC_CRT "Link the MSVC runtime statically" ON)
 if(MSVC AND ZIRCON_STATIC_CRT)
   cmake_policy(SET CMP0091 NEW)
@@ -86,6 +109,8 @@ add_library(zircon_engine STATIC
   src/engine/src/EnumLayout.cpp
   src/engine/src/Kismet.cpp
   src/engine/src/ValueReader.cpp
+  src/engine/src/ValueWriter.cpp
+  src/engine/src/ProcessEvent.cpp
   src/engine/src/DumpBuilder.cpp
 )
 target_include_directories(zircon_engine PUBLIC src/engine/include)
@@ -314,4 +339,9 @@ if(ZIRCON_BUILD_TESTS)
   target_link_libraries(zircon_kismet_tests PRIVATE zircon_engine)
   set_target_properties(zircon_kismet_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
   add_test(NAME kismet COMMAND zircon_kismet_tests)
+
+  add_executable(zircon_write_tests tests/test_write.cpp)
+  target_link_libraries(zircon_write_tests PRIVATE zircon_engine)
+  set_target_properties(zircon_write_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
+  add_test(NAME write COMMAND zircon_write_tests)
 endif()

@@ -18,6 +18,8 @@
 #include "core/MemorySource.h"
 #include "emit/Emitter.h"
 #include "engine/DumpBuilder.h"
+#include "engine/ProcessEvent.h"
+#include "engine/StructLayout.h"
 #include "engine/UnrealDetect.h"
 #include "ir/Json.h"
 
@@ -31,6 +33,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -104,6 +107,12 @@ void RunDump(const engine::Reflection& reflection, const std::filesystem::path& 
     }
 }
 
+// Held for the lifetime of the payload: a generated SDK may call in at any point while
+// the browser is open.
+std::unique_ptr<core::IMemorySource> g_memory;
+engine::Reflection                   g_reflection;
+engine::ProcessEventInfo             g_process_event;
+
 DWORD WINAPI PayloadThread(LPVOID) {
     OpenConsole();
     core::SetLogLevel(core::LogLevel::Debug);
@@ -150,23 +159,83 @@ DWORD WINAPI PayloadThread(LPVOID) {
     const auto out = OutputDirectory();
     core::LogInfo("output directory: {}", out.string());
 
+    // From here the log is also written to a file, because the console is not somewhere a
+    // game leaves readable.
+    std::string log_error;
+    if (emit::util::EnsureDirectory(out.string(), log_error))
+        core::SetLogFile((out / "zircon.log").string());
+
+    // Before the dump, so the slot lands in the header the SDK is generated from. Finding
+    // it calls through vtable slots that are not it, and those calls usually cost the game
+    // a few seconds later, so it is opt-in: a marker file beside the DLL is a deliberate
+    // act in a way a default is not.
+    if (std::filesystem::exists(out.parent_path() / "zircon-find-processevent")) {
+        core::LogWarn("probing for ProcessEvent; this calls unknown virtuals and the game "
+                      "will probably not survive it");
+        g_process_event = engine::DeriveProcessEvent(reflection.Context(),
+                                                     reflection.class_layout);
+        if (g_process_event.Valid()) {
+            reflection.process_event_index = g_process_event.vtable_index;
+            core::LogInfo("baking ProcessEvent slot {} into the dump",
+                          g_process_event.vtable_index);
+        }
+    } else {
+        core::LogInfo("ProcessEvent probing is off; create 'zircon-find-processevent' "
+                      "beside the DLL to enable it");
+    }
+
     RunDump(reflection, out);
+
+    // Published before the browser opens, so an SDK compiled from this dump can bind as
+    // soon as the payload is in.
+    g_reflection        = reflection;
+    g_memory            = std::move(memory);
+    g_reflection.memory = g_memory.get();
+    core::LogInfo("zircon_find_object exported for a generated SDK");
+
+
 
 #if ZIRCON_WITH_GUI
     // Browser takes over from here, in its own window.
     core::LogInfo("opening the live browser; close its window to unload");
-    gui::RunBrowserWindow(std::move(memory), reflection);
+    gui::RunBrowserWindow(std::move(g_memory), g_reflection);
 #else
     core::LogInfo("press END in the game window to unload");
     while ((::GetAsyncKeyState(VK_END) & 1) == 0) ::Sleep(50);
 #endif
 
     core::LogInfo("unloading");
+    core::CloseLogFile();
     CloseConsole();
     ::FreeLibraryAndExitThread(g_self, 0);
 }
 
 } // namespace
+
+// Half of what a generated SDK needs, and the half that can be answered honestly.
+//
+// A wrapper has to turn "/Script/Engine.PawnMovementComponent.GetPawnOwner" into a
+// UFunction pointer. That is an object-path lookup, which is the walk this payload has
+// already done, so the SDK needs neither StaticFindObject nor us to go find it.
+//
+// The other half is UObject::ProcessEvent, a virtual whose vtable index the reflection
+// data does not record. It stays the caller's one line. Guessing an index would be an
+// unverifiable answer, and a wrong one calls something arbitrary on a live object.
+// The vtable slot UObject::ProcessEvent occupies, or -1 when it was never looked for.
+// A generated SDK can turn that into its ProcessEvent hook without knowing the engine
+// version.
+extern "C" __declspec(dllexport) int zircon_process_event_index() {
+    return g_process_event.vtable_index;
+}
+
+extern "C" __declspec(dllexport) void* zircon_find_object(const char* full_path) {
+    if (!full_path || !g_memory || !g_reflection.Valid()) return nullptr;
+
+    const auto object = engine::FindObjectByPath(*g_memory, g_reflection.array,
+                                                 g_reflection.object_layout,
+                                                 g_reflection.pool, full_path);
+    return core::IsNull(object) ? nullptr : reinterpret_cast<void*>(core::Raw(object));
+}
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;

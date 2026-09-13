@@ -16,6 +16,7 @@
 #include "engine/FunctionLayout.h"
 #include "engine/Kismet.h"
 #include "engine/ValueReader.h"
+#include "engine/ValueWriter.h"
 #include "engine/TypeResolver.h"
 #include "engine/UnrealDetect.h"
 #include "diff/Diff.h"
@@ -49,7 +50,7 @@ using namespace zircon::core::term;
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0-dev";
+constexpr const char* kVersion = ZIRCON_VERSION;
 
 struct TargetSpec {
     enum class Kind { None, Internal, Pid, ProcessName, DumpFile, StaticFile } kind{Kind::None};
@@ -138,6 +139,8 @@ void PrintUsage() {
     std::printf("  %sfunctions%s     List UFunctions with signatures\n", c.data(), r.data());
     std::printf("  %sscript%s        Decompile Kismet bytecode to pseudo-code\n", c.data(), r.data());
     std::printf("  %sread%s          Read live property values of one object\n", c.data(), r.data());
+    std::printf("  %swrite%s         Write one property of one object (--set Name=Value)\n", c.data(), r.data());
+    std::printf("  %sfind%s          Find objects by what they hold (--where Health<50)\n", c.data(), r.data());
     std::printf("  %sinspect%s       Annotated hexdump of one object (path, #slot or @address)\n", c.data(), r.data());
     std::printf("  %sscan%s          Pattern-scan the target\n\n", c.data(), r.data());
 
@@ -173,6 +176,8 @@ void PrintUsage() {
                 "      --plugins <d>  Load emitter plugins from a directory (repeatable)\n"
                 "      --allow-partial  Let emitters run on a partial dump\n"
                 "      --style <s>    diff output: text (default), json, markdown\n"
+                "      --set <N=V>    write: the property and value, e.g. MaxWalkSpeed=1337\n"
+                "      --where <cond> find: Name<op>Value, ops = != < > <= >=\n"
                 "      --breaking     diff: only changes that break existing code\n"
                 "  -v, --verbose      Debug logging (repeat for trace)\n"
                 "      --color/--no-color  Force colour on or off (also honours NO_COLOR)\n"
@@ -1102,6 +1107,237 @@ int CommandRead(const TargetSpec& spec, std::string_view path, int limit) {
     return 0;
 }
 
+// Writes one property of one object. The counterpart of `read`, and deliberately narrow:
+// it takes a single Name=Value, resolves the same way `read` does, and reports what the
+// value was before so a mistake can be undone by hand.
+int CommandWrite(const TargetSpec& spec, std::string_view path, std::string_view assignment) {
+    if (path.empty() || assignment.empty()) {
+        LogError("write needs an object and an assignment, e.g. "
+                 "zircon write --pid 1234 -f /Script/Engine.CharacterMovementComponent "
+                 "--set MaxWalkSpeed=1337");
+        return 1;
+    }
+
+    const auto equals = assignment.find('=');
+    if (equals == std::string_view::npos) {
+        LogError("--set takes Name=Value, e.g. --set MaxWalkSpeed=1337");
+        return 1;
+    }
+
+    const auto wanted_name = assignment.substr(0, equals);
+    const auto wanted_value = assignment.substr(equals + 1);
+    if (wanted_name.empty()) {
+        LogError("--set is missing a property name");
+        return 1;
+    }
+
+    auto session = OpenSession(spec, true);
+    if (!session) return 4;
+
+    // Writing is opt-in at the provider, the same as it is in the browser. Reaching this
+    // command is the opt-in; a session that only reads never asks for the handle.
+    if (!session->memory->EnableWrites(true)) {
+        LogError("this target cannot be opened for writing");
+        return 4;
+    }
+
+    const auto object = zircon::engine::FindObjectByPath(
+        *session->memory, session->array, session->layout, session->pool, path);
+    if (IsNull(object)) {
+        LogError("no object with path '{}'", path);
+        return 3;
+    }
+
+    // Same rule as `read`: naming a class means its defaults, since a class read as an
+    // instance shows the few members UClass itself declares.
+    auto instance = object;
+    if (zircon::engine::ClassifyObject(*session->memory, session->layout, session->structs,
+                                       session->pool, object) ==
+        zircon::engine::ObjectKind::Class) {
+        const auto cdo = zircon::engine::GetClassDefaultObject(*session->memory,
+                                                               session->classes, object);
+        if (IsNull(cdo)) {
+            LogError("{} has no class default object; nothing to write", path);
+            return 3;
+        }
+        instance = cdo;
+    }
+
+    auto context = session->Context();
+
+    // Walk the class chain so an inherited property can be named without qualifying it.
+    const auto klass = zircon::engine::GetObjectClass(*session->memory, session->layout, instance);
+    for (auto current = klass; !IsNull(current);
+         current = zircon::engine::GetSuperStruct(*session->memory, session->structs, current)) {
+
+        for (const auto field : zircon::engine::GetChildProperties(
+                 *session->memory, session->structs, session->props, current)) {
+
+            const std::string name = zircon::engine::GetFieldName(
+                *session->memory, session->props, session->pool, field);
+            if (name != wanted_name) continue;
+
+            const std::string before =
+                zircon::engine::ReadPropertyValue(context, instance, field);
+
+            const auto result =
+                zircon::engine::WritePropertyValue(context, instance, field, wanted_value);
+            if (!result.ok) {
+                LogError("{}: {}", name, result.error);
+                return 5;
+            }
+
+            const std::string after =
+                zircon::engine::ReadPropertyValue(context, instance, field);
+
+            Field("object", path);
+            Field("property", name);
+            Field("was", before);
+            FieldStrong("now", after);
+
+            // The engine may own this field and put it back on the next tick. Saying so
+            // beats leaving someone to wonder why the change did not take.
+            if (after != result.written)
+                LogWarn("reads back as {}, not {}; the game may own this field",
+                        after, result.written);
+            return 0;
+        }
+    }
+
+    LogError("{} has no property named '{}'", path, wanted_name);
+    return 3;
+}
+
+// Finds objects by what they hold, not by what they are called.
+//
+// "every Actor whose Health is under 50" is the question a dumper usually cannot answer:
+// the dump says where Health lives, and finding the ones that matter means reading it
+// across every instance. That is one pass over the object array, which the walker already
+// does for everything else.
+int CommandFind(const TargetSpec& spec, std::string_view class_filter,
+                std::string_view predicate, int limit) {
+    if (predicate.empty()) {
+        LogError("find needs a condition, e.g. "
+                 "zircon find --pid 1234 --where MaxWalkSpeed=600 [-f PartialClassName]");
+        return 1;
+    }
+
+    // Longest operator first, or "<=" is read as "<".
+    static constexpr std::string_view kOperators[] = {">=", "<=", "!=", "=", ">", "<"};
+
+    std::string_view op;
+    std::size_t at = std::string_view::npos;
+    for (const auto candidate : kOperators) {
+        const auto found = predicate.find(candidate);
+        if (found == std::string_view::npos) continue;
+        if (at == std::string_view::npos || found < at) { at = found; op = candidate; }
+    }
+    if (at == std::string_view::npos) {
+        LogError("--where takes Name<op>Value, e.g. Health<50 or MovementMode=MOVE_Falling");
+        return 1;
+    }
+
+    const std::string wanted_property{predicate.substr(0, at)};
+    const std::string wanted_value{predicate.substr(at + op.size())};
+    if (wanted_property.empty()) {
+        LogError("--where is missing a property name");
+        return 1;
+    }
+
+    auto session = OpenSession(spec, true);
+    if (!session) return 4;
+
+    auto context = session->Context();
+
+    // Numeric comparisons need a number. Anything else falls back to comparing the text
+    // the reader produced, which is what makes MovementMode=MOVE_Falling work.
+    double wanted_number = 0.0;
+    const bool numeric = [&] {
+        const auto* end = wanted_value.data() + wanted_value.size();
+        const auto result = std::from_chars(wanted_value.data(), end, wanted_number);
+        return result.ec == std::errc{} && result.ptr == end;
+    }();
+
+    if (!numeric && op != "=" && op != "!=") {
+        LogError("'{}' is not a number, so it can only be compared with = or !=",
+                 wanted_value);
+        return 1;
+    }
+
+    Heading(std::format("{:<58} {:<22} {}", "OBJECT", "PROPERTY", "VALUE"));
+
+    int matched = 0;
+    int scanned = 0;
+    for (std::int32_t i = 0; i < session->array.num_elements; ++i) {
+        if (limit > 0 && matched >= limit) break;
+
+        const auto object = zircon::engine::ObjectAt(*session->memory, session->array, i);
+        if (IsNull(object)) continue;
+
+        const auto klass = zircon::engine::GetObjectClass(*session->memory,
+                                                          session->layout, object);
+        if (IsNull(klass)) continue;
+
+        const std::string class_path = zircon::engine::GetObjectPathName(
+            *session->memory, session->layout, session->pool, klass);
+        if (!class_filter.empty() && class_path.find(class_filter) == std::string::npos)
+            continue;
+
+        // Walk the chain so an inherited property counts, the same as `read` and `write`.
+        for (auto current = klass; !IsNull(current);
+             current = zircon::engine::GetSuperStruct(*session->memory, session->structs,
+                                                      current)) {
+
+            bool done = false;
+            for (const auto field : zircon::engine::GetChildProperties(
+                     *session->memory, session->structs, session->props, current)) {
+
+                if (zircon::engine::GetFieldName(*session->memory, session->props,
+                                                 session->pool, field) != wanted_property)
+                    continue;
+
+                ++scanned;
+                done = true;
+
+                const std::string value =
+                    zircon::engine::ReadPropertyValue(context, object, field);
+
+                bool hit = false;
+                if (numeric) {
+                    double actual = 0.0;
+                    const auto* end = value.data() + value.size();
+                    const auto parsed = std::from_chars(value.data(), end, actual);
+                    if (parsed.ec == std::errc{} && parsed.ptr == end) {
+                        if      (op == "=")  hit = actual == wanted_number;
+                        else if (op == "!=") hit = actual != wanted_number;
+                        else if (op == ">")  hit = actual >  wanted_number;
+                        else if (op == "<")  hit = actual <  wanted_number;
+                        else if (op == ">=") hit = actual >= wanted_number;
+                        else if (op == "<=") hit = actual <= wanted_number;
+                    }
+                } else {
+                    hit = (op == "=") ? value == wanted_value : value != wanted_value;
+                }
+
+                if (hit) {
+                    const std::string path = zircon::engine::GetObjectPathName(
+                        *session->memory, session->layout, session->pool, object);
+                    std::printf("%-58s %-22s %s\n", path.c_str(), wanted_property.c_str(),
+                                value.c_str());
+                    ++matched;
+                }
+                break;
+            }
+            if (done) break;
+        }
+    }
+
+    std::fprintf(stderr, "\n%d match%s from %d object%s carrying '%s'\n",
+                 matched, matched == 1 ? "" : "es", scanned, scanned == 1 ? "" : "s",
+                 wanted_property.c_str());
+    return matched > 0 ? 0 : 3;
+}
+
 int CommandScript(const TargetSpec& spec, std::string_view filter, int limit) {
     auto session = OpenSession(spec, true);
     if (!session) return 4;
@@ -1454,6 +1690,8 @@ int main(int argc, char** argv) {
     std::string pattern_text;
     std::string scan_module;
     std::string name_filter;
+    std::string assignment;
+    std::string predicate;
     std::string out_path;
     std::string validate_path;
     std::string emit_format;
@@ -1523,6 +1761,14 @@ int main(int argc, char** argv) {
         } else if (arg == "--color" || arg == "--colour" ||
                    arg == "--no-color" || arg == "--no-colour") {
             // Already applied before parsing; accepted here so it is not "unknown".
+        } else if (arg == "--where") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            predicate = *value;
+        } else if (arg == "--set") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            assignment = *value;
         } else if (arg == "--all-regions") {
             all_regions = true;
         } else if (arg == "-v" || arg == "--verbose") {
@@ -1594,6 +1840,8 @@ int main(int argc, char** argv) {
     if (command == "functions")   return CommandFunctions(spec, name_filter, limit);
     if (command == "script")      return CommandScript(spec, name_filter, limit);
     if (command == "read")        return CommandRead(spec, name_filter, limit);
+    if (command == "write")       return CommandWrite(spec, name_filter, assignment);
+    if (command == "find")        return CommandFind(spec, name_filter, predicate, limit);
     if (command == "dump")        return CommandDump(spec, out_path, name_filter, with_names,
                                                      with_script, with_defaults);
     if (command == "validate")    return CommandValidate(validate_path);

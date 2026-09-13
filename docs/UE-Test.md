@@ -44,6 +44,7 @@ a claim that output was produced.
 | **Pseudoregalia** | **5.1** | **L5** | version corroborated by its own modding toolchain |
 | **Peepo Island** | **5.0** | **L5** | needed the Offset_Internal threshold fix |
 | **Mizeria** | **5.2** | **L5** | almost pure C++; no Blueprint script to decompile |
+| **Ready Or Not** | **5.3** | **L5** | no version string; pins where FProperty moved |
 | **Dark Pals: The 1st Floor** | **5.5** | **L5** | brackets the FProperty change from below |
 | **Funnel Runners** | **5.6** | **L5** | the original reference |
 | **Subnautica 2** | **5.6-era** | **L4** | licensee-branded; largest target. L5 is not reachable on it — see below |
@@ -57,10 +58,13 @@ a claim that output was produced.
 | Little Nightmares III | 4.27 | L0 | launcher exe separate from shipping exe |
 | Ready Or Not | 4.27 / 5.x | L0 | no version string |
 
-**Fifteen targets verified, UE 4.22 through UE 5.7 — every engine era Zircon claims to
-support, every one implemented, and no known gap left. Fourteen reach full provider
-agreement; the fifteenth is the one target where L5 cannot mean anything, for reasons that
-are the game's and not the tool's.**
+**Sixteen targets verified, UE 4.22 through UE 5.7 — every engine era Zircon claims to
+support, every one implemented. Fifteen reach full provider agreement; the sixteenth is the
+one target where L5 cannot mean anything, for reasons that are the game's and not the
+tool's.**
+
+Only UE 5.4 has never been run, and it is now bracketed by 5.3 and 5.5 rather than by 5.2
+and 5.5.
 
 ### Measured
 
@@ -74,6 +78,7 @@ Pseudoregalia   5.1       n/a     23372        233       26933       0    100.00
 Subnautica 2    5.6e      n/a     96115       3451      110426       0    100.00%
 Backrooms       5.7       55986   48525        516       58984       0    100.00%
 Motorslice      5.7       64787   42383        631       49377       0    100.00%
+Ready Or Not    5.3      201090   49946       259       45832       0    100.00%
 Dark Pals       5.5       40619   32596        388       38924       0    100.00%
 Mizeria         5.2       n/a     23268        143       27144       0    (no script)
 Funnel Runners  5.6       72562   48692        619       56396       0    100.00%
@@ -98,6 +103,7 @@ Mizeria           6370 /  6370 byte-identical
 Backrooms        13599 / 13599 byte-identical
 Motorslice       10291 / 10291 byte-identical
 Dark Pals         9118 /  9118 byte-identical
+Ready Or Not     10731 / 10731 byte-identical
 Nightmare Kart    3726 /  3726 byte-identical
 Deep Rock Gal.    8365 /  8365 byte-identical
 ```
@@ -320,11 +326,12 @@ Every engine era is covered. What is left is breadth within eras, not missing su
 
    ```
    4.25 – 5.2   FProperty next +0x20, offset +0x4c
-   5.5  – 5.7   FProperty next +0x18, offset +0x44
+   5.3  – 5.7   FProperty next +0x18, offset +0x44
    ```
 
-   The change happened in 5.3 or 5.4, and both resulting shapes are proven — 5.2 below and
-   5.5 above, each at L5. Everything else matches across the boundary too: the classic
+   Ready Or Not settled where that boundary is. It reports the new shape, so the change
+   landed in 5.3, not 5.4, and 5.4 now sits between two versions that agree with each
+   other rather than between two that differ. Everything else matches across the boundary too: the classic
    interleaved `UEnum`, `Interfaces +0x1d8`, `CDO +0x110`, the same name pool.
 
    The argument that closes it is that engine changes persist forward. Anything introduced

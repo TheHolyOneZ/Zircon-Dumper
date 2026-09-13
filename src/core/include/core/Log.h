@@ -8,6 +8,15 @@ namespace zircon::core {
 enum class LogLevel { Trace, Debug, Info, Warn, Error };
 
 void SetLogLevel(LogLevel level);
+
+// Mirror everything to a file as well as the console. The injected payload needs this:
+// AllocConsole gives it a window that a fullscreen game covers, that some games prevent
+// entirely, and that is gone the moment the process exits. A log beside the output is the
+// only copy anyone can read afterwards.
+//
+// Never coloured, whatever the console is doing. Passing an empty path closes it.
+void SetLogFile(std::string_view path);
+void CloseLogFile();
 LogLevel GetLogLevel();
 void LogRaw(LogLevel level, std::string_view message);
 

@@ -5,6 +5,7 @@
 #include "emit/Emitter.h"
 #include "engine/Kismet.h"
 #include "engine/ValueReader.h"
+#include "engine/ValueWriter.h"
 #include "ir/Json.h"
 
 #include "imgui.h"
@@ -170,6 +171,7 @@ void Browser::Draw() {
     ImGui::EndChild();
 
     DrawDumpPanel();
+    ApplyFrozen();
 
     ImGui::End();
 }
@@ -272,25 +274,45 @@ void Browser::DrawStatusPanel() {
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Checkbox("Pause", &paused_);
+
+    // Writing is opt-in every session and the switch goes all the way down to the
+    // provider. Until it is on, IMemorySource::Write refuses.
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Allow edits", &writes_enabled_)) {
+        if (memory_) writes_enabled_ = memory_->EnableWrites(writes_enabled_);
+        CancelEdit();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Lets the Value column write back into the game.\n"
+                          "Off by default. Numbers, bools and enums only.");
+    }
+    if (writes_enabled_) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.90f, 0.65f, 0.30f, 1.0f), "writes on");
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) {
         // Every derived offset, so the UI audits as well as the dump does.
         ImGui::BeginTooltip();
-        MonoScope mono;
-        const auto& ol = reflection_.object_layout;
-        const auto& sl = reflection_.struct_layout;
-        const auto& pl = reflection_.property_layout;
-        ImGui::Text("GObjects   0x%llX", static_cast<unsigned long long>(Raw(array.gobjects)));
-        ImGui::Text("FNamePool  0x%llX",
-                    static_cast<unsigned long long>(Raw(reflection_.pool.blocks)));
-        ImGui::Separator();
-        ImGui::Text("UObject  index +0x%X  class +0x%X  name +0x%X  outer +0x%X",
-                    ol.index_offset, ol.class_offset, ol.name_offset, ol.outer_offset);
-        ImGui::Text("UStruct  super +0x%X  children +0x%X  props +0x%X  size +0x%X",
-                    sl.super_struct, sl.children, sl.child_properties, sl.properties_size);
-        ImGui::Text("FProperty  next +0x%X  name +0x%X  offset +0x%X",
-                    pl.next, pl.name, pl.offset_internal);
+        {
+            // The font stack balances per window. A MonoScope living to the end of the
+            // enclosing block would pop after EndTooltip and trip ImGui's assert.
+            MonoScope mono;
+            const auto& ol = reflection_.object_layout;
+            const auto& sl = reflection_.struct_layout;
+            const auto& pl = reflection_.property_layout;
+            ImGui::Text("GObjects   0x%llX", static_cast<unsigned long long>(Raw(array.gobjects)));
+            ImGui::Text("FNamePool  0x%llX",
+                        static_cast<unsigned long long>(Raw(reflection_.pool.blocks)));
+            ImGui::Separator();
+            ImGui::Text("UObject  index +0x%X  class +0x%X  name +0x%X  outer +0x%X",
+                        ol.index_offset, ol.class_offset, ol.name_offset, ol.outer_offset);
+            ImGui::Text("UStruct  super +0x%X  children +0x%X  props +0x%X  size +0x%X",
+                        sl.super_struct, sl.children, sl.child_properties, sl.properties_size);
+            ImGui::Text("FProperty  next +0x%X  name +0x%X  offset +0x%X",
+                        pl.next, pl.name, pl.offset_internal);
+        }
         ImGui::EndTooltip();
     }
 
@@ -423,6 +445,10 @@ void Browser::DrawInspector() {
             }
 
             ImGui::TableNextRow();
+
+            const std::size_t row_index = static_cast<std::size_t>(&row - rows_.data());
+            const bool frozen = IsFrozen(read_from_, row.field);
+
             ImGui::TableNextColumn();
             {
                 MonoScope mono;
@@ -433,12 +459,64 @@ void Browser::DrawInspector() {
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(row.name.c_str());
             ImGui::TableNextColumn();
+            if (writes_enabled_ && row.writable) {
+                // A padlock would need a font carrying one. An asterisk is legible at any
+                // size and in any face, and it sits with the value it holds instead of in
+                // a column of its own.
+                ImGui::PushID(static_cast<int>(row_index));
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      frozen ? ImVec4(0.45f, 0.75f, 0.95f, 1.0f)
+                                             : ImVec4(0.34f, 0.36f, 0.41f, 1.0f));
+                if (ImGui::SmallButton(frozen ? "*" : "\u00b7")) ToggleFreeze(row_index);
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(frozen ? "Frozen. Click to release."
+                                             : "Hold this value against the game.");
+                ImGui::SameLine(0.0f, 6.0f);
+            }
             {
                 MonoScope mono;
-                ImGui::TextColored(ValueColour(row.value), "%s", row.value.c_str());
+                const std::size_t index = row_index;
+
+                if (editing_row_ == index) {
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (!ImGui::IsAnyItemActive()) ImGui::SetKeyboardFocusHere();
+
+                    const bool done = ImGui::InputText(
+                        "##edit", edit_buffer_, sizeof(edit_buffer_),
+                        ImGuiInputTextFlags_EnterReturnsTrue |
+                        ImGuiInputTextFlags_AutoSelectAll);
+
+                    if (done) CommitEdit();
+                    else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) CancelEdit();
+                } else if (frozen) {
+                    ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1.0f), "%s",
+                                       row.value.c_str());
+                } else if (writes_enabled_ && row.writable) {
+                    // A Selectable so the whole cell responds, and so hovering shows the
+                    // row is editable. A Text item is only as wide as its own glyphs, and
+                    // clicking the empty space past a short number would do nothing.
+                    ImGui::PushID(static_cast<int>(index));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ValueColour(row.value));
+                    if (ImGui::Selectable(row.value.c_str(), false)) BeginEdit(index);
+                    ImGui::PopStyleColor();
+                    ImGui::PopID();
+                } else {
+                    ImGui::TextColored(ValueColour(row.value), "%s", row.value.c_str());
+                }
             }
         }
         ImGui::EndTable();
+    }
+
+    DrawFrozenPanel();
+
+    if (!edit_error_.empty()) {
+        ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.35f, 1.0f), "%s", edit_error_.c_str());
+    } else if (!last_write_.empty()) {
+        ImGui::TextDisabled("wrote %s", last_write_.c_str());
     }
 }
 
@@ -697,6 +775,134 @@ void Browser::StartDump() {
     });
 }
 
+// --- frozen values ---------------------------------------------------------------------
+
+bool Browser::IsFrozen(core::Address object, core::Address field) const {
+    return std::any_of(frozen_.begin(), frozen_.end(), [&](const Frozen& entry) {
+        return Raw(entry.object) == Raw(object) && Raw(entry.field) == Raw(field);
+    });
+}
+
+void Browser::ToggleFreeze(std::size_t row_index) {
+    if (row_index >= rows_.size()) return;
+    const Row& row = rows_[row_index];
+
+    const auto it = std::find_if(frozen_.begin(), frozen_.end(), [&](const Frozen& entry) {
+        return Raw(entry.object) == Raw(read_from_) && Raw(entry.field) == Raw(row.field);
+    });
+    if (it != frozen_.end()) {
+        frozen_.erase(it);
+        return;
+    }
+
+    // Freeze what is on screen. Re-reading here would race the tick that is about to
+    // overwrite it, which is the situation freezing exists for.
+    Frozen entry;
+    entry.object = read_from_;
+    entry.field  = row.field;
+    entry.value  = row.value;
+    entry.label  = std::format("{}::{}", entries_[selected_].path, row.name);
+    frozen_.push_back(std::move(entry));
+}
+
+void Browser::ApplyFrozen() {
+    if (frozen_.empty() || !memory_ || !writes_enabled_ || dumping_) return;
+
+    // Fast enough to beat a 60 Hz tick, slow enough that a dozen frozen values cost
+    // nothing. Tying this to the value-refresh slider would let someone set it to two
+    // seconds and wonder why freezing stopped working.
+    constexpr double kInterval = 0.03;
+
+    const double now = ImGui::GetTime();
+    if (last_freeze_ >= 0.0 && now - last_freeze_ < kInterval) return;
+    last_freeze_ = now;
+
+    const auto context = reflection_.Context();
+    for (auto& entry : frozen_) {
+        const auto result =
+            engine::WritePropertyValue(context, entry.object, entry.field, entry.value);
+        if (result.ok) {
+            entry.failures = 0;
+            continue;
+        }
+
+        // A frozen value that cannot be written any more usually means the object is gone.
+        // Say so once instead of retrying silently forever.
+        if (++entry.failures == 1)
+            core::LogWarn("frozen {}: {}", entry.label, result.error);
+    }
+
+    // Anything that has failed for a second or so is not coming back.
+    std::erase_if(frozen_, [](const Frozen& entry) { return entry.failures > 30; });
+}
+
+void Browser::DrawFrozenPanel() {
+    if (frozen_.empty()) return;
+
+    ImGui::Separator();
+    ImGui::TextDisabled("frozen");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("release all")) frozen_.clear();
+
+    for (std::size_t i = 0; i < frozen_.size();) {
+        ImGui::PushID(static_cast<int>(i));
+        const bool release = ImGui::SmallButton("x");
+        ImGui::SameLine();
+        {
+            MonoScope mono;
+            ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1.0f), "%s = %s",
+                               frozen_[i].label.c_str(), frozen_[i].value.c_str());
+        }
+        ImGui::PopID();
+
+        if (release) frozen_.erase(frozen_.begin() + static_cast<std::ptrdiff_t>(i));
+        else         ++i;
+    }
+}
+
+// --- editing -------------------------------------------------------------------------
+
+void Browser::BeginEdit(std::size_t row_index) {
+    if (row_index >= rows_.size()) return;
+
+    editing_row_ = row_index;
+    edit_error_.clear();
+    std::snprintf(edit_buffer_, sizeof(edit_buffer_), "%s", rows_[row_index].value.c_str());
+}
+
+void Browser::CancelEdit() {
+    editing_row_ = static_cast<std::size_t>(-1);
+    edit_buffer_[0] = '\0';
+}
+
+void Browser::CommitEdit() {
+    if (editing_row_ >= rows_.size() || !memory_) {
+        CancelEdit();
+        return;
+    }
+
+    const Row& row = rows_[editing_row_];
+    const auto context = reflection_.Context();
+
+    const auto result = engine::WritePropertyValue(context, read_from_, row.field,
+                                                   edit_buffer_);
+    if (result.ok) {
+        core::LogInfo("{} = {} at {:#x}", row.name, result.written,
+                      core::Raw(read_from_ + static_cast<std::uint64_t>(row.offset)));
+        last_write_ = std::format("{} = {}", row.name, result.written);
+        edit_error_.clear();
+    } else {
+        core::LogWarn("{}: {}", row.name, result.error);
+        edit_error_ = std::format("{}: {}", row.name, result.error);
+    }
+
+    CancelEdit();
+
+    // Read it back immediately. If the game owns the field and overwrites it next tick,
+    // the row showing the old value again is the useful answer.
+    RefreshRows(true);
+}
+
 // --- state ---------------------------------------------------------------------------
 
 void Browser::Attach(std::uint32_t pid) {
@@ -764,6 +970,11 @@ void Browser::Adopt(std::unique_ptr<core::IMemorySource> memory,
 }
 
 void Browser::Detach() {
+    if (memory_ && writes_enabled_) memory_->EnableWrites(false);
+    writes_enabled_ = false;
+    CancelEdit();
+    edit_error_.clear();
+    last_write_.clear();
     target_name_.clear();
     attached_ = false;
     attached_pid_ = 0;
@@ -877,6 +1088,8 @@ void Browser::RefreshRows(bool force) {
             row.size   = engine::GetElementSize(*memory_, reflection_.property_layout, field);
             row.type   = engine::DescribeType(engine::ResolveType(context, field));
             row.value  = engine::ReadPropertyValue(context, read_from_, field, format);
+            row.field    = field;
+            row.writable = engine::IsPropertyWritable(context, field);
             rows_.push_back(std::move(row));
         }
 

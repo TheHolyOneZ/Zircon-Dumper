@@ -3,6 +3,7 @@
 #include "core/PeImage.h"
 
 #include <algorithm>
+#include <map>
 #include <format>
 #include <set>
 
@@ -122,9 +123,17 @@ UFunctionLayout DeriveFunctionLayout(core::IMemorySource& memory,
     }
 
     // --- UFunction::FunctionFlags -----------------------------------------------------
-    // Found through a reflection-system invariant, not a bit pattern. Every UFunction
-    // has exactly one access specifier, so exactly one of Public, Private and Protected is
-    // set. Random dwords don't manage that at scale.
+    // Every UFunction carries exactly one access specifier, so exactly one of Public,
+    // Private and Protected is set. That alone is not enough to identify the field, and
+    // trusting it cost a release: the low half of a heap pointer sitting a few bytes away
+    // satisfied it for 15884 of 17441 functions, because every one of those pointers came
+    // out of the same region and shared the same bit there. The flags then read as
+    // Event|Static|Protected for the entire game.
+    //
+    // So the access bit is the positive property, and diversity is the independent one.
+    // Real flags differ across functions: a native getter, a Blueprint event and a
+    // replicated RPC have little in common. A field that repeats one value for most of the
+    // target is describing something other than the function.
     {
         int best_offset = -1, best_hits = 0;
         const std::uint32_t access = function_flags::kPublic | function_flags::kPrivate |
@@ -132,11 +141,27 @@ UFunctionLayout DeriveFunctionLayout(core::IMemorySource& memory,
 
         for (int offset = struct_layout.properties_size; offset <= kMaxProbe; offset += 4) {
             int hits = 0;
+            std::map<std::uint32_t, int> histogram;
+
             for (const auto function : functions) {
                 const auto value = core::ReadOr<std::uint32_t>(memory, function + offset);
                 const std::uint32_t bits = value & access;
                 if (bits != 0 && (bits & (bits - 1)) == 0) ++hits;
+                ++histogram[value];
             }
+
+            int dominant = 0;
+            for (const auto& [value, count] : histogram) {
+                (void)value;
+                dominant = std::max(dominant, count);
+            }
+
+            // Half the target sharing one value is a pointer, a padding word, or a
+            // constant. It is not a flags field.
+            const bool diverse = histogram.size() >= 8 &&
+                                 dominant * 2 < static_cast<int>(functions.size());
+            if (!diverse) continue;
+
             if (hits > best_hits) {
                 best_hits   = hits;
                 best_offset = offset;
@@ -147,7 +172,8 @@ UFunctionLayout DeriveFunctionLayout(core::IMemorySource& memory,
             layout.function_flags = best_offset;
             layout.evidence.push_back(std::format(
                 "UFunction::FunctionFlags at +{:#x}: {}/{} have exactly one access "
-                "specifier bit", best_offset, best_hits, functions.size()));
+                "specifier bit, and the value varies across the target",
+                best_offset, best_hits, functions.size()));
         }
     }
 

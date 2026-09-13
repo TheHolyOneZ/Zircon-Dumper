@@ -34,6 +34,11 @@ struct Reflection {
     UEnumLayout     enum_layout;
     ScriptLayout    script_layout;
 
+    // UObject::ProcessEvent's vtable slot, or -1 when it was never looked for. Unlike
+    // everything else here it cannot be read, only confirmed by calling, so it is filled in
+    // separately and only when someone asks. See engine/ProcessEvent.h.
+    int process_event_index{-1};
+
     ResolveContext Context() const;
     bool Valid() const;
 };

@@ -109,9 +109,51 @@ private:
         std::int32_t offset{};
         std::int32_t size{};
         std::string owner;      // the class that declares it, for the inherited grouping
+
+        // Kept so an edit does not have to find the property again by name, and so the
+        // Value cell knows whether to offer editing at all.
+        core::Address field{};
+        bool          writable{false};
     };
     std::vector<Row> rows_;
     void RefreshRows(bool force);
+
+    // --- editing ---
+    //
+    // Off until switched on, and the switch reaches the memory source: with writes
+    // disabled the provider refuses at the bottom of the stack, so a bug in the UI cannot
+    // put bytes into a game by itself.
+    bool        writes_enabled_{false};
+    std::size_t editing_row_{static_cast<std::size_t>(-1)};
+    char        edit_buffer_[128]{};
+    std::string edit_error_;
+    std::string last_write_;
+
+    void BeginEdit(std::size_t row_index);
+    void CommitEdit();
+    void CancelEdit();
+
+    // --- frozen values ---
+    //
+    // A game that owns a field writes it every tick, and an edit to one of those is gone
+    // before it can be read back. Freezing re-applies the value on a timer so it holds.
+    //
+    // Keyed by address, not by row: the list survives selecting another object, and a
+    // frozen value stays frozen while you look somewhere else.
+    struct Frozen {
+        core::Address object{};
+        core::Address field{};
+        std::string   label;     // owning object and property, for the list
+        std::string   value;     // exactly the text that was committed
+        int           failures{0};
+    };
+    std::vector<Frozen> frozen_;
+    double              last_freeze_{-1.0};
+
+    bool IsFrozen(core::Address object, core::Address field) const;
+    void ToggleFreeze(std::size_t row_index);
+    void ApplyFrozen();
+    void DrawFrozenPanel();
 
     // What the rows were actually read from. For a class that is its default object, so the
     // header can say so instead of implying a live instance.

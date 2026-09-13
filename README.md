@@ -9,8 +9,12 @@ engine's entire type system: every class, struct, enum, property offset, functio
 signature and Blueprint script. Then turn that into a C++ SDK, a `.usmap`, types for IDA
 or Ghidra, readable Blueprint logic, or a report on what a patch just broke.
 
-<sub>Fifteen games verified · UE 4.22 → 5.7 · both property systems · both name pools ·
+<sub>Sixteen games verified · UE 4.22 → 5.7 · both property systems · both name pools ·
 no engine-version table anywhere in the codebase</sub>
+
+<sub>Cross-checked against Dumper-7 on the same UE 5.6 game:
+<b>26,625 of 26,625 shared member offsets agree exactly</b>, with 48,535 data members
+emitted against its 44,701.</sub>
 
 ---
 
@@ -123,7 +127,7 @@ The result is one JSON file containing the game's whole type system.
 
 | You want… | Use | What you get |
 |---|---|---|
-| To write a cheat/mod in C++ | `cpp_sdk` | Headers with every class, correct offsets, and compile-time checks |
+| To write a cheat/mod in C++ | `cpp_sdk` | Headers with every class, correct offsets, compile-time checks, and callable wrappers for every reflected function |
 | To use UE4SS, FModel, or an asset tool | `usmap` | A `.usmap` mappings file |
 | To reverse the binary in IDA Pro | `ida` | A Python script that imports every struct into your database |
 | Same, but Ghidra | `ghidra` | The same, for Ghidra |
@@ -152,6 +156,25 @@ files written     620
   out/SDK/Engine.hpp
   ... and 608 more
 ```
+
+### The SDK it writes can call the game
+
+The headers do not only describe the layout. Every reflected function comes with a wrapper:
+
+```cpp
+inline class APawn* UPawnMovementComponent::GetPawnOwner() { ... }
+```
+
+Calling one needs two things wired up, and injecting alongside `zircon.dll` supplies both:
+
+```cpp
+ZirconSDK::BindToZirconPayload();
+```
+
+The second of those is `UObject::ProcessEvent`, a virtual whose position the engine does
+not record anywhere. Zircon works it out by calling a function whose answer it already
+knows, once, and bakes the result into the SDK it generates. See
+[Editing values](#editing-values-live) for the safety note on that.
 
 ### It shows you the game while it runs
 
@@ -201,6 +224,27 @@ through the same reflection data. Each line is prefixed with its bytecode offset
 
 Available in the GUI's **Script** tab, and from the CLI as
 `zircon script --pid 12345 -f <name>`.
+
+### It lets you change values while the game runs
+
+Tick **Allow edits** and the Value column becomes editable. Numbers, bools and enums,
+written straight into the live process and read back to confirm. Details in
+[Editing values](#editing-values-live).
+
+### It finds objects by what they hold
+
+The question a dump on its own cannot answer. Not "where does Health live" but "which
+things have less than fifty of it".
+
+```
+> zircon find --pid 1234 --where MaxWalkSpeed>500 -n 4
+OBJECT                                               PROPERTY        VALUE
+/Script/Engine.Default__CharacterMovementComponent   MaxWalkSpeed    777
+/Script/Engine.Default__Character.CharMoveComp       MaxWalkSpeed    600
+```
+
+`=`, `!=`, `<`, `>`, `<=`, `>=`, and enums compare by name, so
+`--where MovementMode=MOVE_Falling` works. `-f` narrows to one class first.
 
 ### It tells you what an update broke
 
@@ -462,6 +506,67 @@ Handy bits:
 - **(?)** — hover it to see every offset Zircon derived for this game
 - The **Script** tab decompiles the selected function, if it's a Blueprint function
 - **Dump…** writes an SDK and anything else you tick, without leaving the window
+- **Allow edits** turns the Value column into a live editor, see
+  [Editing values](#editing-values-live)
+
+---
+
+## Editing values live
+
+Tick **Allow edits** in the top bar, then click any Value cell and type.
+
+```
+engine 5.6 (60%)   objects 72561   indexed 72345   [Reindex]  [ ] Pause  [x] Allow edits  writes on
+
+Offset   Type      Name             Value
+0x0278   float     MaxWalkSpeed     600     <- click, type 1337, press Enter
+```
+
+Enter commits, Escape cancels. The row re-reads straight afterwards, so if the game owns
+that field and overwrites it on the next tick, you see it snap back. That is the useful
+answer, not a bug.
+
+**Holding a value.** Editing a field the game owns does nothing on its own, because the
+next tick writes it back. Click the dot beside a value to freeze it and Zircon re-applies
+it every 30ms, which beats a 60Hz tick. Frozen values are listed under the table and stay
+frozen while you look at other objects.
+
+**What can be edited:** numbers, bools, enums, and structs whose members are all numbers
+(`FVector`, `FRotator`, `FLinearColor`). A struct takes either `{Z=-2}` or `0,1,-3`, and
+a partial write leaves the rest alone. Enums take either the enumerator name
+or its number, and integers take `0x` hex as well as decimal.
+
+**What cannot:** strings, arrays, maps, object pointers, and structs holding any of
+those. Their memory holds
+allocator state and element counts alongside the value, and a plain byte write corrupts
+that with no immediate symptom. Those cells stay plain text instead of offering an edit
+that would be refused.
+
+Three things the editor will not do to you:
+
+- **It is off until you switch it on**, every session. The switch reaches the memory
+  source itself, so while it is off a write is refused at the bottom of the stack.
+- **It writes exactly the property's width.** Putting 300 into a `uint8` is refused
+  rather than silently stored as 44.
+- **It preserves neighbouring bits.** Seven bools commonly share one byte;
+  `CharacterMovementComponent` packs seven into `0x02E8` alone. Setting one reads the
+  byte, changes that bit, and writes it back.
+
+The command line can do the same thing without the browser:
+
+```
+> zircon write --pid 1234 -f /Script/Engine.CharacterMovementComponent --set MaxWalkSpeed=777
+object            /Script/Engine.CharacterMovementComponent
+property          MaxWalkSpeed
+was               600
+now               777
+```
+
+It prints what the value was, because the quickest way to undo a mistake is to have been
+shown what it replaced.
+
+Editing is data, not code. Zircon does not patch instructions, install hooks or modify
+the game's executable. See [What Zircon will not do](#what-zircon-will-not-do).
 
 ---
 
@@ -549,8 +654,9 @@ the readme:
 
 - **Anti-cheat evasion.** `zircon inject` refuses outright when the target has anti-cheat
   loaded.
-- **Modifying games.** Zircon reads. The only writes that exist are the ones the injected
-  payload needs for itself, and they're off by default.
+- **Patching game code.** Zircon can edit property *values* (see
+  [Editing values](#editing-values-live)), which is data. It does not write over the
+  game's instructions, install hooks, or patch functions.
 - **Non-Unreal engines.**
 
 A concrete consequence: the injected browser opens its **own window** instead of drawing
@@ -676,9 +782,42 @@ Zircon is aiming at a wider surface:
 | Live object browser | — | yes | yes, standalone **and** in-process |
 | Bytecode decompiler | — | — | ~90 Kismet opcodes |
 | Build-to-build diffing | — | — | 27 change kinds, CI exit code |
+| Find objects by property value | — | — | `--where Health<50` |
 | Reads CDO default values | — | — | yes, into SDK, docs and diff |
+| Edits values in a live process | — | yes | yes, opt-in, with freezing |
+| Callable function wrappers in the SDK | 17,319 | — | **17,419** |
+| SDK can call the game with no setup | — | — | yes, ProcessEvent slot derived |
 | Scriptable / extensible | — | — | C ABI + vendored Lua |
 | Behaviour when unsure | — | — | **refuses rather than guessing** |
+
+### Measured, not claimed
+
+Dumper-7 was injected into the same UE 5.6 game Zircon dumped from outside, and both SDKs
+were parsed for the `// 0xOFFSET(0xSIZE)` annotation every member carries:
+
+```
+                          Dumper-7    Zircon
+real data members            44701     48535
+members present in both      26625     26625
+offsets agreeing             26625     26625     100.000%
+offsets disagreeing              0         0
+```
+
+Two separately written dumpers, no disagreement anywhere. That is worth more than either
+tool's own self-consistency checks, and it cuts both ways: it is evidence for Dumper-7 as
+much as for Zircon.
+
+It also found a real defect here. Zircon's SDK compiled with 133 `C4369` warnings, enums
+declared `uint8` holding values up to 524287. Dumper-7 declares the same enum `uint32`.
+Fixed in 0.2.0; the SDK now compiles with zero warnings.
+
+That exercise also closed the one gap it found. Dumper-7 emitted callable function
+wrappers and Zircon did not; as of 0.2.0 it does, 17,419 of that game's 17,441 reflected
+functions against Dumper-7's 17,319. It also
+turned up a real defect here, covered in the changelog: `UFunction::FunctionFlags` had
+been deriving to the low half of a pointer, so every function in every dump reported the
+same three flags. Offsets were never affected; flag names were, for every consumer of
+them.
 
 The four things that actually drive the design:
 
@@ -687,8 +826,8 @@ The four things that actually drive the design:
    on disk are the same code. This is what makes the next point possible.
 
 2. **Cross-provider agreement as a correctness test.** Dumping a game live and dumping a
-   full-memory minidump of that same process must produce byte-identical output. Fourteen
-   of fifteen targets pass that check. Two real bugs were found by it disagreeing with
+   full-memory minidump of that same process must produce byte-identical output. Fifteen
+   of sixteen targets pass that check. Two real bugs were found by it disagreeing with
    itself — bugs that no amount of "the SDK compiles" would have caught.
 
 3. **Auditability over convenience.** Every offset is reported with evidence and a
@@ -755,6 +894,7 @@ src/diff/      Diff (classification) + Report (text / json / markdown)
 src/app/       CLI shell
 src/dll/       injected payload — dumps, emits, then opens the browser in-process
 src/gui/       Browser (host-agnostic UI) + Host (window, device, frame loop)
+res/           the icon and the version resources
 docs/          SCOPE.md, ARCHITECTURE.md, PLUGINS.md,
                UE-Test.md (version coverage), ENGINEERING-LOG.md
 ```
@@ -774,6 +914,8 @@ props         properties with offsets, types, bitfield masks
 functions     UFunctions with rendered signatures and native RVAs
 script        decompile Kismet bytecode to pseudo-code
 read          live property values of one object (a class reads its defaults)
+write         set one property, e.g. --set MaxWalkSpeed=1337
+find          objects by what they hold, e.g. --where Health<50
 inspect       annotated hexdump of one object (the layout-debugging tool)
 scan          pattern-scan a module, or the whole process
 dump          full reflection dump to IR JSON   [--script] [--names] [--defaults]
@@ -861,7 +1003,8 @@ not a missing feature.
 
 ## Status
 
-All phases P0–P7 complete, verified against fifteen live games from UE 4.22 to UE 5.7.
+All phases P0–P7 complete, verified against sixteen live games from UE 4.22 to UE 5.7.
+`CHANGELOG.md` records what changed per release.
 
 | | |
 |---|---|
@@ -880,18 +1023,28 @@ Measured on Funnel Runners (UE 5.6):
 ```
 dump          618 packages, 5252 classes, 48692 properties, 17698 functions   1.8 s
 defaults      27065 of 27065 class properties read from their CDOs            2.0 s
-SDK           619 headers, 56396 static_asserts, compiles clean in 3.8 s
+SDK           585 headers, 56203 static_asserts, 17419 callable wrappers
+              compiles clean with and without windows.h included first
 bytecode      2871 functions, 1156611 bytes, 100% decoded
 determinism   live process vs a 6.5 GB minidump of itself: 10850/10850 identical
               external vs injected (Internal provider): 10850/10850 identical
+```
+
+And on Ready Or Not (UE 5.3), the largest target by script volume:
+
+```
+dump          1406 packages, 6327 classes, 49946 properties, 25517 functions
+SDK           259 headers, 45832 static_asserts, 0 errors, 0 warnings
+bytecode      7700 functions, 2173747 bytes, 100% decoded
+determinism   live process vs a 5.5 GB minidump: 10731/10731 identical
 ```
 
 Those last two lines are the ones that matter: **the same target produces the same answer
 from a live process, from a dump file, and from inside the game itself.**
 
 `docs/UE-Test.md` is the version-coverage board — which engine versions have been run,
-how far each was taken, and what is left. Fifteen targets verified from UE 4.22 to UE 5.7,
-fourteen to full provider agreement. `docs/ENGINEERING-LOG.md` is the record of what broke
+how far each was taken, and what is left. Sixteen targets verified from UE 4.22 to UE 5.7,
+fifteen to full provider agreement. `docs/ENGINEERING-LOG.md` is the record of what broke
 along the way and what each failure turned out to mean.
 
 ---
@@ -907,7 +1060,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-Six test suites, 1469 checks, none of which need a game installed. They run against
+A build reports its version as `0.2.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
+that is the only difference between a local build and a released one.
+
+Seven test suites, 1537 checks, none of which need a game installed. They run against
 synthetic memory, hand-built bytecode and checked-in fixtures.
 
 > If Strawberry Perl or MinGW is on PATH, CMake may pick up its GCC. Pass the Visual
@@ -923,8 +1079,11 @@ confirm the right assertions fail — a green suite that cannot fail is worse th
 **In:** reading and analysing UE reflection data for modding and reverse engineering,
 across any engine version from roughly 4.20 to 5.7, including licensee forks.
 
-**Out:** anti-cheat evasion, game modification (Zircon reads; writes exist only for what
-the injected payload needs and are off by default), non-UE engines.
+**Out:** anti-cheat evasion, patching game code, non-UE engines.
+
+Since 0.2.0 Zircon can edit a reflected property's value in a live process. That is data
+the engine already describes and already changes itself. Writing over the game's own
+code is a different thing and stays out.
 
 That is not a disclaimer, it decided a design. The injected payload opens its own window
 instead of overlaying the game, because an overlay means hooking `Present` — writing a

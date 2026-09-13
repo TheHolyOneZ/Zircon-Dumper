@@ -24,6 +24,11 @@ public:
     // Only Internal/External implement this, and only when writes are enabled.
     virtual bool Write(Address, const void*, std::size_t) { return false; }
 
+    // Opt in to writing. Off at open time on every provider, so a tool that only reads
+    // cannot write by accident and a provider that cannot write says so by refusing.
+    // Returns whether writes are enabled afterwards.
+    virtual bool EnableWrites(bool /*enable*/) { return false; }
+
     virtual std::span<const ModuleInfo> Modules() const = 0;
     virtual std::span<const RegionInfo> Regions() const = 0;
     virtual Capabilities                Caps()    const = 0;

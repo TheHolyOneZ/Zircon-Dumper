@@ -85,14 +85,26 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
 | Plugin API for custom emitters | no | ⭐ |
 | Non-Windows hosts | no | ➖ not in v1 |
 | Anti-cheat evasion | no | ➖ explicitly excluded |
+| Editing live property values | yes | ✅ 0.2.0, opt-in |
+| Patching game code | no | ➖ explicitly excluded |
 
 ## Non-goals
 
 - **Anti-cheat evasion / detection bypass.** Handling unusual, packed, or encrypted
   memory layouts is in scope because it is a reverse-engineering problem. Defeating
   protection to gain access we do not otherwise have is not.
-- **Game modification.** This tool reads. Writing to a live process is limited to what
-  the `Internal` provider needs to call reflection functions, and is off by default.
+- **Patching game code.** Zircon writes data, never instructions. From 0.2.0 a reflected
+  property's value can be edited in a live process, which is data the engine already
+  describes and already lets itself change. Writing over the game's own code, installing
+  trampolines, or hooking its functions stays out: those are the techniques the rule below
+  about `Present` exists to exclude, and nothing in the tool needs them.
+
+  Editing is opt-in per session and off until switched on. The switch reaches the memory
+  source, so with it off `IMemorySource::Write` refuses at the bottom of the stack and no
+  bug higher up can put bytes into a game by itself. Only kinds whose bytes the property
+  owns outright are writable: numbers, bools and enums. Containers, strings and structs
+  are refused, since their memory carries allocator state that a plain byte write
+  corrupts without any immediate symptom.
 - **Non-UE engines.**
 - **Overlaying the game's own rendering.** The injected payload opens its own window
   rather than hooking the swap chain's `Present`. A Present hook means writing a

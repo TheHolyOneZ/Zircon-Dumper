@@ -1,10 +1,12 @@
 #include "Emitters.h"
 
 #include <algorithm>
+#include <cstring>
 #include <format>
 #include <functional>
 #include <map>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -108,10 +110,50 @@ std::string WithComment(std::string_view declaration, std::string_view comment) 
     return line;
 }
 
+// Identifiers <windows.h> has already taken as macros.
+//
+// UE names a reflected function min, another max, an enumerator PF_MAX and a function
+// PlaySound. Include windows.h before the SDK, as any injected DLL does, and the
+// preprocessor rewrites those before the compiler sees them: "int32 min(int32 A, int32 B)"
+// stops being a declaration.
+//
+// The SDK renames its own identifier instead of undefining the macro. Undefining would
+// fix the header and break the caller, since TRUE, FALSE, RGB and SendMessage are names
+// their code is entitled to keep using. The renamed member carries the engine's spelling
+// in its comment.
+//
+// This list is the Win32 macro names, not anything about the engine, so it does not go
+// stale with an engine release. It is also not exhaustive: 16 of 66114 identifiers emitted
+// for a UE 5.6 game collided on the Windows 10.0.26100 headers, and these are those plus
+// the neighbouring members of the same families.
+bool ClashesWithWindowsMacro(std::string_view name) {
+    static const std::set<std::string_view> kTaken = {
+        "min", "max", "RGB", "TRUE", "FALSE", "DELETE", "ERROR", "IN", "OUT", "OPTIONAL",
+        "NO_ERROR", "PF_MAX", "PlaySound", "DrawText", "GetObject", "GetMessage",
+        "SendMessage", "PostMessage", "GetCommandLine", "GetCurrentTime",
+        "GetDiskFreeSpace", "ReportEvent", "UpdateResource", "CreateWindow", "CreateFile",
+        "CreateProcess", "GetClassName", "LoadImage", "DrawState", "CopyFile", "MoveFile",
+        "DeleteFile", "GetUserName", "GetComputerName", "SetPort", "GetFreeSpace",
+        "GetTempPath", "GetFullPathName", "FindText", "ReplaceText", "GetJob", "SetJob",
+        "AddJob", "GetForm", "SetForm", "AddForm", "DeleteForm", "GetPrinter",
+        "SetPrinter", "AddPrinter", "DeletePrinter", "StartDoc", "StartPage", "EndPage",
+        "EndDoc", "AbortDoc", "Rectangle", "Ellipse", "Polygon", "Polyline",
+    };
+    return kTaken.count(name) != 0;
+}
+
+// The SDK's spelling of a reflected name: legal C++, and not something the preprocessor
+// will rewrite.
+std::string SafeIdentifier(std::string_view raw) {
+    std::string name = util::SanitizeIdentifier(raw);
+    if (ClashesWithWindowsMacro(name)) name += "_";
+    return name;
+}
+
 // Unique within its owner and legal in C++. UE lets two properties differ only by
 // characters the sanitizer collapses, so enforce uniqueness instead of hoping for it.
 std::string UniqueMember(std::string_view raw, std::set<std::string>& taken) {
-    std::string name = util::SanitizeIdentifier(raw);
+    std::string name = SafeIdentifier(raw);
     if (taken.insert(name).second) return name;
 
     for (int suffix = 1;; ++suffix) {
@@ -119,6 +161,11 @@ std::string UniqueMember(std::string_view raw, std::set<std::string>& taken) {
         if (taken.insert(candidate).second) return candidate;
     }
 }
+
+// Declared ahead of use: the enum's effective width is needed by the size checks above
+// and by the declaration far below, and all three have to agree or the struct layout and
+// the enum definition disagree with each other.
+std::string_view EnumUnderlying(const ir::Enum& record);
 
 std::int32_t UnderlyingSize(std::string_view underlying) {
     if (underlying == "int8"  || underlying == "uint8")  return 1;
@@ -149,7 +196,7 @@ std::int32_t ExpectedSize(const TypeIndex& index, const ir::TypeRef& type) {
 
         case TypeKind::Enum: {
             const auto it = index.enums.find(type.name);
-            return it == index.enums.end() ? 0 : UnderlyingSize(it->second->underlying);
+            return it == index.enums.end() ? 0 : UnderlyingSize(EnumUnderlying(*it->second));
         }
         case TypeKind::Struct: {
             const auto it = index.structs.find(type.name);
@@ -226,7 +273,7 @@ std::string RenderType(const TypeIndex& index, const ir::TypeRef& type,
             // Property wins over the enum's underlying type on disagreement. It's measured
             // per use where the enum's width is inferred from other uses, and a mismatch
             // corrupts every later member.
-            const std::int32_t declared = UnderlyingSize(it->second->underlying);
+            const std::int32_t declared = UnderlyingSize(EnumUnderlying(*it->second));
             if (fallback_size > 0 && declared > 0 && declared != fallback_size) {
                 warnings.push_back(std::format(
                     "enum '{}' is declared {} bytes but used as {}; emitting a sized "
@@ -371,12 +418,60 @@ std::vector<const ir::Struct*> TopoSort(const std::vector<const ir::Struct*>& re
 
 // --- emission -----------------------------------------------------------------------
 
+// The declared underlying type has to hold every enumerator.
+//
+// UEnum does not always state a width, so the IR falls back to uint8, and a flags enum
+// built from bit positions overflows that immediately: ETransformGizmoSubElements reaches
+// 524287. MSVC warns (C4369) and clamps the value, which would leave the SDK compiling
+// while comparing against the wrong number.
+//
+// Widening is safe in a way narrowing is not. A property that reads the enum uses its own
+// measured width, so the enum's declared type only has to be wide enough to name the
+// values.
+std::string_view EnumUnderlying(const ir::Enum& record) {
+    const std::string_view declared =
+        record.underlying.empty() ? std::string_view{"uint8"} : record.underlying;
+
+    std::int64_t lowest = 0;
+    std::int64_t highest = 0;
+    for (const auto& value : record.values) {
+        lowest  = std::min(lowest, value.value);
+        highest = std::max(highest, value.value);
+    }
+
+    const bool negative = lowest < 0;
+    const std::int32_t declared_size = UnderlyingSize(declared);
+
+    std::int32_t needed = 1;
+    if (negative) {
+        // The bounds are written as signed 64-bit literals: 0x8000'0000 on its own is
+        // unsigned, and negating it would stay unsigned.
+        if      (lowest >= -128LL        && highest <= 127LL)        needed = 1;
+        else if (lowest >= -32768LL      && highest <= 32767LL)      needed = 2;
+        else if (lowest >= -2147483648LL && highest <= 2147483647LL) needed = 4;
+        else                                                         needed = 8;
+    } else {
+        if      (highest <= 0xFFLL)        needed = 1;
+        else if (highest <= 0xFFFFLL)      needed = 2;
+        else if (highest <= 0xFFFFFFFFLL)  needed = 4;
+        else                               needed = 8;
+    }
+
+    if (declared_size >= needed && (!negative || declared.front() == 'i')) return declared;
+
+    switch (needed) {
+        case 1:  return negative ? "int8"  : "uint8";
+        case 2:  return negative ? "int16" : "uint16";
+        case 4:  return negative ? "int32" : "uint32";
+        default: return negative ? "int64" : "uint64";
+    }
+}
+
 void EmitEnum(std::string& out, const ir::Enum& record, const TypeIndex& index) {
     const std::string name = index.cpp_names.at(record.path);
 
     out += std::format("// {}\n", record.path);
-    out += std::format("enum class {} : {} {{\n", name,
-                       record.underlying.empty() ? "uint8" : record.underlying);
+    out += std::format("enum class {} : {} {{\n", name, EnumUnderlying(record));
 
     std::set<std::string> taken;
     for (const auto& value : record.values) {
@@ -389,6 +484,215 @@ void EmitEnum(std::string& out, const ir::Enum& record, const TypeIndex& index) 
         out += std::format("{}{} = {},\n", Indent(1), UniqueMember(entry, taken), value.value);
     }
     out += "};\n\n";
+}
+
+// --- reflected function wrappers -------------------------------------------------------
+
+// "/Script/Engine.Vector" -> "/Script/Engine"
+std::string PackageOfPath(std::string_view path) {
+    const auto dot = path.rfind('.');
+    return dot == std::string_view::npos ? std::string{} : std::string(path.substr(0, dot));
+}
+
+// Whether a signature type is already available in the package header that declares the
+// method. A pointer is, through a forward declaration. A struct or enum passed by value
+// from another package is not, and needs one emitted for it.
+//
+// A declaration is happy with an incomplete type; only the body needs the definition, and
+// bodies live in Functions.hpp which includes everything.
+bool SignatureIsReachable(const ir::TypeRef& type, const std::string& package) {
+    using ir::TypeKind;
+
+    switch (type.kind) {
+        case TypeKind::Struct:
+        case TypeKind::Enum:
+            if (type.name.empty()) return false;
+            if (PackageOfPath(type.name) != package) return false;
+            break;
+
+        // Containers hold their element by value, so the element has to be reachable too.
+        case TypeKind::Array: case TypeKind::Set: case TypeKind::Map:
+        case TypeKind::Optional:
+            break;
+
+        default:
+            return true;   // scalars, and pointers that a forward declaration covers
+    }
+
+    for (const auto& param : type.params)
+        if (!SignatureIsReachable(param, package)) return false;
+    return true;
+}
+
+bool IsStaticFunction(const ir::Function& fn) {
+    return std::find(fn.flag_names.begin(), fn.flag_names.end(), "Static") !=
+           fn.flag_names.end();
+}
+
+// One parameter block per function, named for the pair so two classes can each have an
+// Activate without colliding.
+std::string ParamsStructName(std::string_view type_name, std::string_view function_name) {
+    return std::format("{}_{}_Params", type_name, SafeIdentifier(function_name));
+}
+
+// Out parameters are references because the callee writes them. Everything else goes by
+// value: "const T*&" is a reference to pointer-to-const and will not assign into the T*
+// member of the parameter block, and a per-kind rule would be more surface than the copy
+// is worth.
+std::string RenderParameter(const ir::FunctionParam& param, const std::string& rendered,
+                            const std::string& member) {
+    if (param.is_out) return std::format("{}& {}", rendered, member);
+    return std::format("{} {}", rendered, member);
+}
+
+// The parameter block, laid out at the offsets the engine reported. Padding matters here
+// for the same reason it does in a struct: the callee reads its arguments by offset.
+void EmitParamsStruct(std::string& out, const ir::Struct& record, const ir::Function& fn,
+                      const TypeIndex& index, std::vector<std::string>& warnings) {
+    const std::string type_name = index.cpp_names.at(record.path);
+    const std::string name = ParamsStructName(type_name, fn.name);
+
+    std::vector<ir::FunctionParam> params = fn.params;
+    std::sort(params.begin(), params.end(),
+              [](const ir::FunctionParam& a, const ir::FunctionParam& b) {
+                  return a.offset < b.offset;
+              });
+
+    out += std::format("struct {} {{\n", name);
+
+    std::set<std::string> taken;
+    int pad_counter = 0;
+    std::int32_t cursor = 0;
+    for (const auto& param : params) {
+        EmitPadding(out, cursor, param.offset, pad_counter);
+
+        bool opaque = false;
+        const std::string rendered = RenderType(index, param.type, param.size, warnings,
+                                                opaque);
+        const std::string member = UniqueMember(param.name, taken);
+
+        if (opaque || rendered.empty()) {
+            out += WithComment(std::format("uint8 {}[0x{:X}];", member, param.size),
+                               std::format("// 0x{:04X}(0x{:04X}) unrepresentable",
+                                           param.offset, param.size));
+        } else {
+            out += WithComment(std::format("{} {};", rendered, member),
+                               std::format("// 0x{:04X}(0x{:04X})", param.offset,
+                                           param.size));
+        }
+        cursor = param.offset + param.size;
+    }
+
+    // The block has to be at least as large as the last parameter ends, or the callee
+    // writes past it.
+    EmitPadding(out, cursor, cursor, pad_counter);
+    out += "};\n\n";
+}
+
+// The declaration that sits inside the class.
+std::string FunctionDeclaration(const ir::Struct& record, const ir::Function& fn,
+                                const TypeIndex& index, std::set<std::string>& taken,
+                                std::vector<std::string>& warnings, std::string& out_name) {
+    (void)record;
+    std::string return_type = "void";
+    std::vector<std::string> args;
+
+    std::set<std::string> arg_names;
+    for (const auto& param : fn.params) {
+        bool opaque = false;
+        const std::string rendered = RenderType(index, param.type, param.size, warnings,
+                                                opaque);
+        if (opaque || rendered.empty()) return {};   // cannot be spelled, so no wrapper
+
+        if (param.is_return) {
+            return_type = rendered;
+            continue;
+        }
+        args.push_back(RenderParameter(param, rendered, UniqueMember(param.name, arg_names)));
+    }
+
+    out_name = UniqueMember(fn.name, taken);
+
+    std::string joined;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (i != 0) joined += ", ";
+        joined += args[i];
+    }
+    return std::format("{} {}({});", return_type, out_name, joined);
+}
+
+// The body, emitted after every type in the file so each parameter type is complete.
+void EmitFunctionBody(std::string& out, const ir::Struct& record, const ir::Function& fn,
+                      const std::string& method_name, const TypeIndex& index,
+                      std::vector<std::string>& warnings) {
+    const std::string type_name = index.cpp_names.at(record.path);
+    const std::string params_name = ParamsStructName(type_name, fn.name);
+
+    std::string return_type = "void";
+    std::string return_member;
+    std::vector<std::pair<std::string, bool>> assignments;   // member, is_out
+    std::vector<std::string> args;
+
+    std::set<std::string> arg_names;
+    std::set<std::string> member_names;
+    for (const auto& param : fn.params) {
+        bool opaque = false;
+        const std::string rendered = RenderType(index, param.type, param.size, warnings,
+                                                opaque);
+        if (opaque || rendered.empty()) return;
+
+        const std::string member = UniqueMember(param.name, member_names);
+        if (param.is_return) {
+            return_type = rendered;
+            return_member = member;
+            continue;
+        }
+
+        const std::string arg = UniqueMember(param.name, arg_names);
+        args.push_back(RenderParameter(param, rendered, arg));
+        assignments.emplace_back(arg, param.is_out);
+    }
+
+    std::string joined;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (i != 0) joined += ", ";
+        joined += args[i];
+    }
+
+    out += std::format("inline {} {}::{}({}) {{\n", return_type, type_name, method_name,
+                       joined);
+    out += std::format("{}static void* function = nullptr;\n", Indent(1));
+    out += std::format("{}{} params{{}};\n", Indent(1), params_name);
+
+    std::size_t member_index = 0;
+    std::set<std::string> replay;
+    for (const auto& param : fn.params) {
+        if (param.is_return) continue;
+        const std::string member = UniqueMember(param.name, replay);
+        out += std::format("{}params.{} = {};\n", Indent(1), member,
+                           assignments[member_index].first);
+        ++member_index;
+    }
+
+    out += std::format("{}ZirconSDK::Call(this, function, \"{}.{}\", &params);\n",
+                       Indent(1), record.path, fn.name);
+
+    // An out parameter is only useful if what the callee wrote comes back.
+    member_index = 0;
+    replay.clear();
+    for (const auto& param : fn.params) {
+        if (param.is_return) continue;
+        const std::string member = UniqueMember(param.name, replay);
+        if (assignments[member_index].second)
+            out += std::format("{}{} = params.{};\n", Indent(1),
+                               assignments[member_index].first, member);
+        ++member_index;
+    }
+
+    if (!return_member.empty())
+        out += std::format("{}return params.{};\n", Indent(1), return_member);
+
+    out += "}\n\n";
 }
 
 void EmitStruct(std::string& out, const ir::Struct& record, const TypeIndex& index,
@@ -553,6 +857,25 @@ void EmitStruct(std::string& out, const ir::Struct& record, const TypeIndex& ind
     }
 
     EmitPadding(out, cursor, record.size, pad_counter);
+
+    // Declarations only. The bodies go at the end of the file, where every parameter type
+    // is complete; a declaration is happy with the forward declarations above.
+    if (!record.functions.empty()) {
+        std::string declarations;
+        for (const auto& fn : record.functions) {
+            std::string method_name;
+            const std::string decl =
+                FunctionDeclaration(record, fn, index, taken, warnings, method_name);
+            if (decl.empty()) continue;
+            declarations += WithComment(
+                decl, IsStaticFunction(fn) ? "// static" : std::string{});
+        }
+        if (!declarations.empty()) {
+            out += "\n";
+            out += declarations;
+        }
+    }
+
     out += "};\n";
 
     // The point of the whole emitter: if any derived offset is wrong, this fails to
@@ -565,6 +888,150 @@ void EmitStruct(std::string& out, const ir::Struct& record, const TypeIndex& ind
                            "\"Wrong offset on {}::{}\");\n",
                            name, member, offset, name, member);
     out += "\n";
+}
+
+// Appended to Basic.hpp. UE dispatches a reflected call through UObject::ProcessEvent,
+// which is virtual, and its vtable index is not in the reflection data. Deriving it would
+// mean binary analysis with nothing independent to check the answer against, so the SDK
+// names the one thing it cannot know and asks for it once. The function itself is
+// addressed by full object path, which the dump does have.
+constexpr std::string_view kCallRuntime = R"(
+// --- calling reflected functions ------------------------------------------------------
+//
+// Two hooks stand between a wrapper and the game:
+//
+//   ZirconSDK::FindFunction   resolve a UFunction by full path, e.g.
+//                             "/Script/Engine.PawnMovementComponent.AddInputVector"
+//   ZirconSDK::ProcessEvent   invoke it: object, function, parameter block
+//
+// Injected alongside zircon.dll, both are free:
+//
+//     ZirconSDK::BindToZirconPayload();
+//
+// FindFunction comes from the payload, which has already walked the object graph.
+// ProcessEvent comes from the vtable slot below, when the dump this SDK was generated
+// from carried one.
+//
+// Each wrapper resolves its UFunction once and caches it. A wrapper on a Static function
+// still needs an object to dispatch through; UE uses the class default object for those.
+//
+// BindToZirconPayload only exists when <windows.h> has already been included. This header
+// will not pull it in: it defines several hundred macros, among them ERROR, DELETE,
+// GetObject and Rectangle, and a generated SDK is thousands of reflected names that did
+// not agree to avoid them. Anything injected has windows.h anyway.
+
+namespace ZirconSDK {
+
+inline void* (*FindFunction)(const char* full_path) = nullptr;
+inline void  (*ProcessEvent)(void* object, void* function, void* params) = nullptr;
+
+// UObject::ProcessEvent's vtable slot on the build this SDK was generated from.
+//
+// -1 when the dump did not carry one, in which case set ProcessEvent yourself. It is not
+// a number that can be read out of the engine: it was confirmed by calling a function
+// whose answer was known, and only because someone asked for that to happen.
+//
+// It belongs to this build. An SDK regenerated after a game update carries the slot that
+// update has.
+inline constexpr int kProcessEventSlot = %PE_SLOT%;
+
+// The ProcessEvent for one object, taken from its own vtable. Every UObject shares the
+// implementation unless it overrides it, so any object will do.
+inline void CallProcessEvent(void* object, void* function, void* params) {
+    auto vtable = *reinterpret_cast<void***>(object);
+    auto fn = reinterpret_cast<void(*)(void*, void*, void*)>(vtable[kProcessEventSlot]);
+    fn(object, function, params);
+}
+
+#ifdef _WINDOWS_
+// Fills in FindFunction from zircon.dll when the payload is loaded in this process, which
+// is the case for anything injected alongside it. Resolving an object by path is the walk
+// the payload has already done, so there is no reason to write it twice.
+//
+// False when the payload is not there, in which case set FindFunction yourself.
+inline bool BindToZirconPayload() {
+    HMODULE payload = ::GetModuleHandleA("zircon.dll");
+    if (payload == nullptr) return false;
+
+    auto resolve = reinterpret_cast<void* (*)(const char*)>(
+        reinterpret_cast<void*>(::GetProcAddress(payload, "zircon_find_object")));
+    if (resolve == nullptr) return false;
+
+    FindFunction = resolve;
+
+    // The slot came from the dump, so nothing has to be found at runtime.
+    if (kProcessEventSlot >= 0 && ProcessEvent == nullptr) ProcessEvent = &CallProcessEvent;
+
+    return ProcessEvent != nullptr;
+}
+#endif
+
+// False when the hooks are unset or the function was not found, which is worth being able
+// to tell apart from a call that ran and did nothing.
+inline bool Call(void* object, void*& cached, const char* full_path, void* params) {
+    if (ProcessEvent == nullptr) return false;
+    if (cached == nullptr) {
+        if (FindFunction == nullptr) return false;
+        cached = FindFunction(full_path);
+        if (cached == nullptr) return false;
+    }
+    ProcessEvent(object, cached, params);
+    return true;
+}
+
+} // namespace ZirconSDK
+)";
+
+// Every identifier the SDK emits, guarded so it stops being a macro if it is one.
+//
+// The rename list above covers the names worth protecting for the caller's sake. It
+// cannot cover the rest: Ready Or Not has an enumerator called TRANSPARENT, which wingdi.h
+// defines, and no list written against one game predicts the next one. So the names that
+// are not renamed get an #undef that only fires when the name really is a macro on
+// whichever Windows SDK is compiling.
+//
+// A user macro that shares a name with a reflected identifier loses. The SDK cannot spell
+// the name any other way, and a header that does not compile helps nobody. Anything whose
+// loss would actually hurt belongs on the rename list instead, which is what it is for.
+std::string UndefHeader(const TypeIndex& index) {
+    std::set<std::string> names;
+
+    auto note = [&](std::string_view raw) {
+        std::string name = util::SanitizeIdentifier(raw);
+        // Renamed already, so the macro is welcome to keep the original spelling.
+        if (name.empty() || ClashesWithWindowsMacro(name)) return;
+        names.insert(std::move(name));
+    };
+
+    for (const auto& [path, record] : index.enums) {
+        (void)path;
+        for (const auto& value : record->values) {
+            std::string entry = value.name;
+            const auto scope = entry.rfind("::");
+            note(scope == std::string::npos ? entry : entry.substr(scope + 2));
+        }
+    }
+
+    for (const auto& [path, record] : index.structs) {
+        (void)path;
+        for (const auto& property : record->properties) note(property.name);
+        for (const auto& function : record->functions) {
+            note(function.name);
+            for (const auto& param : function.params) note(param.name);
+        }
+    }
+
+    std::string out =
+        "#pragma once\n\n"
+        "// Reflected names a Windows header may have taken as a macro first.\n"
+        "//\n"
+        "// Guarded, so nothing happens unless the name really is one. Names whose loss\n"
+        "// would hurt the caller are renamed in the SDK instead; see Basic.hpp.\n\n";
+
+    for (const auto& name : names)
+        out += std::format("#ifdef {0}\n#undef {0}\n#endif\n", name);
+
+    return out;
 }
 
 std::string BasicHeader(const SizeTable& sizes) {
@@ -714,7 +1181,7 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         std::set<std::string> taken;
         for (const auto& [path, record] : index.structs) {
             const char prefix = util::CppPrefixFor(dump, *record);
-            std::string name = prefix + util::SanitizeIdentifier(util::LeafName(path));
+            std::string name = prefix + SafeIdentifier(util::LeafName(path));
             if (!taken.insert(name).second) {
                 const std::string package = util::PackageFileStem(util::PackageName(path));
                 name = std::format("{}_{}", name, package);
@@ -725,7 +1192,7 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         }
         for (const auto& [path, record] : index.enums) {
             (void)record;
-            std::string name = util::SanitizeIdentifier(util::LeafName(path));
+            std::string name = SafeIdentifier(util::LeafName(path));
             if (name.empty() || name[0] != 'E') name = "E" + name;
             if (!taken.insert(name).second) {
                 for (int n = 1;; ++n) {
@@ -737,11 +1204,34 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         }
     }
 
+    // Accumulated across every package, written once at the end.
+    std::string params_blocks;
+    std::string function_bodies;
+
     std::string error;
     const std::string root = options.out_dir + "/SDK";
     if (!util::EnsureDirectory(root, error)) { result.error = error; return result; }
 
-    if (!util::WriteFile(root + "/Basic.hpp", BasicHeader(index.sizes), error)) {
+    if (!util::WriteFile(root + "/Undef.hpp", UndefHeader(index), error)) {
+        result.error = error;
+        return result;
+    }
+    result.files.push_back(root + "/Undef.hpp");
+
+    // The one number in the runtime that is not the same for every target.
+    int process_event_slot = -1;
+    for (const auto& offset : dump.header.offsets)
+        if (offset.name == "UObject.ProcessEvent") process_event_slot = offset.value;
+
+    std::string call_runtime{kCallRuntime};
+    if (const auto at = call_runtime.find("%PE_SLOT%"); at != std::string::npos)
+        call_runtime.replace(at, std::strlen("%PE_SLOT%"),
+                             std::format("{}", process_event_slot));
+
+    if (!util::WriteFile(root + "/Basic.hpp",
+                         "#pragma once\n#include \"Undef.hpp\"\n" +
+                             BasicHeader(index.sizes) + call_runtime,
+                         error)) {
         result.error = error;
         return result;
     }
@@ -771,6 +1261,13 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
             for (const auto& property : record->properties)
                 CollectValueDependencies(property.type, deps);
 
+            // Function signatures name types by value too. A method declared here that
+            // returns a struct from another package needs that package included, and a
+            // property never referencing it is no reason to leave it out.
+            for (const auto& fn : record->functions)
+                for (const auto& param : fn.params)
+                    CollectValueDependencies(param.type, deps);
+
             for (const auto& dep : deps) {
                 const auto it = index.package_of.find(dep);
                 if (it == index.package_of.end()) continue;
@@ -788,6 +1285,59 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         // other packages, which is what keeps per-package headers independent of include
         // order.
         std::set<std::string> forwards;
+        {
+            std::function<void(const ir::TypeRef&)> collect = [&](const ir::TypeRef& type) {
+                const bool is_pointer =
+                    type.kind == ir::TypeKind::ObjectPtr || type.kind == ir::TypeKind::ClassPtr ||
+                    type.kind == ir::TypeKind::WeakPtr   || type.kind == ir::TypeKind::LazyPtr ||
+                    type.kind == ir::TypeKind::SoftPtr   || type.kind == ir::TypeKind::SoftClassPtr ||
+                    type.kind == ir::TypeKind::Interface;
+                if (is_pointer && !type.name.empty()) {
+                    const auto it = index.cpp_names.find(type.name);
+                    if (it != index.cpp_names.end()) forwards.insert(it->second);
+                }
+                for (const auto& param : type.params) collect(param);
+            };
+
+            // Function signatures reference classes by pointer too, and a wrapper is
+            // declared inside the class where only the forward declaration is in scope.
+            for (const auto* record : records)
+                for (const auto& fn : record->functions)
+                    for (const auto& param : fn.params) collect(param.type);
+        }
+
+        // Every type named in a function signature, declared ahead of the first class that
+        // mentions it.
+        //
+        // Not only the ones from other packages: a type defined later in this same header
+        // is just as unavailable to a method declared earlier, and the sort that orders
+        // definitions has no reason to agree with the order signatures reference them in.
+        // Declaring a type that is defined further down is harmless.
+        std::set<std::string> forward_structs;
+        std::map<std::string, std::string> forward_enums;   // name -> underlying
+        {
+            std::function<void(const ir::TypeRef&)> collect = [&](const ir::TypeRef& type) {
+                if (!type.name.empty()) {
+                    if (type.kind == ir::TypeKind::Struct) {
+                        const auto it = index.cpp_names.find(type.name);
+                        if (it != index.cpp_names.end()) forward_structs.insert(it->second);
+                    } else if (type.kind == ir::TypeKind::Enum) {
+                        const auto named = index.cpp_names.find(type.name);
+                        const auto record = index.enums.find(type.name);
+                        if (named != index.cpp_names.end() && record != index.enums.end())
+                            forward_enums[named->second] =
+                                std::string(EnumUnderlying(*record->second));
+                    }
+                }
+                for (const auto& param : type.params) collect(param);
+            };
+
+            for (const auto* record : records)
+                for (const auto& fn : record->functions)
+                    for (const auto& param : fn.params) collect(param.type);
+
+        }
+
         for (const auto* record : records)
             for (const auto& property : record->properties) {
                 std::function<void(const ir::TypeRef&)> walk = [&](const ir::TypeRef& type) {
@@ -805,8 +1355,10 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
                 walk(property.type);
             }
 
+        // "struct", matching how every type is defined below. Declaring one as "class"
+        // and defining it as "struct" is a mismatch MSVC reports at /W4.
         if (!forwards.empty()) {
-            for (const auto& name : forwards) out += std::format("class {};\n", name);
+            for (const auto& name : forwards) out += std::format("struct {};\n", name);
             out += "\n";
         }
 
@@ -821,10 +1373,28 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         // are hand-written at natural alignment.
         out += "#pragma pack(push, 1)\n\n";
 
-        for (const auto* record : TopoSort(records, result.warnings))
+        const auto sorted = TopoSort(records, result.warnings);
+        for (const auto* record : sorted)
             EmitStruct(out, *record, index, result.warnings);
 
         out += "#pragma pack(pop)\n";
+
+        // Parameter blocks and bodies go to Functions.hpp instead of here. A body needs
+        // every signature type complete, and a package header sees only Basic.hpp plus
+        // forward declarations.
+        for (const auto* record : sorted) {
+            std::set<std::string> taken;
+            for (const auto& fn : record->functions) {
+                std::string method_name;
+                const std::string decl =
+                    FunctionDeclaration(*record, fn, index, taken, result.warnings,
+                                        method_name);
+                if (decl.empty()) continue;
+                EmitParamsStruct(params_blocks, *record, fn, index, result.warnings);
+                EmitFunctionBody(function_bodies, *record, fn, method_name, index,
+                                 result.warnings);
+            }
+        }
 
         const std::string path = std::format("{}/{}.hpp", root, stem);
         if (!util::WriteFile(path, out, error)) { result.error = error; return result; }
@@ -847,6 +1417,44 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         emitted_packages.push_back(stem);
     }
 
+    // --- function wrappers ------------------------------------------------------------
+    //
+    // One header, included after every package, so a parameter type is complete whichever
+    // package the engine put it in. Splitting these per package would need the packages to
+    // include one another, and an include graph across six hundred headers is worse than
+    // one file that arrives last.
+    std::sort(emitted_packages.begin(), emitted_packages.end());
+    emitted_packages.erase(std::unique(emitted_packages.begin(), emitted_packages.end()),
+                           emitted_packages.end());
+
+    if (!function_bodies.empty()) {
+        std::string functions =
+            "#pragma once\n\n"
+            "// Wrappers for every reflected function, and the parameter block each one\n"
+            "// passes. Included after all packages: a body needs its parameter types\n"
+            "// complete, and those come from wherever the engine put them.\n"
+            "//\n"
+            "// Set ZirconSDK::FindFunction and ZirconSDK::ProcessEvent once before calling\n"
+            "// any of these. See Basic.hpp.\n\n";
+
+        for (const auto& stem : emitted_packages)
+            functions += std::format("#include \"{}.hpp\"\n", stem);
+
+        // Parameter blocks sit at engine offsets, so the packing pragma applies to them
+        // exactly as it does to any other reflected type.
+        functions += "\n#pragma pack(push, 1)\n\n";
+        functions += params_blocks;
+        functions += "#pragma pack(pop)\n\n";
+        functions += function_bodies;
+
+        const std::string functions_path = root + "/Functions.hpp";
+        if (!util::WriteFile(functions_path, functions, error)) {
+            result.error = error;
+            return result;
+        }
+        result.files.push_back(functions_path);
+    }
+
     // --- umbrella header ----------------------------------------------------------
     std::sort(emitted_packages.begin(), emitted_packages.end());
     emitted_packages.erase(std::unique(emitted_packages.begin(), emitted_packages.end()),
@@ -864,6 +1472,7 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
         emitted_packages.size(), dump.TotalClasses(), dump.TotalStructs(), dump.TotalEnums());
 
     for (const auto& stem : emitted_packages) sdk += std::format("#include \"SDK/{}.hpp\"\n", stem);
+    if (!function_bodies.empty()) sdk += "\n#include \"SDK/Functions.hpp\"\n";
 
     const std::string sdk_path = options.out_dir + "/SDK.hpp";
     if (!util::WriteFile(sdk_path, sdk, error)) { result.error = error; return result; }

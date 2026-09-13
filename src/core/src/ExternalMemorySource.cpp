@@ -70,11 +70,55 @@ public:
         return read;
     }
 
+    bool EnableWrites(bool enable) override {
+        if (!enable) {
+            writes_enabled_ = false;
+            return false;
+        }
+        if (writes_enabled_) return true;
+
+        // The handle this was opened with can only read. Writing needs a second one with
+        // VM_WRITE and VM_OPERATION, so it is asked for here and only here: a session
+        // that never enables writes never holds a handle that could perform one.
+        constexpr DWORD kWriteAccess = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ |
+                                       PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+
+        UniqueHandle writable(::OpenProcess(kWriteAccess, FALSE, pid_));
+        if (!writable) {
+            LogWarn("cannot reopen pid {} for writing: {}", pid_,
+                    LastErrorText(::GetLastError()));
+            return false;
+        }
+
+        process_ = std::move(writable);
+        writes_enabled_ = true;
+        LogInfo("writes enabled on pid {}", pid_);
+        return true;
+    }
+
     bool Write(Address addr, const void* in, std::size_t size) override {
         if (!writes_enabled_) return false;
+
+        auto* target = reinterpret_cast<LPVOID>(Raw(addr));
         SIZE_T written = 0;
-        return ::WriteProcessMemory(process_.get(), reinterpret_cast<LPVOID>(Raw(addr)),
-                                    in, size, &written) && written == size;
+        if (::WriteProcessMemory(process_.get(), target, in, size, &written) &&
+            written == size)
+            return true;
+
+        // A read-only page is the usual reason. Lift the protection for the write and put
+        // it back, so the target is left exactly as it was found.
+        DWORD previous = 0;
+        if (!::VirtualProtectEx(process_.get(), target, size, PAGE_EXECUTE_READWRITE,
+                                &previous))
+            return false;
+
+        written = 0;
+        const bool ok = ::WriteProcessMemory(process_.get(), target, in, size, &written) &&
+                        written == size;
+
+        DWORD ignored = 0;
+        ::VirtualProtectEx(process_.get(), target, size, previous, &ignored);
+        return ok;
     }
 
     std::span<const ModuleInfo> Modules() const override { return modules_; }

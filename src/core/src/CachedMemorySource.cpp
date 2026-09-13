@@ -63,6 +63,8 @@ public:
         return done;
     }
 
+    bool EnableWrites(bool enable) override { return inner_->EnableWrites(enable); }
+
     bool Write(Address addr, const void* in, std::size_t size) override {
         const bool ok = inner_->Write(addr, in, size);
         // Otherwise later reads hand back the pre-write bytes.

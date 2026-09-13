@@ -172,7 +172,7 @@ ir::Dump BuildDump(const Reflection& reflection, const BuildOptions& options) {
     value_format.max_depth       = 3;
 
     // --- header -----------------------------------------------------------------------
-    dump.header.tool_version = "0.1.0-dev";
+    dump.header.tool_version = ZIRCON_VERSION;
     dump.header.created_utc  = Utc();
     dump.header.partial      = !memory.Caps().live_objects;
 
@@ -220,6 +220,9 @@ ir::Dump BuildDump(const Reflection& reflection, const BuildOptions& options) {
         {"UField.Next",                fl.field_next},
         {"UFunction.FunctionFlags",    fl.function_flags},
         {"UFunction.Func",             fl.native_func},
+        // A vtable slot, not a byte offset, and the only entry here confirmed by calling
+        // instead of by reading. Absent unless the payload was asked to find it.
+        {"UObject.ProcessEvent",       reflection.process_event_index},
     };
 
     dump.header.globals = {

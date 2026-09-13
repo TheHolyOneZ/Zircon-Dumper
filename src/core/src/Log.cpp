@@ -3,13 +3,18 @@
 #include "core/Term.h"
 
 #include <cstdio>
+#ifdef _WIN32
+#include <share.h>
+#endif
 #include <mutex>
+#include <string>
 
 namespace zircon::core {
 
 namespace {
 LogLevel  g_level = LogLevel::Info;
 std::mutex g_mutex;
+std::FILE* g_file = nullptr;
 
 const char* LevelTag(LogLevel level) {
     switch (level) {
@@ -36,6 +41,24 @@ std::string_view LevelColour(LogLevel level) {
 }
 } // namespace
 
+void SetLogFile(std::string_view path) {
+    std::lock_guard lock(g_mutex);
+    if (g_file) { std::fclose(g_file); g_file = nullptr; }
+    if (path.empty()) return;
+
+    const std::string owned(path);
+#ifdef _WIN32
+    // _fsopen, not fopen_s: fopen_s takes the file exclusively, so nothing could read the
+    // log while the process that is writing it is still running. Watching a payload work
+    // is most of the reason the file exists.
+    g_file = _fsopen(owned.c_str(), "w", _SH_DENYWR);
+#else
+    g_file = std::fopen(owned.c_str(), "w");
+#endif
+}
+
+void CloseLogFile() { SetLogFile({}); }
+
 void SetLogLevel(LogLevel level) { g_level = level; }
 LogLevel GetLogLevel() { return g_level; }
 
@@ -57,6 +80,14 @@ void LogRaw(LogLevel level, std::string_view message) {
                  dim_body ? static_cast<int>(term::Dim().size()) : 0, term::Dim().data(),
                  static_cast<int>(message.size()), message.data(),
                  dim_body ? static_cast<int>(reset.size()) : 0, reset.data());
+
+    if (g_file) {
+        std::fprintf(g_file, "[%s] %.*s\n", LevelTag(level),
+                     static_cast<int>(message.size()), message.data());
+        // Flushed per line on purpose. The interesting log is the one written by a payload
+        // that then crashed the game, and a buffered tail is exactly the part that matters.
+        std::fflush(g_file);
+    }
 }
 
 } // namespace zircon::core

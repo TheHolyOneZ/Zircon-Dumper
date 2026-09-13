@@ -22,9 +22,12 @@ IDI_ZIRCON ICON "zircon.ico"
 
 // Right-click -> Properties -> Details. An executable with no version block looks like
 // something a build script forgot about.
+//
+// The numbers come from CMake, which takes them from project(). Typing them here again is
+// how the dump header spent a whole release announcing the previous one.
 VS_VERSION_INFO VERSIONINFO
-  FILEVERSION     0,1,0,0
-  PRODUCTVERSION  0,1,0,0
+  FILEVERSION     ZIRCON_VER_MAJOR,ZIRCON_VER_MINOR,ZIRCON_VER_PATCH,0
+  PRODUCTVERSION  ZIRCON_VER_MAJOR,ZIRCON_VER_MINOR,ZIRCON_VER_PATCH,0
   FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
   FILEFLAGS       VS_FF_DEBUG | VS_FF_PRERELEASE
@@ -41,12 +44,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "TheHolyOneZ"
       VALUE "FileDescription",  "Unreal Engine reflection extraction and analysis toolkit"
-      VALUE "FileVersion",      "0.1.0-dev"
+      VALUE "FileVersion",      ZIRCON_VERSION
       VALUE "InternalName",     "zircon"
       VALUE "LegalCopyright",   "Copyright (c) 2026 TheHolyOneZ. Apache License 2.0."
       VALUE "OriginalFilename", ZIRCON_RC_FILENAME
       VALUE "ProductName",      "Zircon"
-      VALUE "ProductVersion",   "0.1.0-dev"
+      VALUE "ProductVersion",   ZIRCON_VERSION
     END
   END
 
