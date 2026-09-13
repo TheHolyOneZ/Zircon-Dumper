@@ -1,0 +1,23 @@
+Zircon
+Copyright (c) 2026 TheHolyOneZ
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+--------------------------------------------------------------------------------
+Third-party code included in this repository
+--------------------------------------------------------------------------------
+
+Dear ImGui
+  third_party/imgui
+  Copyright (c) 2014-2025 Omar Cornut
+  MIT License. Full text in third_party/imgui/LICENSE.txt
+  https://github.com/ocornut/imgui
+
+Lua 5.4
+  third_party/lua
+  Copyright (c) 1994-2024 Lua.org, PUC-Rio
+  MIT License. Full text in third_party/lua/LICENSE.txt
+  https://www.lua.org
+
+Both are vendored unmodified apart from the build files needed to compile them
+here. Neither is redistributed under Zircon's licence; each keeps its own.

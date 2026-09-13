@@ -1,0 +1,57 @@
+// Shared resource body. Each binary has a thin .rc that sets the two macros below and
+// includes this, so the icon and the version block are defined once rather than three
+// times drifting apart.
+//
+//   #define ZIRCON_RC_FILENAME "zircon.exe"
+//   #define ZIRCON_RC_FILETYPE VFT_APP        // or VFT_DLL
+//   #include "common.rc"
+
+#include "resource.h"
+#include <windows.h>
+
+#ifndef ZIRCON_RC_FILENAME
+#define ZIRCON_RC_FILENAME "zircon.exe"
+#endif
+#ifndef ZIRCON_RC_FILETYPE
+#define ZIRCON_RC_FILETYPE VFT_APP
+#endif
+
+// Windows uses the lowest-numbered ICON resource as the application icon, and says
+// nothing if a different one happens to sort ahead of it. This is the only one.
+IDI_ZIRCON ICON "zircon.ico"
+
+// Right-click -> Properties -> Details. An executable with no version block looks like
+// something a build script forgot about.
+VS_VERSION_INFO VERSIONINFO
+  FILEVERSION     0,1,0,0
+  PRODUCTVERSION  0,1,0,0
+  FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+  FILEFLAGS       VS_FF_DEBUG | VS_FF_PRERELEASE
+#else
+  FILEFLAGS       VS_FF_PRERELEASE
+#endif
+  FILEOS          VOS_NT_WINDOWS32
+  FILETYPE        ZIRCON_RC_FILETYPE
+  FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"   // US English, Unicode
+    BEGIN
+      VALUE "CompanyName",      "TheHolyOneZ"
+      VALUE "FileDescription",  "Unreal Engine reflection extraction and analysis toolkit"
+      VALUE "FileVersion",      "0.1.0-dev"
+      VALUE "InternalName",     "zircon"
+      VALUE "LegalCopyright",   "Copyright (c) 2026 TheHolyOneZ. Apache License 2.0."
+      VALUE "OriginalFilename", ZIRCON_RC_FILENAME
+      VALUE "ProductName",      "Zircon"
+      VALUE "ProductVersion",   "0.1.0-dev"
+    END
+  END
+
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

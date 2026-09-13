@@ -1,0 +1,3 @@
+#define ZIRCON_RC_FILENAME "zircon.dll"
+#define ZIRCON_RC_FILETYPE VFT_DLL
+#include "common.rc"
