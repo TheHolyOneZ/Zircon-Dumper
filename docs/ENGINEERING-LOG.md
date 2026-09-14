@@ -24,8 +24,8 @@ Two defects the tests caught, both worth recording:
   silently truncates `"\x48\x8B\x00\x00"` at the first NUL. Real signatures contain
   zero bytes. The mask length is now authoritative and the bytes come in as a pointer.
 - `ReadRva` could not read the PE headers, because they sit below the first section and
-  section lookup missed them. The loader maps headers at file offset == RVA; we now do
-  the same.
+  section lookup missed them. The loader maps headers at file offset == RVA, and
+  `ReadRva` does the same now.
 
 `PeImage` still does not parse imports or relocations, because nothing has needed them.
 
@@ -140,7 +140,8 @@ wrong every single time it was the only test. In practice that means:
 
 ## Emitting an SDK
 
-Eight emitters, all pure functions of the IR and therefore testable without a game.
+Eight emitters at the time, all pure functions of the IR and therefore testable without
+a game. Three more landed in 0.3.0 - see the bottom of this file.
 
 | Format | Output | Status |
 |---|---|---|
@@ -148,6 +149,7 @@ Eight emitters, all pure functions of the IR and therefore testable without a ga
 | `usmap` | UE4SS / FModel binary mappings | v0 format, header verified |
 | `ida` | IDA Python importing structs + function names | 151k lines, parses |
 | `ghidra` | Ghidra Jython equivalent | 96k lines, parses |
+| `binja` | Binary Ninja type import (0.3.0) | data table + interpreter |
 | `reclass` | ReClass.NET `.rcnet` archive + loose XML | both written |
 | `docs` | browsable Markdown API reference | 249 files |
 | `graphs` | DOT + Mermaid inheritance graphs | per package + overview |
@@ -168,8 +170,8 @@ on its offset, so the SDK compiling *is* the proof that P1 and P2 derived the la
 correctly — a wrong offset anywhere upstream is a compiler error here rather than a
 silent misread at runtime.
 
-Deferred: `frida_js` and `python_stubs`. Both are straightforward once wanted; neither
-teaches anything the eight above have not.
+Deferred at the time: `frida_js` and `python_stubs`. Both landed in 0.3.0, and one of
+them did teach something - see below.
 
 ### What compiling 46k assertions found
 
@@ -734,3 +736,118 @@ on a dump carrying defaults.
 - **No silent guessing.** Anything derived carries a confidence value and is reported.
 - **Partial results beat failures.** An unknown property type becomes `unknown`, not a
   crash. A missing global degrades the dump, it does not abort it.
+
+---
+
+## 0.3.0 — the three deferred emitters
+
+### `binja`, and why it looks nothing like `ida` or `ghidra`
+
+Those two write a type out in the host's own language: a C declaration for IDA, a
+`DataType` call for Ghidra. Doing the same for Binary Ninja means a `StructureBuilder`
+sequence per type, and on a 5 000-class dump that is roughly 40 MB of Python that its
+interpreter has to parse before anything happens. It is also the same six lines copied
+fifty thousand times, which is where a mistake gets to hide.
+
+So it writes a table and one loop. Every member is a five-tuple `(offset, name, kind, arg,
+count)` with a one-character kind, and forty lines at the bottom of the script turn that
+into types. The build logic exists once, where it can be read.
+
+The other thing that fell out of it: no topological sort. The script reserves every type
+name at its final width first and fills members in afterwards, so a named reference always
+resolves. UE dumps contain reference cycles, and the two C-emitting backends have to warn
+about them because a C declaration cannot be written out of order. Here they cost nothing.
+
+### The Frida blob is JSON, not a JS object
+
+Emitting the type table as a JavaScript object literal is the obvious thing and it is
+slow: V8 has a dedicated JSON parser and the object-literal path goes through the full
+parser. So the data is a string that goes through `JSON.parse`.
+
+That string then has to sit inside a JS literal, and the first version put raw newlines in
+it — which is a syntax error, not a warning. Escaping them to `\n` would have produced a
+single 30 MB line that no editor opens. The literal closes and reopens instead:
+
+```js
+var DATA = JSON.parse('{"meta":...' +
+'"/Script/Engine.Actor":{...}' +
+...);
+```
+
+One type per source line, one string to the parser.
+
+`Zircon.base` also had to become lazy. The first version resolved it with
+`Module.findBaseAddress` at load time, which made the file unloadable outside Frida —
+including from node, which is where the accessors were then tested. Everything above that
+line is plain data, and querying an offset from a build script is a reasonable thing to
+want.
+
+**Verified against a fake buffer.** The generated runtime was loaded in node over a
+`Buffer` with a NativePointer stand-in: fifteen checks, covering the bit-preserving write
+(set one bool, the other six in the byte survive), enum round-trip by name, a nested
+struct's members landing at the outer offset plus the inner one, an inherited property read
+through a derived class, and `FString` refusing to be written. That is the kind of check
+the C++ suite cannot do, because it cannot run JavaScript.
+
+### Two guards, neither test able to fail
+
+`None` is an enumerator in `EGizmoElements` and a keyword in Python, so the stub emitter
+renames it `None_`. The check existed twice: once in `PyIdentifier`, once again after the
+`EFoo::Bar` leaf was stripped in the enum loop.
+
+Removing either one left the other standing, so the test passed both times it should have
+failed. The stripping now happens *before* sanitising rather than after, which leaves one
+guard, and removing it fails two assertions.
+
+Recorded because it is the same shape as the round-trip limitation noted earlier in this
+file: a test is exactly as complete as the thing it exercises, and redundant code makes it
+quietly less complete than it looks.
+
+### What the linter caught the first time it met a real game
+
+`validate --strict` was built against fixtures and ten hand-broken dumps. The first shipped
+game it saw came back with 176 errors, and both causes were real.
+
+**The name check, again.** `TypeResolver` refuses a referenced object unless it is the kind
+expected, which is right, and it was testing that with a string compare against the class
+name. A Blueprint class's class is `BlueprintGeneratedClass`; a Blueprint struct's is
+`UserDefinedStruct`. Neither equals `"Class"` or `"ScriptStruct"`, so 489 object properties
+and 43 struct properties came back with no type at all.
+
+`ClassifyObject` exists precisely for this and `StructLayout.h` carries a comment saying
+so, including that the mistake had already been made once and gone unnoticed until the
+bytecode decompiler found functions the dump did not contain. It was still being made one
+file away. The lesson is not "use ClassifyObject" — that was already written down. It is
+that writing the lesson down does not find the places still doing it, and a check that
+reads the finished artefact does.
+
+Measured as a strict gain, not a change: 532 references recovered, 0 offsets moved, 0 sizes
+changed, 0 properties renamed to anything other than from empty.
+
+**The enum width, half-fixed.** 0.2.0 found that `Enum::underlying` was `uint8` for enums
+whose values need more, and fixed it in the emitters — the SDK widens at emit time and
+compiles. The IR kept saying `uint8`. That is invisible while the built-in emitters are the only
+consumers, and wrong for a plugin, a script, or the two new emitters in this release.
+
+The fix belongs where the data is: `DumpBuilder` widens `underlying` to whatever the values
+need, because the values come straight from `UEnum::Names` and the width was a fallback.
+22 enums on that game, 0 enum values changed.
+
+Both of these had been reproduced identically by all three memory providers for months. L5
+— external, injected and minidump agreeing byte for byte — cannot see a defect they all
+share, and that is the argument for L6 being a separate level rather than a nicer way of
+saying the same thing.
+
+### The SDK's "zero warnings" had quietly stopped being true
+
+Every type in the SDK is `struct`. Every elaborated specifier in a function signature said
+`class`. MSVC raises C4099 per occurrence: 27,334 on a UE 5.6 game.
+
+Never an error, never a layout problem, and the compile test had been checking for errors.
+"0 errors, 0 warnings" went in the README when both were true and only the first half was
+being re-measured afterwards. Fixed in the seven places that render a reference plus one
+hand-written `class UClass*` in `Basic.hpp`; `/W3` is clean again.
+
+Worth keeping because of what it says about the test: a claim is only maintained if
+something re-checks the whole of it, and a compile test that greps for `error` will watch
+a warning count go from 0 to 27,334 without comment.

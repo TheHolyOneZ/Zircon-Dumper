@@ -21,6 +21,7 @@ levels, each one a thing that either happened or did not:
 | **L3** SDK | the generated C++ SDK compiles with **zero** errors | `cl /c` over `SDK.hpp` |
 | **L4** script | Kismet bytecode decompiles, with the undecoded fraction measured | `zircon script --pid N` |
 | **L5** agreement | external, minidump and injected providers produce byte-identical dumps | `zircon diff a.json b.json` |
+| **L6** self-consistent | the dump passes every structural check against itself | `zircon validate --strict` |
 
 L5 has a precondition that the others do not: the target's object graph has to hold still.
 Capturing a full-memory minidump of a large game takes minutes, and a game that is still
@@ -31,6 +32,11 @@ target, not a result — see Subnautica 2 below.
 L3 is the one that matters most. Every member carries a `static_assert` on its offset, so
 a compiling SDK is tens of thousands of independent checks that the layout is right — not
 a claim that output was produced.
+
+L6 is new in 0.3.0 and asks a different question from L5. L5 says three providers agree;
+they can agree and all three be wrong the same way, which is exactly what happened on
+Funnel Runners before 0.3.0 — every provider faithfully reproduced the same 176 defects.
+L6 is the dump checked against itself rather than against another copy of itself.
 
 ---
 
@@ -46,7 +52,7 @@ a claim that output was produced.
 | **Mizeria** | **5.2** | **L5** | almost pure C++; no Blueprint script to decompile |
 | **Ready Or Not** | **5.3** | **L5** | no version string; pins where FProperty moved |
 | **Dark Pals: The 1st Floor** | **5.5** | **L5** | brackets the FProperty change from below |
-| **Funnel Runners** | **5.6** | **L5** | the original reference |
+| **Funnel Runners** | **5.6** | **L6** | the reference target; re-run in full for 0.3.0 |
 | **Subnautica 2** | **5.6-era** | **L4** | licensee-branded; largest target. L5 is not reachable on it — see below |
 | **Backrooms Escape Together** | **5.7** | **L5** | newest engine; moved three things, see below |
 | **Motorslice** | **5.7** | **L5** | the second 5.7 sample; it is what closed the enum gap |
@@ -81,12 +87,26 @@ Motorslice      5.7       64787   42383        631       49377       0    100.00
 Ready Or Not    5.3      201090   49946       259       45832       0    100.00%
 Dark Pals       5.5       40619   32596        388       38924       0    100.00%
 Mizeria         5.2       n/a     23268        143       27144       0    (no script)
-Funnel Runners  5.6       72562   48692        619       56396       0    100.00%
+Funnel Runners  5.6       72562   48692        622       56396       0    100.00%
 RV There Yet    5.6e      51256   41609        661       49186       0    100.00%
 LN Enhanced     4.27      40679   22755        246       25114       0    100.00%
 Deep Rock Gal.  4.27e     81242   37616        958       43652       0    100.00%
 FF7 Rebirth     4.26     207123   48893        948       56718       0    100.00%
 ```
+
+L6 self-consistency (`validate --strict`), run for the first time in 0.3.0:
+
+```
+Funnel Runners  5.6   before the 0.3.0 engine fixes:  176 errors, 0 warnings
+                        133  enum-underlying-narrow   an enum too narrow for its own values
+                         43  unnamed-struct-ref       a StructProperty naming no struct
+                      after:                            0 errors, 0 warnings
+```
+
+Both were real and both had been wrong since before 0.2.0; every provider reproduced them
+identically, which is why L5 had never noticed. The causes are in `CHANGELOG.md` under
+0.3.0. **Only Funnel Runners has been through L6 so far** — every other target in the table
+above predates the check, and re-running them is the obvious next job.
 
 L5 agreement (external dump vs a full-memory minidump of the same session):
 

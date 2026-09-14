@@ -5,7 +5,7 @@
 A reflection extraction and analysis toolkit for Unreal Engine games. It reads a UE
 process (or a dump, or a binary on disk), reconstructs the engine's reflection data
 into a versioned intermediate representation, and emits that IR into as many useful
-formats as we can support.
+formats as it can.
 
 It is not "a better Dumper-7". Dumper-7 is one feature of this tool (the C++ SDK
 emitter), reached through a pipeline that also produces diffs, disassembler types,
@@ -19,6 +19,7 @@ mappings, decompiled script bytecode, and a live inspector.
 | Engine coverage | UE4.20 → UE5.5, runtime fingerprint + offset auto-derivation |
 | Output strategy | Reflection → IR → N emitters; IR is the contract |
 | Language / toolchain | C++20, MSVC (VS2022), CMake + Ninja, x64 Windows first |
+| Auditing | every derivation reports evidence; the finished dump is lint-checkable |
 | Scripting | Python for optional post-processing only, never in the hot path |
 
 ## The four memory providers
@@ -29,7 +30,7 @@ once; the mode is a runtime choice.
 | Provider | Backing | Can enumerate live objects? | Notes |
 |---|---|---|---|
 | `Internal` | injected DLL, direct pointers | yes | fastest; can also *call* game functions (CDO construction, `StaticFindObject`) |
-| `External` | `OpenProcess` + `NtReadVirtualMemory` | yes | no injection; a crash in our code cannot take the game down |
+| `External` | `OpenProcess` + `NtReadVirtualMemory` | yes | no injection; a crash in Zircon cannot take the game down |
 | `Dump` | full-memory minidump on disk | yes, if captured with `MiniDumpWithFullMemory` | offline, reproducible, shareable — dump once, analyse forever |
 | `Static` | PE file on disk, sections mapped | **no** | see caveat below |
 
@@ -69,10 +70,10 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
 | Bitfield reconstruction | partial | ⭐ full, with mask/offset preserved in IR |
 | `.usmap` mappings (UE4SS / FModel) | some builds | ✅ |
 | Machine-readable JSON IR | no | ⭐ the core contract |
-| IDA / Ghidra / Binary Ninja type import | no | ⭐ |
+| IDA / Ghidra / Binary Ninja type import | no | ⭐ all three, 0.3.0 |
 | ReClass.NET node files | no | ⭐ |
-| Frida JS bindings | no | ⭐ |
-| Python type stubs | no | ⭐ |
+| Frida JS bindings | no | ⭐ 0.3.0, with live property accessors |
+| Python type stubs | no | ⭐ 0.3.0 |
 | Markdown API docs | no | ⭐ |
 | Inheritance / interface graphs (dot, mermaid) | no | ⭐ |
 | CDO default-value extraction | no | ⭐ |
@@ -81,6 +82,8 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
 | Kismet → pseudo-C++ / pseudo-Blueprint decompile | no | ⭐ |
 | Console command dump (`IConsoleManager`) | no | ⭐ |
 | Build-to-build dump diffing | no | ⭐ |
+| Structural lint of the tool's own output | no | ⭐ 0.3.0, `validate --strict` |
+| Reverse reference index over the type system | no | ⭐ 0.3.0, `xref` |
 | Live interactive object browser | no | ⭐ |
 | Plugin API for custom emitters | no | ⭐ |
 | Non-Windows hosts | no | ➖ not in v1 |
@@ -92,7 +95,7 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
 
 - **Anti-cheat evasion / detection bypass.** Handling unusual, packed, or encrypted
   memory layouts is in scope because it is a reverse-engineering problem. Defeating
-  protection to gain access we do not otherwise have is not.
+  protection to gain access it does not otherwise have is not.
 - **Patching game code.** Zircon writes data, never instructions. From 0.2.0 a reflected
   property's value can be edited in a live process, which is data the engine already
   describes and already lets itself change. Writing over the game's own code, installing

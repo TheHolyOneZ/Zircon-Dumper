@@ -1,7 +1,8 @@
-// Dependency-free test runner for the IR layer. Pure data in, pure data out: nothing
-// here touches a process, a file it did not write, or a game.
+// Dependency-free test runner for the IR layer: JSON round-trip and the linter. Pure data
+// in, pure data out - nothing here touches a process, a file it didn't write, or a game.
 
 #include "ir/Json.h"
+#include "ir/Lint.h"
 #include "ir/Model.h"
 
 #include <cstdio>
@@ -426,9 +427,262 @@ void TestFileRoundTrip() {
     std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------------
+// Lint
+// ---------------------------------------------------------------------------------
+
+// A dump the linter is known to pass, so every test below starts from clean and breaks
+// exactly one thing.
+Dump MakeCleanDump() {
+    Dump dump;
+
+    Package package;
+    package.name = "/Script/Engine";
+
+    Enum mode;
+    mode.name = "EMovementMode";
+    mode.path = "/Script/Engine.EMovementMode";
+    mode.underlying = "uint8";
+    mode.values = {{"MOVE_None", 0}, {"MOVE_Walking", 1}};
+    package.enums.push_back(mode);
+
+    Struct base;
+    base.name     = "Object";
+    base.path     = "/Script/Engine.Object";
+    base.is_class = true;
+    base.size     = 40;
+    base.alignment = 8;
+
+    TypeRef int32;
+    int32.kind = TypeKind::Int32;
+    int32.raw  = "IntProperty";
+    int32.size = 4;
+
+    Struct actor;
+    actor.name           = "Actor";
+    actor.path           = "/Script/Engine.Actor";
+    actor.super          = "/Script/Engine.Object";
+    actor.is_class       = true;
+    actor.size           = 80;
+    actor.alignment      = 8;
+    actor.inherited_size = 40;
+
+    Property health;
+    health.name   = "Health";
+    health.type   = int32;
+    health.offset = 40;
+    health.size   = 4;
+    actor.properties.push_back(health);
+
+    Property first_flag;
+    first_flag.name        = "bA";
+    first_flag.type.kind   = TypeKind::Bool;
+    first_flag.type.raw    = "BoolProperty";
+    first_flag.type.size   = 1;
+    first_flag.offset      = 44;
+    first_flag.size        = 1;
+    first_flag.is_bitfield = true;
+    first_flag.field_mask  = 0x01;
+    first_flag.bit_index   = 0;
+    actor.properties.push_back(first_flag);
+
+    Property second_flag = first_flag;
+    second_flag.name       = "bB";
+    second_flag.field_mask = 0x02;
+    second_flag.bit_index  = 1;
+    actor.properties.push_back(second_flag);
+
+    package.classes.push_back(base);
+    package.classes.push_back(actor);
+    dump.packages.push_back(package);
+    return dump;
+}
+
+std::size_t CountCheck(const LintReport& report, std::string_view check) {
+    std::size_t total = 0;
+    for (const auto& finding : report.findings) if (finding.check == check) ++total;
+    return total;
+}
+
+Struct& ActorIn(Dump& dump) { return dump.packages.front().classes.back(); }
+
+void TestLintAcceptsCleanDump() {
+    const auto report = Lint(MakeCleanDump());
+    if (report.errors != 0 || report.warnings != 0) {
+        for (const auto& finding : report.findings)
+            std::fprintf(stderr, "  unexpected: %s %s - %s\n", finding.check.c_str(),
+                         finding.where.c_str(), finding.detail.c_str());
+    }
+    CHECK(report.errors == 0);
+    CHECK(report.warnings == 0);
+    CHECK(report.types_checked == 2);
+    CHECK(report.properties_checked == 3);
+    CHECK(report.enums_checked == 1);
+
+    // packed bools legitimately share an offset. if this ever starts firing, every real dump
+    // turns into a wall of false errors.
+    CHECK(CountCheck(report, "shared-offset") == 0);
+}
+
+void TestLintCatchesOverlap() {
+    Dump dump = MakeCleanDump();
+
+    // Health runs 40..44 and the packed bools sit at 44. Sized to land inside Health and stop
+    // short of 44, so exactly one pair overlaps - anything wider also hits the bools and
+    // reports twice, which is right but makes the count meaningless.
+    Property late;
+    late.name        = "Overlapper";
+    late.type.kind   = TypeKind::Int16;
+    late.type.raw    = "Int16Property";
+    late.type.size   = 2;
+    late.offset      = 42;
+    late.size        = 2;
+    ActorIn(dump).properties.push_back(late);
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "property-overlap") == 1);
+    CHECK(report.errors == 1);
+
+    // the finding should name the member that starts inside the other one, not the one it ran
+    // into. that's the one whose offset is wrong.
+    bool named_correctly = false;
+    for (const auto& finding : report.findings)
+        if (finding.check == "property-overlap")
+            named_correctly = finding.where == "/Script/Engine.Actor.Overlapper";
+    CHECK(named_correctly);
+}
+
+void TestLintCatchesOverrun() {
+    Dump dump = MakeCleanDump();
+    Property past;
+    past.name      = "PastTheEnd";
+    past.type.kind = TypeKind::Int64;
+    past.type.raw  = "Int64Property";
+    past.type.size = 8;
+    past.offset    = 76;        // the class is 80 bytes
+    past.size      = 8;
+    ActorIn(dump).properties.push_back(past);
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "member-overruns-type") == 1);
+}
+
+void TestLintCatchesSharedOffset() {
+    Dump dump = MakeCleanDump();
+    Property twin;
+    twin.name      = "Twin";
+    twin.type.kind = TypeKind::Int32;
+    twin.type.raw  = "IntProperty";
+    twin.type.size = 4;
+    twin.offset    = 40;        // same as Health, and neither is a bitfield
+    twin.size      = 4;
+    ActorIn(dump).properties.push_back(twin);
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "shared-offset") == 1);
+}
+
+void TestLintCatchesClashingBits() {
+    Dump dump = MakeCleanDump();
+    // two bools claiming the same bit of the same byte. one write clears the other and
+    // nothing about the dump looks wrong until it happens.
+    ActorIn(dump).properties.back().field_mask = 0x01;
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "bitfield-mask-clash") == 1);
+}
+
+void TestLintCatchesNarrowEnum() {
+    Dump dump = MakeCleanDump();
+    dump.packages.front().enums.front().values.push_back({"MOVE_Huge", 524287});
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "enum-underlying-narrow") == 1);
+
+    // widening is the fix, so the check had better agree
+    dump.packages.front().enums.front().underlying = "uint32";
+    CHECK(CountCheck(Lint(dump), "enum-underlying-narrow") == 0);
+}
+
+void TestLintCatchesDanglingReferences() {
+    Dump dump = MakeCleanDump();
+    ActorIn(dump).super = "/Script/Nowhere.Gone";
+
+    Property ghost;
+    ghost.name      = "Ghost";
+    ghost.type.kind = TypeKind::Struct;
+    ghost.type.raw  = "StructProperty";
+    ghost.type.name = "/Script/Nowhere.Ghost";
+    ghost.type.size = 8;
+    ghost.offset    = 48;
+    ghost.size      = 8;
+    ActorIn(dump).properties.push_back(ghost);
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "dangling-super") == 1);
+    CHECK(CountCheck(report, "dangling-type-ref") == 1);
+
+    // warnings, not errors. a filtered dump has no ancestors to point at and is still
+    // perfectly good.
+    CHECK(report.errors == 0);
+    CHECK(report.warnings == 2);
+}
+
+void TestLintCatchesDuplicatePath() {
+    Dump dump = MakeCleanDump();
+    dump.packages.front().classes.push_back(ActorIn(dump));
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "duplicate-path") == 1);
+}
+
+void TestLintCatchesBadBitfield() {
+    Dump dump = MakeCleanDump();
+    auto& flag = ActorIn(dump).properties.back();
+    flag.field_mask = 0;
+    flag.bit_index  = 9;
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "bitfield-no-mask") == 1);
+    CHECK(CountCheck(report, "bitfield-bad-bit") == 1);
+}
+
+void TestLintCatchesTwoReturns() {
+    Dump dump = MakeCleanDump();
+    Function function;
+    function.name = "Broken";
+
+    FunctionParam param;
+    param.name      = "ReturnValue";
+    param.type.kind = TypeKind::Int32;
+    param.type.raw  = "IntProperty";
+    param.type.size = 4;
+    param.size      = 4;
+    param.is_return = true;
+    function.params.push_back(param);
+    param.name = "AlsoReturnValue";
+    function.params.push_back(param);
+
+    ActorIn(dump).functions.push_back(function);
+
+    const auto report = Lint(dump);
+    CHECK(CountCheck(report, "multiple-returns") == 1);
+}
+
 } // namespace
 
 int main() {
+    TestLintAcceptsCleanDump();
+    TestLintCatchesOverlap();
+    TestLintCatchesOverrun();
+    TestLintCatchesSharedOffset();
+    TestLintCatchesClashingBits();
+    TestLintCatchesNarrowEnum();
+    TestLintCatchesDanglingReferences();
+    TestLintCatchesDuplicatePath();
+    TestLintCatchesBadBitfield();
+    TestLintCatchesTwoReturns();
+
     TestTypeKindRoundTrip();
     TestDumpRoundTrip();
     TestHighBitFlags();

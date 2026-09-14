@@ -457,19 +457,78 @@ ir::Dump BuildDump(const Reflection& reflection, const BuildOptions& options) {
             }
         };
 
+        // can `underlying` actually hold `value`?
+        auto fits = [](std::string_view underlying, std::int64_t value) {
+            const bool is_signed = !underlying.empty() && underlying[0] == 'i';
+            int bits = 8;
+            if (underlying == "uint16" || underlying == "int16") bits = 16;
+            if (underlying == "uint32" || underlying == "int32") bits = 32;
+            if (underlying == "uint64" || underlying == "int64") bits = 64;
+            if (bits == 64) return true;
+            if (is_signed) {
+                const std::int64_t limit = std::int64_t(1) << (bits - 1);
+                return value >= -limit && value < limit;
+            }
+            return value >= 0 && value < (std::int64_t(1) << bits);
+        };
+
         int widened = 0;
+        int forced   = 0;
+
         for (auto& [name, package] : packages)
             for (auto& record : package.enums) {
                 const auto it = widths.find(record.path);
-                if (it == widths.end()) continue;   // unused enum: uint8 is the UE default
-                if (const char* text = name_for(it->second)) {
-                    if (record.underlying != text) ++widened;
-                    record.underlying = text;
+                if (it != widths.end()) {
+                    if (const char* text = name_for(it->second)) {
+                        if (record.underlying != text) ++widened;
+                        record.underlying = text;
+                    }
                 }
+
+                // An enum nothing uses as a property has no usage to read a width
+                // from, and those fell back to uint8 - which is UE's default, not a
+                // fact about this enum. The values are a fact, they come straight out
+                // of UEnum::Names. So when the two disagree, widen.
+                //
+                // This is where ETransformGizmoSubElements = 524287 was landing. 0.2.0
+                // patched the visible half by widening at emit time so the SDK would
+                // compile, and left the IR saying uint8 for 133 enumerators on a UE 5.6
+                // game. Fine for our own emitters, wrong for anyone else reading it.
+                bool negative = false;
+                std::int64_t widest = 0;
+                for (const auto& value : record.values) {
+                    if (value.value < 0) negative = true;
+                    widest = std::max(widest, value.value < 0 ? -value.value : value.value);
+                }
+
+                if (record.values.empty()) continue;
+                const auto all_fit = [&](const ir::EnumValue& v) {
+                    return fits(record.underlying, v.value);
+                };
+                if (std::all_of(record.values.begin(), record.values.end(), all_fit))
+                    continue;
+
+                const char* needed = nullptr;
+                if (negative) {
+                    if (widest <= 0x7F)            needed = "int8";
+                    else if (widest <= 0x7FFF)     needed = "int16";
+                    else if (widest <= 0x7FFFFFFF) needed = "int32";
+                    else                           needed = "int64";
+                } else {
+                    if (widest <= 0xFF)             needed = "uint8";
+                    else if (widest <= 0xFFFF)      needed = "uint16";
+                    else if (widest <= 0xFFFFFFFFLL) needed = "uint32";
+                    else                            needed = "uint64";
+                }
+
+                record.underlying = needed;
+                ++forced;
             }
 
         if (widened > 0)
             core::LogDebug("{} enums are wider than the uint8 default", widened);
+        if (forced > 0)
+            core::LogDebug("{} enums were widened to hold their own values", forced);
     }
 
     dump.packages.reserve(packages.size());

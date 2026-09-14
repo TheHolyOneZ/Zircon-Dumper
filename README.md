@@ -6,15 +6,18 @@
 
 Point it at a UE game — running, crashed, or just sitting on disk — and get back the
 engine's entire type system: every class, struct, enum, property offset, function
-signature and Blueprint script. Then turn that into a C++ SDK, a `.usmap`, types for IDA
-or Ghidra, readable Blueprint logic, or a report on what a patch just broke.
+signature and Blueprint script. Then turn that into a C++ SDK, a `.usmap`, types for IDA,
+Ghidra or Binary Ninja, Frida bindings, Python stubs, readable Blueprint logic, or a report
+on what a patch just broke.
 
 <sub>Sixteen games verified · UE 4.22 → 5.7 · both property systems · both name pools ·
 no engine-version table anywhere in the codebase</sub>
 
 <sub>Cross-checked against Dumper-7 on the same UE 5.6 game:
 <b>26,625 of 26,625 shared member offsets agree exactly</b>, with 48,535 data members
-emitted against its 44,701.</sub>
+emitted against its 44,701. And cross-checked against itself: the same game dumped from
+outside, from inside, and from a 7 GB minidump gives <b>10,850 of 10,850 types
+byte-identical</b> three ways.</sub>
 
 ---
 
@@ -123,7 +126,7 @@ versions that did not exist when the tool was written.
 
 The result is one JSON file containing the game's whole type system.
 
-### It turns that into eight different things
+### It turns that into eleven different things
 
 | You want… | Use | What you get |
 |---|---|---|
@@ -133,6 +136,9 @@ The result is one JSON file containing the game's whole type system.
 | Same, but Ghidra | `ghidra` | The same, for Ghidra |
 | To poke at memory by hand | `reclass` | A ReClass.NET project |
 | To read the API like documentation | `docs` | Browsable Markdown with an index |
+| Same, but Binary Ninja | `binja` | The same again, as a BN type import |
+| To poke at a live game from JS | `frida_js` | A Frida module with real property accessors |
+| To write Python against the game | `python_stubs` | `.pyi` stubs with completion and offsets |
 | To see the class hierarchy | `graphs` | Inheritance graphs (DOT + Mermaid) |
 | To script your own output | `json` | The raw IR, plus [plugins](#plugins) |
 
@@ -140,15 +146,18 @@ The result is one JSON file containing the game's whole type system.
 
 ```
 > zircon emit list
-FORMAT     NEEDS  DESCRIPTION
-cpp_sdk    objs   C++ SDK headers with static_assert offset checks
-usmap      objs   UE4SS / FModel .usmap mappings
-ida        objs   IDA Pro Python script importing types
-ghidra     objs   Ghidra Python script importing types
-reclass    objs   ReClass.NET node file
-docs       objs   Browsable Markdown API reference
-graphs     objs   Inheritance graphs in DOT and Mermaid
-json       -      Re-emit the IR as JSON
+FORMAT        NEEDS  DESCRIPTION
+cpp_sdk       objs   C++ SDK headers with static_assert offset checks
+usmap         objs   UE4SS / FModel .usmap mappings
+ida           objs   IDA Pro Python script importing types
+ghidra        objs   Ghidra Python script importing types
+binja         objs   Binary Ninja Python script importing types
+reclass       objs   ReClass.NET node file
+docs          objs   Browsable Markdown API reference
+frida_js      objs   Frida JavaScript bindings with live property accessors
+python_stubs  objs   Python .pyi type stubs for the whole type system
+graphs        objs   Inheritance graphs in DOT and Mermaid
+json          -      Re-emit the IR as JSON
 
 > zircon emit cpp_sdk game.json -o out/
 files written     620
@@ -156,6 +165,37 @@ files written     620
   out/SDK/Engine.hpp
   ... and 608 more
 ```
+
+### It gives you the game from JavaScript and Python too
+
+Not everyone wants a C++ SDK. `frida_js` writes one `zircon.js` you hand straight to
+Frida, and every reflected property becomes a real accessor:
+
+```js
+var actor = Zircon.wrap(ptr('0x1F3A4C00'), '/Script/Engine.Actor');
+
+console.log(actor.MaxWalkSpeed);   // 600
+actor.MaxWalkSpeed = 1337;         // written through the derived offset
+actor.bHidden = true;              // one bit — the other six bools in that byte survive
+actor.MovementMode;                // "MOVE_Falling", not 3
+```
+
+Inherited properties need no qualifying, because `wrap` walks the super chain. Strings,
+maps and delegates are refused rather than written, same rule as everywhere else in the
+tool: their memory holds allocator state beside the value.
+
+`python_stubs` is the same type system as `.pyi` stubs, so an editor completes it:
+
+```python
+class AActor(UObject):
+    __size__: ClassVar[int] = 680
+    __offsets__: ClassVar[Dict[str, int]] = {"Owner": 80, "MaxSpeed": 124, ...}
+    Owner: Optional["AActor"]        # 0x0050(0x0008) = nullptr
+    MaxSpeed: float                  # 0x007C(0x0004) = 600
+    def SetOwner(self, NewOwner: Optional["AActor"]) -> None: ...  # rva 0x401000
+```
+
+Feed `__offsets__` to whatever you already read memory with.
 
 ### The SDK it writes can call the game
 
@@ -438,6 +478,9 @@ obvious one.
 | `zircon emit usmap … -o out/` | `out\<GameName>-Win64-Shipping.usmap` |
 | `zircon emit ida … -o out/` | `out\zircon_ida.py` |
 | `zircon emit ghidra … -o out/` | `out\zircon_ghidra.py` |
+| `zircon emit binja … -o out/` | `out\zircon_binja.py` |
+| `zircon emit frida_js … -o out/` | `out\zircon.js` |
+| `zircon emit python_stubs … -o out/` | `out\zircon_sdk\*.pyi` plus `py.typed` |
 | `zircon emit reclass … -o out/` | `out\<GameName>.reclass.xml` and `.rcnet` |
 | `zircon emit docs … -o out/` | `out\index.md` plus one file per package |
 | `zircon emit graphs … -o out/` | `out\inheritance.dot`, `.mmd`, and `out\packages\*` |
@@ -594,6 +637,85 @@ the report in a file instead.
 
 ---
 
+## Checking a dump against itself
+
+`zircon validate` has always said whether the file survives a round-trip. `--strict` asks
+a different question: does what is *in* it make sense?
+
+```
+> zircon validate game.json --strict
+round-trip       lossless
+checked          10850 types, 48692 properties, 2063 enums
+
+CHECK                        COUNT  SEVERITY
+property-overlap                 2  error
+dangling-type-ref              118  warning
+
+  property-overlap         /Script/Engine.Actor.ReplicatedMovement
+                           starts at 400 but AttachmentReplication runs to 408
+
+warnings        118
+errors            2
+```
+
+About twenty checks: members that overlap or run past the end of their class, two
+non-bitfield properties at one offset, two bools claiming the same bit, an enum whose
+underlying type cannot hold its own values, a super or a property type that is not in the
+file, a function with two return values.
+
+**Errors mean the dump contradicts itself**, so something upstream is wrong and whatever
+you render from it will be wrong in the same place. **Warnings are unprovable from one
+file** — a `--filter`ed dump legitimately has no ancestors to point at, so a dangling
+reference is not automatically a defect.
+
+Exit code is `9` when there are errors, which is a different code from `6` ("that file
+would not parse") on purpose: a build script wants to tell those apart.
+
+## Finding what points at a type
+
+```
+> zircon xref game.json -f CharacterMovementComponent
+type              /Script/Engine.CharacterMovementComponent
+
+extended by (14)
+  /Game/Player/BP_PlayerMovement.BP_PlayerMovement_C
+  ...
+held by (31)
+  /Script/Engine.Character.CharacterMovement
+  ...
+passed to (3)
+  /Script/Engine.Character.SetCharacterMovement(NewMovement)
+
+references        48
+```
+
+Inheritance, interfaces, properties that hold one, and function parameters that take one —
+including through containers, so a `TMap<FName, TArray<AActor*>>` counts as a reference to
+`AActor`. `--uses` runs it the other way and lists what the type reaches.
+
+A leaf name is enough when it is unambiguous. When it is not, you get the candidates rather
+than a silently picked one. Exit code `3` when nothing points at it.
+
+## Doing it in one command
+
+`dump` can render as it writes, which saves a second command and one chance to emit from a
+stale file:
+
+```
+zircon dump --pid 12345 --script --defaults -o game.json --emit cpp_sdk,usmap
+```
+
+`emit` takes the same comma list, and `all` means every format:
+
+```
+zircon emit cpp_sdk,usmap,frida_js game.json -o out/
+zircon emit all game.json -o out/
+```
+
+One format writes straight into `-o` the way it always has. Several get a subdirectory
+each, because `docs` and `graphs` would otherwise write over one another. A format that
+refuses does not stop the rest.
+
 ## Injecting (and when you don't need to)
 
 **Most of the time you don't need to inject anything.** Dumping, SDK generation, the live
@@ -622,6 +744,11 @@ unload.
 The game isn't running yet, or it's still on its splash screen. Wait until you reach the
 main menu and try again. Some launchers also start the game as a child process with a
 different name — `zircon detect` lists everything it scored, so check the lower rows.
+
+**`--process` says `no running process named ...`**
+Any part of the name works, as long as it picks out one process — `--process StormEscape`
+is enough for `StormEscape-Win64-Shipping.exe`. If more than one matches you get the list
+and have to use `--pid`, because attaching to the wrong instance dumps the wrong build.
 
 **`fingerprint` says `engine version unknown`**
 This is fine and not an error. Plenty of games (studio-modified engines especially) ship
@@ -695,7 +822,9 @@ Examples of the actual reasoning used:
 | what an object *is* | walk its meta-class chain, not its class name |
 
 Every derivation reports a confidence value and the evidence behind it, and every
-conclusion lands in the dump header.
+conclusion lands in the dump header. Since 0.3.0 `zircon validate --strict` reads the
+finished dump back and checks it against itself, which is how the two defects below were
+found: the evidence being recorded does not on its own mean the pieces fit together.
 
 ### The rule this project learned the hard way
 
@@ -714,6 +843,7 @@ That was learned six times, each time from real game data:
 | `PropertyLink`, as `ChildProperties` | non-null for *more* classes, since it includes inherited properties |
 | a field that is always zero, as `Offset_Internal` | trivially satisfies `0 <= v < size` for every property |
 | a shared thunk pointer, as `UFunction::Func` | 100% "points into executable memory", beating the real field where some entries are null |
+| a target's class *name*, as the test for what it is | `"Class"` is right for every native class, and no Blueprint one — 532 properties on one game silently lost their type |
 
 The corollary, applied throughout: **never emit plausible-but-wrong output.** An
 unresolvable type becomes an opaque byte array of the correct size; an unknown bytecode
@@ -778,7 +908,7 @@ Zircon is aiming at a wider surface:
 | | Dumper-7 | UEDumper | **Zircon** |
 |---|---|---|---|
 | How it attaches | injected DLL | external | **injected, external, minidump, or a PE on disk** |
-| Primary output | C++ SDK | C++ SDK + live viewer | **8 formats + plugins** |
+| Primary output | C++ SDK | C++ SDK + live viewer | **11 formats + plugins** |
 | Live object browser | — | yes | yes, standalone **and** in-process |
 | Bytecode decompiler | — | — | ~90 Kismet opcodes |
 | Build-to-build diffing | — | — | 27 change kinds, CI exit code |
@@ -788,6 +918,8 @@ Zircon is aiming at a wider surface:
 | Callable function wrappers in the SDK | 17,319 | — | **17,419** |
 | SDK can call the game with no setup | — | — | yes, ProcessEvent slot derived |
 | Scriptable / extensible | — | — | C ABI + vendored Lua |
+| Lints its own output | — | — | `validate --strict`, ~20 structural checks |
+| Reverse reference index | — | — | `xref -f Actor` |
 | Behaviour when unsure | — | — | **refuses rather than guessing** |
 
 ### Measured, not claimed
@@ -884,7 +1016,7 @@ src/core/      IMemorySource + 4 providers, PeImage, PatternScanner, page cache,
 src/engine/    EngineProfile, ObjectArray, NamePool, ObjectLayout, StructLayout,
                PropertyLayout, ClassLayout, TypeResolver, FunctionLayout, EnumLayout,
                Kismet, ValueReader, DumpBuilder, UnrealDetect
-src/ir/        Model.h (the contract), hand-rolled JSON
+src/ir/        Model.h (the contract), hand-rolled JSON, Lint (structural checks)
 src/emit/      one file per output format, plus shared Util
 src/plugin/    the host side of the C ABI: node tables, vtable, loader
 src/plugins/   plugins that ship with the tool (the Lua host)
@@ -919,8 +1051,10 @@ find          objects by what they hold, e.g. --where Health<50
 inspect       annotated hexdump of one object (the layout-debugging tool)
 scan          pattern-scan a module, or the whole process
 dump          full reflection dump to IR JSON   [--script] [--names] [--defaults]
-validate      parse a dump and verify it round-trips
-emit          render a dump to a format         (emit list)
+                                                [--emit cpp_sdk,usmap]
+validate      parse a dump, round-trip it       [--strict] to lint it as well
+emit          render a dump to one or more formats, comma separated  (emit list)
+xref          what references a type            [--uses] for the other direction
 diff          compare two dumps                 [--breaking] [--style json|markdown]
 browse        the live object browser
 inject        load the payload into a running game
@@ -929,9 +1063,70 @@ install       add this folder to the user PATH (HKCU only, no elevation)
 uninstall     take it off again
 ```
 
-Targets are interchangeable everywhere: `--pid`, `--process`, `--dump`, `--file`,
-`--internal`. `--plugins <dir>` loads emitter plugins; nothing is loaded without it.
-Colour follows the terminal, `NO_COLOR`, and `--color` / `--no-color`.
+Targets are interchangeable everywhere, and exactly one is required for anything that
+reads a game:
+
+```
+--pid <n>          a running process by id
+--process <name>   by executable name; any unambiguous part of it will do
+--dump <path>      a full-memory minidump
+--file <path>      a PE on disk (partial dumps only)
+--internal         in-process, for the injected payload
+```
+
+And the options, in full:
+
+```
+-f, --filter <s>   only names containing this substring; xref takes the type here
+-n, --limit <n>    stop after n results
+-o, --out <path>   output path (dump defaults to dump.json)
+-p, --pattern <s>  scan: the byte pattern to look for
+-m, --module <s>   scan: restrict to one module
+    --all-regions  scan: the whole address space, not just modules
+    --names        embed the whole FName pool in the dump
+    --script       decompile Kismet bytecode into the dump
+    --defaults     read every property's value from its class default object
+    --emit <fmts>  dump: render as it writes, e.g. cpp_sdk,usmap or all
+    --strict       validate: lint the dump against itself as well
+    --uses         xref: what the type references, instead of what references it
+    --set <N=V>    write: the property and value, e.g. MaxWalkSpeed=1337
+    --where <c>    find: Name<op>Value, ops are = != < > <= >=
+    --breaking     diff: only changes that break existing code
+    --style <s>    diff: text (default), json or markdown
+    --plugins <d>  load emitter plugins from a directory (repeatable)
+    --allow-partial  let emitters run on a partial dump
+-v, --verbose      debug logging; repeat for trace
+    --color / --no-color   force colour on or off
+-h, --help         the command list
+    --version      the version
+```
+
+`--plugins` is the only way plugins load — nothing is picked up just for sitting next to
+the executable. `ZIRCON_PLUGINS` does the same for a shell that sets it once.
+
+Colour follows the terminal and honours `NO_COLOR`. `--colour` and `--no-colour` are
+accepted too.
+
+### Exit codes
+
+Worth knowing if you script any of this:
+
+| Code | Means |
+|---|---|
+| `0` | fine |
+| `1` | bad arguments |
+| `2` | `xref` could not pin down the type you named — either no match or several |
+| `3` | what you named was not there: no such object, no matches, no references, no scan hits |
+| `4` | attached, but the reflection layout would not derive |
+| `5` | could not open the target, or could not write the output file |
+| `6` | a dump file would not parse |
+| `7` | an emitter refused |
+| `8` | `diff` found a breaking change |
+| `9` | `validate --strict` found the dump contradicting itself |
+
+One wart worth knowing: an ambiguous `--process` exits `5` from most commands but `2` from
+`inject` and `browse`, which resolve the name themselves. Match on more of the name and it
+stops mattering.
 
 ---
 
@@ -1011,23 +1206,27 @@ All phases P0–P7 complete, verified against sixteen live games from UE 4.22 to
 | **P0** foundation | four memory providers, PE parser, pattern scanner, page cache |
 | **P1** discovery | GObjects, FNamePool, UObject layout — all derived, zero manual input |
 | **P2** reflection → IR | UStruct/FProperty/UFunction/UEnum layouts, nested types, bitfields |
-| **P3** emitters | cpp_sdk, usmap, ida, ghidra, reclass, docs, graphs, json |
+| **P3** emitters | cpp_sdk, usmap, ida, ghidra, binja, reclass, docs, graphs, frida_js, python_stubs, json |
 | **P4** diffing | 27 change kinds graded by what they break, migration report |
 | **P5** bytecode | ~90 Kismet opcodes, 100% of 1.16 MB decoded |
 | **P6** live browser | Dear ImGui, standalone *and* in-process; CDO defaults, live values |
 | **P7** plugin API | C ABI + vendored Lua; emitters, FName decoders, global resolvers |
 | gap list | CDO defaults, interfaces, property flag names, class vtables — all closed |
+| 0.3.0 | three more emitters, a dump linter, a reference index, multi-format emit |
 
 Measured on Funnel Runners (UE 5.6):
 
 ```
-dump          618 packages, 5252 classes, 48692 properties, 17698 functions   1.8 s
-defaults      27065 of 27065 class properties read from their CDOs            2.0 s
-SDK           585 headers, 56203 static_asserts, 17419 callable wrappers
-              compiles clean with and without windows.h included first
+dump          618 packages, 5252 classes, 48692 properties, 17698 functions
+              with --script --defaults and all eleven formats rendered        13 s
+defaults      27065 of 27065 class properties read from their CDOs
+SDK           622 headers, 56396 static_asserts, 17419 callable wrappers
+              /W3 with windows.h included first: 0 errors, 0 warnings
+lint          validate --strict: 0 errors, 0 warnings over 10850 types
 bytecode      2871 functions, 1156611 bytes, 100% decoded
-determinism   live process vs a 6.5 GB minidump of itself: 10850/10850 identical
+determinism   live process vs a 7 GB minidump of itself: 10850/10850 identical
               external vs injected (Internal provider): 10850/10850 identical
+              all three lint clean and diff to "no differences"
 ```
 
 And on Ready Or Not (UE 5.3), the largest target by script volume:
@@ -1060,10 +1259,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-A build reports its version as `0.2.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
+A build reports its version as `0.3.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
 that is the only difference between a local build and a released one.
 
-Seven test suites, 1537 checks, none of which need a game installed. They run against
+Seven test suites, 1600 checks, none of which need a game installed. They run against
 synthetic memory, hand-built bytecode and checked-in fixtures.
 
 > If Strawberry Perl or MinGW is on PATH, CMake may pick up its GCC. Pass the Visual

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.2.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.3.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -122,6 +122,7 @@ target_link_libraries(zircon_engine PUBLIC zircon_core zircon_ir)
 add_library(zircon_ir STATIC
   src/ir/src/Model.cpp
   src/ir/src/Json.cpp
+  src/ir/src/Lint.cpp
 )
 target_include_directories(zircon_ir PUBLIC src/ir/include)
 
@@ -138,8 +139,11 @@ add_library(zircon_emit STATIC
   src/emit/src/Usmap.cpp
   src/emit/src/Ida.cpp
   src/emit/src/Ghidra.cpp
+  src/emit/src/BinaryNinja.cpp
   src/emit/src/ReClass.cpp
   src/emit/src/Docs.cpp
+  src/emit/src/FridaJs.cpp
+  src/emit/src/PythonStubs.cpp
   src/emit/src/Graphs.cpp
   src/emit/src/Json.cpp
 )
@@ -325,7 +329,7 @@ if(ZIRCON_BUILD_TESTS)
   set_target_properties(zircon_ir_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
   add_test(NAME ir COMMAND zircon_ir_tests)
 
-  add_executable(zircon_emit_tests tests/test_emit_usmap.cpp)
+  add_executable(zircon_emit_tests tests/test_emit.cpp)
   target_link_libraries(zircon_emit_tests PRIVATE zircon_emit)
   set_target_properties(zircon_emit_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
   add_test(NAME emit COMMAND zircon_emit_tests)

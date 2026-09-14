@@ -289,20 +289,25 @@ std::string RenderType(const TypeIndex& index, const ir::TypeRef& type,
             return index.cpp_names.at(type.name);
         }
 
+        // `struct`, not `class`, in all of these. The SDK defines and forward-declares
+        // everything as struct, so `class` here is a keyword mismatch - MSVC raises C4099
+        // on every one, 27,334 of them on a UE 5.6 game. Warnings only and the layout was
+        // never affected, but they bury anything else the compiler wants to say about a
+        // cheat that includes the header.
         case TypeKind::ObjectPtr:
-            return "class " + RenderReferenced(index, type.name, "UObject") + "*";
+            return "struct " + RenderReferenced(index, type.name, "UObject") + "*";
         case TypeKind::ClassPtr:
-            return "TSubclassOf<class " + RenderReferenced(index, type.name, "UObject") + ">";
+            return "TSubclassOf<struct " + RenderReferenced(index, type.name, "UObject") + ">";
         case TypeKind::WeakPtr:
-            return "TWeakObjectPtr<class " + RenderReferenced(index, type.name, "UObject") + ">";
+            return "TWeakObjectPtr<struct " + RenderReferenced(index, type.name, "UObject") + ">";
         case TypeKind::LazyPtr:
-            return "TLazyObjectPtr<class " + RenderReferenced(index, type.name, "UObject") + ">";
+            return "TLazyObjectPtr<struct " + RenderReferenced(index, type.name, "UObject") + ">";
         case TypeKind::SoftPtr:
-            return "TSoftObjectPtr<class " + RenderReferenced(index, type.name, "UObject") + ">";
+            return "TSoftObjectPtr<struct " + RenderReferenced(index, type.name, "UObject") + ">";
         case TypeKind::SoftClassPtr:
-            return "TSoftClassPtr<class " + RenderReferenced(index, type.name, "UObject") + ">";
+            return "TSoftClassPtr<struct " + RenderReferenced(index, type.name, "UObject") + ">";
         case TypeKind::Interface:
-            return "TScriptInterface<class " + RenderReferenced(index, type.name, "IInterface") + ">";
+            return "TScriptInterface<struct " + RenderReferenced(index, type.name, "IInterface") + ">";
 
         case TypeKind::Array:
             if (type.params.size() == 1)
@@ -1110,7 +1115,7 @@ template <typename T> struct TLazyObjectPtr  {{ uint8 Opaque[0x{:X}]; }};
 template <typename T> struct TSoftObjectPtr  {{ uint8 Opaque[0x{:X}]; }};
 template <typename T> struct TSoftClassPtr   {{ uint8 Opaque[0x{:X}]; }};
 template <typename T> struct TScriptInterface{{ uint8 Opaque[0x{:X}]; }};
-template <typename T> struct TSubclassOf     {{ class UClass* Class; }};
+template <typename T> struct TSubclassOf     {{ struct UClass* Class; }};
 
 // TOptional's size depends on its payload, so it cannot be one fixed layout. Members whose
 // size disagrees with this are emitted opaque by the size guard instead.

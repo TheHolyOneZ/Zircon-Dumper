@@ -265,7 +265,24 @@ Result<std::unique_ptr<IMemorySource>> OpenExternalByName(std::string_view proce
     if (!::Process32FirstW(snapshot.get(), &entry))
         return Error{"cannot enumerate running processes", 5};
 
-    std::vector<std::pair<DWORD, std::string>> matches;
+    const auto lower = [](std::string text) {
+        for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return text;
+    };
+    const std::string needle = lower(std::string(process_name));
+
+    // Exact first, substring second.
+    //
+    // `zircon detect` prints "StormEscape" in its PROJECT column, and the obvious next move
+    // is to paste that into --process. That used to fail - the match was the whole file name
+    // and nothing else, while `inject` had always taken a substring. Two commands accepting a
+    // name the rest of the tool refused.
+    //
+    // Exact still wins, so a process whose name is a substring of another's can't get
+    // shadowed, and an ambiguous substring is refused rather than guessed at.
+    std::vector<std::pair<DWORD, std::string>> exact;
+    std::vector<std::pair<DWORD, std::string>> partial;
+
     do {
         const int needed = ::WideCharToMultiByte(CP_UTF8, 0, entry.szExeFile, -1,
                                                  nullptr, 0, nullptr, nullptr);
@@ -275,13 +292,13 @@ Result<std::unique_ptr<IMemorySource>> OpenExternalByName(std::string_view proce
         ::WideCharToMultiByte(CP_UTF8, 0, entry.szExeFile, -1, name.data(), needed,
                               nullptr, nullptr);
 
-        const bool equal = name.size() == process_name.size() &&
-            std::equal(name.begin(), name.end(), process_name.begin(), [](char a, char b) {
-                return std::tolower(static_cast<unsigned char>(a)) ==
-                       std::tolower(static_cast<unsigned char>(b));
-            });
-        if (equal) matches.emplace_back(entry.th32ProcessID, std::move(name));
+        const std::string folded = lower(name);
+        if (folded == needle) exact.emplace_back(entry.th32ProcessID, name);
+        else if (folded.find(needle) != std::string::npos)
+            partial.emplace_back(entry.th32ProcessID, name);
     } while (::Process32NextW(snapshot.get(), &entry));
+
+    auto& matches = exact.empty() ? partial : exact;
 
     if (matches.empty())
         return Error{std::format("no running process named '{}'", process_name), 5};
@@ -289,8 +306,8 @@ Result<std::unique_ptr<IMemorySource>> OpenExternalByName(std::string_view proce
     if (matches.size() > 1) {
         // Attaching to the wrong instance silently dumps the wrong build. Make them pick.
         std::string pids;
-        for (const auto& [pid, _] : matches) pids += std::format("{} ", pid);
-        return Error{std::format("{} processes named '{}' (pids: {}) — pass --pid",
+        for (const auto& [pid, name] : matches) pids += std::format("{} ({}) ", pid, name);
+        return Error{std::format("{} processes match '{}': {}— pass --pid",
                                  matches.size(), process_name, pids), 5};
     }
 

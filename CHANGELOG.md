@@ -2,6 +2,295 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.3.0 — 2026-09-14
+
+### Two engine bugs the new linter found on a real game
+
+Built `validate --strict` against fixtures, then pointed it at a 59 MB dump of Funnel
+Runners (UE 5.6). **176 errors.** Both causes real, and both wrong since before 0.2.0.
+
+**489 object properties and 43 struct properties had no type at all.** `TypeResolver`
+checks that a pointer really is the kind it expects before accepting it, which is fine, but
+it was checking by comparing the target's class *name*:
+
+```cpp
+if (GetClassName(...) != expected_kind) return {};      // "Class", "ScriptStruct"
+```
+
+A Blueprint class's class is `BlueprintGeneratedClass`. A Blueprint struct's is
+`UserDefinedStruct`. A widget's is `WidgetBlueprintGeneratedClass`. None of those match the
+string, so anything pointing at a Blueprint type came back untyped.
+
+`ClassifyObject` already exists for exactly this — it walks the meta-class chain — and
+`StructLayout.h` carries a comment saying so, including that the same mistake had been made
+once before and only turned up when the decompiler found functions the dump didn't have.
+Made again anyway, one file over. Uses `ClassifyObject` now.
+
+532 references came back. Checked that it's a pure gain and not a shuffle: **0 offsets
+moved, 0 sizes changed, 0 properties renamed to anything else** — every difference is an
+empty type becoming a named one. `IndicatorWidget` on `BP_TornadoTracker_C` is a
+`W_TornadoIndicator_C` now instead of a bare pointer.
+
+**133 enumerators didn't fit their own enum's declared width.** `Enum::underlying` comes
+from how the enum gets *used* — an `FEnumProperty` names its underlying property. An enum
+nothing uses as a property has no usage to read, so those fell back to `uint8`.
+`ETransformGizmoSubElements` goes up to 524287.
+
+0.2.0 patched the visible half by widening at emit time so the SDK would compile, and left
+the IR still saying `uint8`. Fine while the built-in emitters are the only readers, wrong
+for a plugin, a script, or either of the two new emitters below. The values come straight
+out of `UEnum::Names`, so when the width disagrees with them it's the width that's wrong.
+`DumpBuilder` widens it now. 22 enums on that game, **0 enum values changed**.
+
+Same dump afterwards: 0 errors, 0 warnings.
+
+### The SDK was throwing 27,334 compiler warnings
+
+Found the same way, by compiling it rather than trusting the last measurement. Every type
+in the SDK is declared `struct`, and every elaborated specifier in a signature or parameter
+block said `class`:
+
+```cpp
+inline void UVariant::SetThumbnailFromCamera(class UObject* WorldContextObject, ...)
+                                             ^^^^^ but `struct UObject { ... }`
+```
+
+MSVC raises C4099 on every one. 27,334 on a UE 5.6 game, which buries anything the compiler
+actually wants to tell you about the cheat including the header. No errors and no layout
+problem, so "0 errors" stayed true the whole time and "0 warnings" quietly stopped being.
+The compile test greps for `error`, which is how it slid.
+
+Seven sites plus one hand-written `class UClass*` in `TSubclassOf`. `/W3` is back to
+**0 errors, 0 warnings** over 622 headers and 56,396 `static_assert`s. `/W4` leaves 352,
+all C4458 — a wrapper parameter shadowing a member of its own class, which is UE's naming,
+not ours to rename around.
+
+### `--process` wouldn't take a name two other commands already took
+
+`zircon detect` prints `StormEscape` in the PROJECT column. Paste that into `--process` and
+you got `no running process named 'StormEscape'`, because it matched the whole file name
+and nothing else. `inject` had always taken a substring. So two commands accepted a name
+the rest of the tool threw out.
+
+Exact match still wins, so a process can't get shadowed by one whose name contains it.
+Ambiguous substrings are still refused, and the refusal lists the candidates now instead of
+just their pids.
+
+### Ran the whole thing against a live game
+
+Funnel Runners (UE 5.6), the target the README numbers come from. Every binary, every
+provider, all eleven formats:
+
+```
+dump --emit all     618 packages, 5252 classes, 48692 properties, 17698 functions   13 s
+validate --strict   10850 types, 48692 properties, 2063 enums   0 errors, 0 warnings
+cpp_sdk             622 headers, 56396 static_asserts, /W3 0 errors 0 warnings
+external vs internal (injected)          10850 / 10850 types byte-identical
+external vs a 7 GB full-memory minidump  10850 / 10850 types byte-identical
+```
+
+All three dumps lint clean and diff to `no differences`.
+
+Drove the GUI end to end too: attach, filter, select, live values, **Allow edits**, Dump
+dialog. It was already listing `binja`, `frida_js` and `python_stubs` without a line of GUI
+code changing, because it renders the emitter registry. Dumped all three from it and
+they're all valid — the binja script byte-compiles, 619 stub modules parse, the Frida
+module loads in node at 9.9 MB and 10850 types in 181 ms.
+
+Checked the writes from outside the process: set `MaxWalkSpeed` to 1337 in the GUI and read
+it back with `zircon read` from a separate process, then flipped
+`bUseSeparateBrakingFriction` through `zircon write` with the other six bools in byte
+`0x02E8` left alone.
+
+### Three more emitters: `binja`, `frida_js`, `python_stubs`
+
+`frida_js` and `python_stubs` have been marked deferred since P3, and Binary Ninja sat in
+the scope table next to IDA and Ghidra without anyone writing it. Eleven formats now.
+
+**`binja`** — a Binary Ninja Python script. It doesn't spell out a `StructureBuilder`
+sequence per type the way you would by hand. On a real dump that's a 40 MB `.py` that takes
+minutes to import, and it's the same six lines copied fifty thousand times. It emits a data
+table and one loop that reads it:
+
+```python
+("AActor", 680, 8, ((0,"baseclass_0","s","UObject",1),(40,"RootLocation","s","FVector",1), ...
+```
+
+The script reserves every type name at its final width first and fills members in after, so
+a named reference always resolves. That's also why it needs no topological sort and raises
+none of the cycle warnings the C-emitting backends have to — UE dumps have cycles in them
+and here they cost nothing.
+
+**`frida_js`** — one `zircon.js` for `frida -l`. Half data, half runtime:
+
+```js
+var actor = Zircon.wrap(ptr('0x...'), '/Script/Engine.Actor');
+actor.MaxSpeed;          // reads through the derived offset
+actor.MaxSpeed = 1337;   // writes it
+actor.bHidden = true;    // one bit, not the byte the other six bools share
+```
+
+`wrap` walks the super chain so you don't have to qualify an inherited property. Enums read
+and write by name. Strings, maps, sets and delegates get refused rather than written — same
+rule as everywhere else, their memory has allocator state sitting next to the value.
+
+The data goes through `JSON.parse` instead of being a JS object literal. V8 has a faster
+path for JSON and it's worth seconds on a big game. It's escaped into a string literal that
+closes and reopens at every type, so you still get one type per line rather than a single
+30 MB line no editor will open.
+
+`Zircon.base` is lazy. Grabbing Frida's `Module` at load time would make the file
+unloadable anywhere else, and asking it for an offset from a build script is a reasonable
+thing to want.
+
+**`python_stubs`** — `.pyi` stubs, one module per UE package, for driving a game from
+Python. Completion on every class, `__offsets__` as a class-level dict, enums as real
+`IntEnum`s, the super chain as Python inheritance so inherited attributes resolve the way
+they already do.
+
+Stubs, not importable modules. Nothing here ever executes, which is the only reason the
+circular imports between packages are fine — UE's dependency graph has cycles and nothing
+would untangle them.
+
+`None` is an enumerator in `EGizmoElements` and a keyword in Python, so it comes out
+`None_`. That guard was in two places and neither test could fail while the other stood.
+Strips the `EFoo::Bar` leaf *before* sanitising now instead of after, so there's one guard
+and removing it fails two assertions.
+
+### `validate --strict`
+
+Every derived offset already comes with evidence and a confidence value. Nothing was
+reading the finished dump back afterwards and asking whether the pieces fit together, and
+that's a different question — it's where a derivation going wrong in a new way turns up
+first.
+
+```
+> zircon validate game.json --strict
+round-trip       lossless
+checked          10850 types, 48692 properties, 2063 enums
+
+CHECK                        COUNT  SEVERITY
+property-overlap                 2  error
+dangling-type-ref              118  warning
+
+warnings        118
+errors            2
+```
+
+About twenty checks: members overlapping or running past the end of their class, two
+non-bitfield properties at one offset, two bools claiming the same bit, an enum too narrow
+for its own values, a super or property type missing from the file, a function with two
+return values.
+
+Error vs warning splits on whether one file can prove it. A member at 400 sitting inside
+one that runs to 408 is a contradiction — error. A dangling super isn't; a `--filter`ed
+dump has no ancestors to point at and is still perfectly good.
+
+Exit code `9`, not `6`. `6` already means the file wouldn't parse, and a build script wants
+to tell that apart from "parsed fine and contradicts itself".
+
+The enum width check is the C4369 thing from 0.2.0, turned into something that fires now
+rather than as compiler warnings three steps later that nobody reads.
+
+Lives in `ir/Lint.h` next to the JSON reader, for the same reason: pure function of the IR,
+so no game needed and the tests need nothing beyond a struct literal.
+
+### `zircon xref`
+
+The thing a header can't tell you: if I change this, what's looking at it?
+
+```
+> zircon xref game.json -f CharacterMovementComponent
+extended by (14)
+held by (31)
+passed to (3)
+references        48
+```
+
+Inheritance, interfaces, properties and function parameters, including through containers —
+a `TMap<FName, TArray<AActor*>>` counts as a reference to `AActor`, not to nothing.
+`--uses` runs it the other way.
+
+A leaf name resolves when there's one match; when there isn't you get the candidates rather
+than a silent pick. Exit `3` when nothing points at it, same as `find`.
+
+### Several formats at once, and `dump --emit`
+
+`emit` takes a comma-separated list, and `all`:
+
+```
+zircon emit cpp_sdk,usmap,frida_js game.json -o out/
+zircon emit all game.json -o out/
+```
+
+A single format still writes straight into `-o`. Several get a subdirectory each, or `docs`
+and `graphs` write over one another — same layout the GUI and the payload already used. One
+format refusing doesn't stop the rest; asking for eleven and losing ten because one wanted
+objects is no use to anyone.
+
+Bad format names all get reported, not just the first. Mistype two of five and you want
+both now.
+
+`dump` can render as it writes:
+
+```
+zircon dump --pid 12345 --script --defaults -o game.json --emit cpp_sdk,usmap
+```
+
+Output lands next to the dump, not in the cwd, and the format list is resolved *before* the
+walk — finding out after seventy thousand objects that you mistyped a name is a bad trade.
+
+### `zircon browse` was in the help and wasn't a command
+
+It's listed in `--help`, in the README's command reference, and in the README's own
+examples. Running it printed `'browse' is not a command`.
+
+Starts `zircon-gui.exe` from next to the executable now, forwarding `--pid` or `--process`
+as the browser's `--attach`. `--dump` and `--file` get refused with a reason, since the GUI
+attaches externally and has nothing to browse in either. Doesn't wait on the window, which
+would make it useless from a script.
+
+### Fixes
+
+- `arg[0]` on a `std::string_view` that can be empty, which is UB. You get an empty argv
+  entry from any shell that expands a variable to nothing. Three call sites, one
+  `IsPositional` helper.
+- The injected payload prints every warning where the CLI collapses identical ones with a
+  count. 21 identical `usmap` lines in `zircon.log` tell you nothing one line with a count
+  wouldn't. Left alone for now, written down so it doesn't get rediscovered.
+- `emit list` had its format column ten wide, so `python_stubs` knocked the rest of its row
+  out of line.
+- `-p/--pattern`, `-m/--module` and `--all-regions` are all accepted by the parser and were
+  missing from `--help`.
+
+### Tests
+
+1600 checks across seven suites, up from 1537.
+
+`tests/test_emit_usmap.cpp` is `tests/test_emit.cpp` — it's covered reclass for a while and
+now covers three more formats, so the name had stopped being true.
+
+The binja test parses the emitted table back and checks the members *tile* the struct with
+no gap and no overlap, instead of matching golden text. A gap puts every member after it at
+the wrong address and nothing in Binary Ninja would tell you. Verified all three bite:
+padding emitted one byte wide instead of its real width fails two assertions, dropping the
+bitfield mask from the Frida blob fails one, removing the keyword guard from the stubs
+fails two.
+
+Also ran the Frida runtime outside Frida, over a `Buffer` with a NativePointer stand-in:
+fifteen checks covering the bit-preserving write, enum round-trip by name, nested struct
+offsets, an inherited property read through a derived class, and `FString` refusing.
+
+The linter has ten tests, each starting from a dump it passes and breaking exactly one
+thing. First version of the overlap test asserted a count of one and got two — a member
+wide enough to overlap `Health` also reaches the packed bools behind it. The cascade is
+right, so the test uses a width that hits exactly one member and the count means something.
+
+And then it found two real bugs the first time it saw a shipped game, which is the only
+result in this release nobody designed in advance.
+
+---
+
 ## 0.2.0 — 2026-09-13
 
 ### ProcessEvent, found by asking a question with a known answer

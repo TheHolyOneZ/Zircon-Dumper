@@ -62,7 +62,7 @@ provider they were handed:
 struct Capabilities {
     bool live_objects;       // GObjects is populated (false for Static)
     bool writable;
-    bool can_call;           // Internal only: we can invoke game functions
+    bool can_call;           // Internal only: can invoke game functions
     bool full_address_space;
 };
 ```
@@ -131,6 +131,14 @@ be inherited by every consumer of the IR.
 Synthetic fixtures cannot cover what a 30 MB dump of a shipped game contains, so that
 round-trip is what actually proves the serializer.
 
+`Lint.cpp` is the other half of that: the round-trip says the file survived being written
+and read, the lint says whether what is in it makes sense. Members that overlap, offsets
+past the end of a type, two bools on the same bit, an enum too narrow for its own values.
+It is a pure function of the IR like the emitters, so it needs no game, and `validate
+--strict` runs it. Errors mean the dump contradicts itself; warnings mean one file cannot
+prove it, which is why a dangling super is only a warning — a filtered dump has no
+ancestors to point at.
+
 The dump's exact structure is documented in the README under "What the dump contains".
 
 ### Why the IR is the contract
@@ -145,8 +153,8 @@ wholesale because a game shipped a custom property type.
 
 ## emit/ and diff/
 
-One file per output format, all of them pure functions from the IR. Adding a format means
-adding a file and registering it; it never means touching `engine/`.
+One file per output format, eleven of them, all pure functions from the IR. Adding a
+format means adding a file and registering it; it never means touching `engine/`.
 
 `diff/` classifies changes between two dumps by what they break, and renders text, JSON or
 Markdown. The exit code carries the verdict so a build script can gate on it.

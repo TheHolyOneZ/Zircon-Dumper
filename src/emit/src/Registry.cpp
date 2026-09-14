@@ -20,8 +20,11 @@ std::vector<Emitter>& Registry() {
         built_in.push_back({"usmap", "UE4SS / FModel .usmap mappings", true, &EmitUsmap});
         built_in.push_back({"ida", "IDA Pro Python script importing types", true, &EmitIda});
         built_in.push_back({"ghidra", "Ghidra Python script importing types", true, &EmitGhidra});
+        built_in.push_back({"binja", "Binary Ninja Python script importing types", true, &EmitBinja});
         built_in.push_back({"reclass", "ReClass.NET node file", true, &EmitReClass});
         built_in.push_back({"docs", "Browsable Markdown API reference", true, &EmitDocs});
+        built_in.push_back({"frida_js", "Frida JavaScript bindings with live property accessors", true, &EmitFridaJs});
+        built_in.push_back({"python_stubs", "Python .pyi type stubs for the whole type system", true, &EmitPythonStubs});
         built_in.push_back({"graphs", "Inheritance graphs in DOT and Mermaid", true, &EmitGraphs});
         built_in.push_back({"json", "Re-emit the IR as JSON", false, &EmitJson});
         return built_in;

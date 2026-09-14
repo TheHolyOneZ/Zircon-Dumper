@@ -244,15 +244,22 @@ ResolvedType ResolveTypeInner(const ResolveContext& context, Address field, int 
     type.raw  = GetPropertyTypeName(memory, *context.property_layout, *context.pool, field);
     type.size = GetElementSize(memory, *context.property_layout, field);
 
-    // Only resolves when the target really is the expected kind. Silence beats a wrong
-    // name here, since an unresolved reference is visible in the output and a confidently
-    // wrong one isn't.
-    auto referenced_object = [&](int slot, std::string_view expected_kind) -> std::string {
+    // Only resolves when the target really is the kind we expect. Silence beats a wrong name
+    // here - an unresolved reference is visible in the output, a confidently wrong one isn't.
+    //
+    // Kind test is meta-class ancestry, not the class name. This is the exact mistake
+    // ClassifyObject exists to stop and it was still being made here: a Blueprint struct's
+    // class is UserDefinedStruct, a Blueprint class's is BlueprintGeneratedClass, and the
+    // string compare dropped the type off every property pointing at one. 489 object
+    // properties and 43 struct properties on a UE 5.6 game, all of them Blueprint types,
+    // all silently untyped.
+    auto referenced_object = [&](int slot, ObjectKind expected_kind) -> std::string {
         if (slot < 0) return {};
         const auto target = core::ReadOr<Address>(memory, field + slot);
         if (!IsArrayObject(memory, *context.array, target)) return {};
-        if (!expected_kind.empty() &&
-            GetClassName(memory, *context.object_layout, *context.pool, target) != expected_kind)
+        if (expected_kind != ObjectKind::Other &&
+            ClassifyObject(memory, *context.object_layout, *context.struct_layout,
+                           *context.pool, target) != expected_kind)
             return {};
         type.referenced_object = target;
         return GetObjectPathName(memory, *context.object_layout, *context.pool, target);
@@ -275,22 +282,22 @@ ResolvedType ResolveTypeInner(const ResolveContext& context, Address field, int 
 
     if (raw == "ObjectProperty" || raw == "WeakObjectProperty" || raw == "LazyObjectProperty" ||
         raw == "SoftObjectProperty" || raw == "ObjectPtrProperty") {
-        type.referenced = referenced_object(slots.object_property_class, "Class");
+        type.referenced = referenced_object(slots.object_property_class, ObjectKind::Class);
     } else if (raw == "ClassProperty" || raw == "SoftClassProperty") {
         // MetaClass gives TSubclassOf<What>. PropertyClass is only ever UClass itself.
-        type.referenced = referenced_object(slots.class_meta_class, "Class");
+        type.referenced = referenced_object(slots.class_meta_class, ObjectKind::Class);
         if (type.referenced.empty()) {
             type.referenced_object = {};
-            type.referenced = referenced_object(slots.object_property_class, "Class");
+            type.referenced = referenced_object(slots.object_property_class, ObjectKind::Class);
         }
     } else if (raw == "StructProperty") {
-        type.referenced = referenced_object(slots.struct_struct, "ScriptStruct");
+        type.referenced = referenced_object(slots.struct_struct, ObjectKind::ScriptStruct);
     } else if (raw == "EnumProperty") {
-        type.referenced = referenced_object(slots.enum_enum, "Enum");
+        type.referenced = referenced_object(slots.enum_enum, ObjectKind::Enum);
         type.params.push_back(inner_property(slots.enum_underlying));
     } else if (raw == "ByteProperty") {
         // Null for a plain uint8.
-        type.referenced = referenced_object(slots.byte_enum, "Enum");
+        type.referenced = referenced_object(slots.byte_enum, ObjectKind::Enum);
     } else if (raw == "ArrayProperty") {
         type.params.push_back(inner_property(slots.array_inner));
     } else if (raw == "SetProperty") {
@@ -301,11 +308,11 @@ ResolvedType ResolveTypeInner(const ResolveContext& context, Address field, int 
         type.params.push_back(inner_property(slots.map_key));
         type.params.push_back(inner_property(slots.map_value));
     } else if (raw == "InterfaceProperty") {
-        type.referenced = referenced_object(slots.interface_class, "Class");
+        type.referenced = referenced_object(slots.interface_class, ObjectKind::Class);
     } else if (raw == "DelegateProperty" || raw == "MulticastDelegateProperty" ||
                raw == "MulticastInlineDelegateProperty" ||
                raw == "MulticastSparseDelegateProperty") {
-        type.referenced = referenced_object(slots.delegate_signature, "Function");
+        type.referenced = referenced_object(slots.delegate_signature, ObjectKind::Function);
     }
 
     return type;

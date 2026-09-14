@@ -22,6 +22,7 @@
 #include "diff/Diff.h"
 #include "emit/Emitter.h"
 #include "ir/Json.h"
+#include "ir/Lint.h"
 
 #include <algorithm>
 #include <charconv>
@@ -38,8 +39,10 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -146,9 +149,10 @@ void PrintUsage() {
 
     std::printf("%sProduce output%s\n", b.data(), r.data());
     std::printf("  %sdump%s          Full reflection dump to IR JSON\n", c.data(), r.data());
-    std::printf("  %semit%s          Render a dump to a format (%semit list%s to see them)\n",
-                c.data(), r.data(), c.data(), r.data());
-    std::printf("  %svalidate%s      Parse a dump and verify it round-trips\n", c.data(), r.data());
+    std::printf("  %semit%s          Render a dump to one or more formats, comma separated\n",
+                c.data(), r.data());
+    std::printf("  %svalidate%s      Parse a dump, round-trip it, and with --strict lint it\n", c.data(), r.data());
+    std::printf("  %sxref%s          What references a type, or with --uses what it references\n", c.data(), r.data());
     std::printf("  %sdiff%s          Compare two dumps and report what broke\n\n", c.data(), r.data());
 
     std::printf("%sWork live%s\n", b.data(), r.data());
@@ -170,11 +174,17 @@ void PrintUsage() {
     std::printf("  -f, --filter <s>   Only show names containing this substring\n"
                 "  -n, --limit <n>    Stop after n results\n"
                 "  -o, --out <path>   Output path (dump: default dump.json)\n"
+                "  -p, --pattern <s>  scan: the byte pattern to search for\n"
+                "  -m, --module <s>   scan: restrict the scan to one module\n"
+                "      --all-regions  scan: the whole address space, not only modules\n"
                 "      --names        Embed the whole FName pool in the dump\n"
                 "      --script       Decompile Kismet bytecode into the dump\n"
                 "      --defaults     Read each property's value from its class default object\n"
                 "      --plugins <d>  Load emitter plugins from a directory (repeatable)\n"
                 "      --allow-partial  Let emitters run on a partial dump\n"
+                "      --emit <fmts>  dump: also render the dump, e.g. cpp_sdk,usmap or all\n"
+                "      --strict       validate: also check the dump against itself\n"
+                "      --uses         xref: list what the type references, not what references it\n"
                 "      --style <s>    diff output: text (default), json, markdown\n"
                 "      --set <N=V>    write: the property and value, e.g. MaxWalkSpeed=1337\n"
                 "      --where <cond> find: Name<op>Value, ops = != < > <= >=\n"
@@ -190,7 +200,16 @@ void PrintUsage() {
     std::printf("  %szircon dump --pid 1234 --script --defaults -o game.json%s\n", d.data(), r.data());
     std::printf("  %szircon emit cpp_sdk game.json -o sdk/%s\n", d.data(), r.data());
     std::printf("  %szircon diff old.json new.json --breaking%s\n", d.data(), r.data());
+    std::printf("  %szircon dump --pid 1234 --emit cpp_sdk,usmap -o game.json%s\n", d.data(), r.data());
+    std::printf("  %szircon validate game.json --strict%s\n", d.data(), r.data());
+    std::printf("  %szircon xref game.json -f CharacterMovementComponent%s\n", d.data(), r.data());
     std::printf("  %szircon browse --pid 1234%s\n", d.data(), r.data());
+}
+
+// Bare argument, not a flag. Own function because arg[0] on an empty string_view is UB,
+// and you get an empty argv entry any time a shell expands a variable to nothing.
+bool IsPositional(std::string_view arg) {
+    return !arg.empty() && arg.front() != '-';
 }
 
 std::optional<std::uint32_t> ParseU32(std::string_view text) {
@@ -610,6 +629,62 @@ int CommandInject(const TargetSpec& spec, std::string_view dll_path) {
     return 0;
 }
 
+// Hands off to zircon-gui.exe next door. The browser is a separate binary since it drags
+// in a renderer the CLI doesn't need - but `browse` has been sitting in the help and the
+// readme the whole time, and printing "that's not a command" for something the help
+// lists is the worst of both.
+int CommandBrowse(const TargetSpec& spec) {
+    wchar_t self[MAX_PATH * 2] = {};
+    ::GetModuleFileNameW(nullptr, self, static_cast<DWORD>(std::size(self)));
+    const auto gui = std::filesystem::path(self).parent_path() / "zircon-gui.exe";
+
+    std::error_code ec;
+    if (!std::filesystem::exists(gui, ec)) {
+        LogError("the browser is a separate binary and is not next to this one: {}",
+                 gui.string());
+        LogError("build the zircon-gui target, or run zircon-gui.exe directly");
+        return 4;
+    }
+
+    // only a pid is any use to it. the GUI attaches externally, so --dump and --file have
+    // nothing to browse - say so instead of opening a picker that ignores the argument.
+    std::wstring arguments = L"\"" + gui.wstring() + L"\"";
+    if (spec.kind == TargetSpec::Kind::Pid) {
+        arguments += L" --attach " + std::to_wstring(spec.pid);
+    } else if (spec.kind == TargetSpec::Kind::ProcessName) {
+        std::vector<std::uint32_t> matches;
+        for (const auto& process : zircon::core::EnumerateProcesses())
+            if (process.name.find(spec.value) != std::string::npos)
+                matches.push_back(process.pid);
+        if (matches.size() != 1) {
+            LogError("'{}' matches {} processes; use --pid", spec.value, matches.size());
+            return 2;
+        }
+        arguments += L" --attach " + std::to_wstring(matches.front());
+    } else if (spec.kind != TargetSpec::Kind::None) {
+        LogError("browse attaches to a running process; --pid or --process, or neither "
+                 "to pick from a list");
+        return 1;
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION info{};
+
+    if (!::CreateProcessW(gui.c_str(), arguments.data(), nullptr, nullptr, FALSE,
+                          0, nullptr, nullptr, &startup, &info)) {
+        LogError("could not start the browser: error {}", ::GetLastError());
+        return 4;
+    }
+    ::CloseHandle(info.hThread);
+    ::CloseHandle(info.hProcess);
+
+    // don't wait on it. the browser owns its own window, and blocking here would make this
+    // useless from a script.
+    Field("browser", gui.string());
+    return 0;
+}
+
 int CommandObjects(const TargetSpec& spec, std::string_view filter, int limit) {
     auto session = OpenSession(spec, true);
     if (!session) return 4;
@@ -886,50 +961,67 @@ void ReportWarnings(const std::vector<std::string>& warnings) {
         LogWarn("{} warnings, {} distinct", warnings.size(), unique.size());
 }
 
-int CommandEmit(std::string_view format, std::string_view dump_path,
-                std::string_view out_dir, std::string_view filter, bool allow_partial) {
-    if (format.empty() || format == "list") {
-        Heading(std::format("{:<10} {:<6} {}", "FORMAT", "NEEDS", "DESCRIPTION"));
-        for (const auto& emitter : zircon::emit::Emitters()) {
-            std::printf("%.*s%-10s%.*s %.*s%-6s%.*s %s\n",
-                        static_cast<int>(Cyan().size()), Cyan().data(),
-                        std::string(emitter.name).c_str(),
-                        static_cast<int>(Reset().size()), Reset().data(),
-                        static_cast<int>(Dim().size()), Dim().data(),
-                        emitter.needs_objects ? "objs" : "-",
-                        static_cast<int>(Reset().size()), Reset().data(),
-                        std::string(emitter.description).c_str());
+// "cpp_sdk,usmap,json", or "all". Empty entries get dropped so a trailing comma isn't
+// an error nobody would have expected.
+std::vector<std::string> SplitFormats(std::string_view spec) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    while (start <= spec.size()) {
+        const std::size_t comma = spec.find(',', start);
+        const std::size_t end = comma == std::string_view::npos ? spec.size() : comma;
+        std::string_view piece = spec.substr(start, end - start);
+        while (!piece.empty() && piece.front() == ' ') piece.remove_prefix(1);
+        while (!piece.empty() && piece.back() == ' ')  piece.remove_suffix(1);
+        if (!piece.empty()) out.emplace_back(piece);
+        if (comma == std::string_view::npos) break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+// Resolve a format list. Reports every bad name, not just the first - if you mistyped two
+// of five you want both now, not on the next run.
+bool ResolveEmitters(std::string_view spec,
+                     std::vector<const zircon::emit::Emitter*>& out) {
+    if (spec == "all") {
+        for (const auto& emitter : zircon::emit::Emitters()) out.push_back(&emitter);
+        return true;
+    }
+
+    bool ok = true;
+    for (const auto& name : SplitFormats(spec)) {
+        const auto* emitter = zircon::emit::FindEmitter(name);
+        if (!emitter) {
+            LogError("unknown format '{}'; run 'zircon emit list' to see them", name);
+            ok = false;
+            continue;
         }
-        return format.empty() ? 1 : 0;
+        // same format twice would just run it twice into the same directory
+        if (std::find(out.begin(), out.end(), emitter) == out.end()) out.push_back(emitter);
     }
-
-    const auto* emitter = zircon::emit::FindEmitter(format);
-    if (!emitter) {
-        LogError("unknown format '{}'; run 'zircon emit list' to see them", format);
-        return 1;
+    if (ok && out.empty()) {
+        LogError("no formats given, e.g. zircon emit cpp_sdk dump.json -o out/");
+        return false;
     }
-    if (dump_path.empty()) {
-        LogError("emit requires a dump, e.g. zircon emit cpp_sdk dump.json -o out/");
-        return 1;
-    }
+    return ok;
+}
 
-    auto loaded = zircon::ir::ReadJsonFile(dump_path);
-    if (!loaded.ok()) {
-        LogError("{}", loaded.error().message);
-        return 6;
-    }
-
-    zircon::emit::EmitOptions options;
-    options.out_dir        = out_dir.empty() ? "." : std::string(out_dir);
-    options.package_filter = filter;
-    options.allow_partial  = allow_partial;
-
-    const auto emitted = emitter->emit(loaded.value(), options);
+// Run one emitter, print what it wrote. `labelled` is false for a single-format run so
+// that output stays exactly as it was; with several it prefixes each block.
+int RunEmitter(const zircon::emit::Emitter& emitter, const zircon::ir::Dump& dump,
+               const zircon::emit::EmitOptions& options, bool labelled) {
+    const auto emitted = emitter.emit(dump, options);
     ReportWarnings(emitted.warnings);
 
     if (!emitted.ok()) {
-        LogError("{}", emitted.error);
+        LogError("{}: {}", emitter.name, emitted.error);
         return 7;
+    }
+
+    if (labelled) {
+        FieldStrong(emitter.name, std::format("{} file(s) -> {}", emitted.files.size(),
+                                              options.out_dir));
+        return 0;
     }
 
     FieldStrong("files written", std::format("{}", emitted.files.size()));
@@ -946,10 +1038,127 @@ int CommandEmit(std::string_view format, std::string_view dump_path,
     return 0;
 }
 
+// Several formats into one directory means `docs` and `graphs` write over each other, so
+// each gets a subdirectory. A single format still writes straight into -o, because that's
+// where everyone's scripts already look.
+std::string OutDirFor(std::string_view base, std::string_view format, bool split) {
+    if (!split) return std::string(base);
+    std::filesystem::path path(base);
+    path /= format;
+    return path.lexically_normal().string();
+}
+
+int CommandEmit(std::string_view format, std::string_view dump_path,
+                std::string_view out_dir, std::string_view filter, bool allow_partial) {
+    if (format.empty() || format == "list") {
+        Heading(std::format("{:<13} {:<6} {}", "FORMAT", "NEEDS", "DESCRIPTION"));
+        for (const auto& emitter : zircon::emit::Emitters()) {
+            std::printf("%.*s%-13s%.*s %.*s%-6s%.*s %s\n",
+                        static_cast<int>(Cyan().size()), Cyan().data(),
+                        std::string(emitter.name).c_str(),
+                        static_cast<int>(Reset().size()), Reset().data(),
+                        static_cast<int>(Dim().size()), Dim().data(),
+                        emitter.needs_objects ? "objs" : "-",
+                        static_cast<int>(Reset().size()), Reset().data(),
+                        std::string(emitter.description).c_str());
+        }
+        return format.empty() ? 1 : 0;
+    }
+
+    std::vector<const zircon::emit::Emitter*> emitters;
+    if (!ResolveEmitters(format, emitters)) return 1;
+
+    if (dump_path.empty()) {
+        LogError("emit requires a dump, e.g. zircon emit cpp_sdk dump.json -o out/");
+        return 1;
+    }
+
+    auto loaded = zircon::ir::ReadJsonFile(dump_path);
+    if (!loaded.ok()) {
+        LogError("{}", loaded.error().message);
+        return 6;
+    }
+
+    const std::string base = out_dir.empty() ? "." : std::string(out_dir);
+    const bool split = emitters.size() > 1;
+
+    int worst = 0;
+    for (const auto* emitter : emitters) {
+        zircon::emit::EmitOptions options;
+        options.out_dir        = OutDirFor(base, emitter->name, split);
+        options.package_filter = filter;
+        options.allow_partial  = allow_partial;
+
+        // one failing doesn't stop the rest. ask for eleven and lose ten because usmap refused a
+        // partial dump - not useful.
+        const int code = RunEmitter(*emitter, loaded.value(), options, split);
+        if (code != 0) worst = code;
+    }
+    return worst;
+}
+
+// Lint report: a table of check names with counts, then the findings up to a limit.
+// Errors before warnings - an overlapping member matters more than a hundred dangling
+// refs in a filtered dump.
+//
+// --strict is a different question from the round-trip. The round-trip says the file
+// survived being written and read back; the lint says whether what's in it makes sense.
+void ReportLint(const zircon::ir::LintReport& report, int limit) {
+    if (report.findings.empty()) {
+        std::printf("%-16s %s\n", "structure", "no problems found");
+        return;
+    }
+
+    std::map<std::pair<int, std::string>, std::size_t> counts;
+    for (const auto& finding : report.findings)
+        ++counts[{static_cast<int>(finding.severity), finding.check}];
+
+    Heading(std::format("{:<26} {:>7}  {}", "CHECK", "COUNT", "SEVERITY"));
+    for (const auto& [key, count] : counts) {
+        const auto severity = static_cast<zircon::ir::LintSeverity>(key.first);
+        const bool is_error = severity == zircon::ir::LintSeverity::Error;
+        std::printf("%.*s%-26s%.*s %7zu  %.*s%s%.*s\n",
+                    static_cast<int>(Cyan().size()), Cyan().data(), key.second.c_str(),
+                    static_cast<int>(Reset().size()), Reset().data(), count,
+                    static_cast<int>(is_error ? Red().size() : Dim().size()),
+                    is_error ? Red().data() : Dim().data(),
+                    std::string(zircon::ir::ToString(severity)).c_str(),
+                    static_cast<int>(Reset().size()), Reset().data());
+    }
+    std::printf("\n");
+
+    const int shown_cap = limit > 0 ? limit : 20;
+    int shown = 0;
+    for (const int pass : {0, 1}) {
+        for (const auto& finding : report.findings) {
+            if (static_cast<int>(finding.severity) != pass) continue;
+            if (shown >= shown_cap) break;
+            ++shown;
+            std::printf("  %-24s %s\n", finding.check.c_str(), finding.where.c_str());
+            std::printf("  %.*s%-24s %s%.*s\n",
+                        static_cast<int>(Dim().size()), Dim().data(), "",
+                        finding.detail.c_str(),
+                        static_cast<int>(Reset().size()), Reset().data());
+        }
+    }
+
+    const std::size_t total = report.errors + report.warnings;
+    if (static_cast<std::size_t>(shown) < total)
+        std::printf("  %.*s... and %zu more; -n to raise the limit%.*s\n",
+                    static_cast<int>(Dim().size()), Dim().data(),
+                    total - static_cast<std::size_t>(shown),
+                    static_cast<int>(Reset().size()), Reset().data());
+    std::printf("\n");
+}
+
 // Parses a dump back and re-emits it, checking the result is identical. Synthetic
 // fixtures cannot cover what a 30 MB dump of a real game contains, so this is what
 // actually proves the serializer round-trips.
-int CommandValidate(std::string_view path) {
+//
+// --strict adds the structural checks in ir/Lint.h, which is a different question: the
+// round-trip says the file survived being written and read, the lint says whether what is
+// in it makes sense.
+int CommandValidate(std::string_view path, bool strict, int limit) {
     if (path.empty()) {
         LogError("validate requires a dump path, e.g. zircon validate dump.json");
         return 1;
@@ -987,12 +1196,183 @@ int CommandValidate(std::string_view path) {
     }
 
     std::printf("%-16s %s\n", "round-trip", "lossless");
+    if (!strict) return 0;
+
+    const auto report = zircon::ir::Lint(dump);
+    std::printf("%-16s %zu types, %zu properties, %zu enums\n", "checked",
+                report.types_checked, report.properties_checked, report.enums_checked);
+    std::printf("\n");
+
+    ReportLint(report, limit);
+
+    Field("warnings", "{}", report.warnings);
+    if (report.errors == 0) {
+        FieldStrong("errors", "0");
+        return 0;
+    }
+
+    // own exit code. 6 already means "wouldn't parse", and a build script wants to tell
+    // that apart from "parsed fine and contradicts itself".
+    FieldStrong("errors", std::format("{}", report.errors));
+    return 9;
+}
+
+// Does this type tree mention `path` anywhere, at any depth? TMap<FName, TArray<AActor*>>
+// references AActor, and only looking at the outer kind would miss it.
+bool TypeMentions(const zircon::ir::TypeRef& type, std::string_view path) {
+    if (type.name == path) return true;
+    for (const auto& param : type.params) if (TypeMentions(param, path)) return true;
+    return false;
+}
+
+// Full path wins. Otherwise a leaf name, and only when it's unambiguous - quietly picking
+// one of two Actors is the sort of wrong answer this tool exists not to give.
+std::string ResolveTypePath(const zircon::ir::Dump& dump, std::string_view query) {
+    std::vector<std::string> hits;
+
+    const auto consider = [&](const std::string& path) {
+        if (path == query) { hits.assign(1, path); return true; }
+        if (zircon::emit::util::LeafName(path) == query) hits.push_back(path);
+        return false;
+    };
+
+    for (const auto& package : dump.packages) {
+        for (const auto& record : package.classes) if (consider(record.path)) return record.path;
+        for (const auto& record : package.structs) if (consider(record.path)) return record.path;
+        for (const auto& record : package.enums)   if (consider(record.path)) return record.path;
+    }
+
+    if (hits.empty()) {
+        LogError("no type named '{}' in this dump", query);
+        return {};
+    }
+    if (hits.size() > 1) {
+        LogError("'{}' is ambiguous, {} types have that leaf name:", query, hits.size());
+        for (std::size_t i = 0; i < hits.size() && i < 8; ++i)
+            std::printf("  %s\n", hits[i].c_str());
+        if (hits.size() > 8) std::printf("  ... and %zu more\n", hits.size() - 8);
+        return {};
+    }
+    return hits.front();
+}
+
+// Who points at this type, and how. The thing a dump can answer and a header can't: if I
+// change AActor, what else is looking at it?
+int CommandXref(std::string_view dump_path, std::string_view query, bool uses, int limit) {
+    if (dump_path.empty()) {
+        LogError("xref requires a dump, e.g. zircon xref game.json -f Actor");
+        return 1;
+    }
+    if (query.empty()) {
+        LogError("xref requires a type, e.g. zircon xref game.json -f CharacterMovementComponent");
+        return 1;
+    }
+
+    auto loaded = zircon::ir::ReadJsonFile(dump_path);
+    if (!loaded.ok()) {
+        LogError("{}", loaded.error().message);
+        return 6;
+    }
+    const auto& dump = loaded.value();
+
+    const std::string target = ResolveTypePath(dump, query);
+    if (target.empty()) return 2;
+
+    FieldStrong("type", target);
+
+    // grouped - "inherits from it" and "holds a pointer to it" are different questions, and
+    // a flat list leaves you sorting them out yourself
+    std::map<std::string, std::vector<std::string>> groups;
+    const auto note = [&](const char* group, std::string entry) {
+        groups[group].push_back(std::move(entry));
+    };
+
+    if (uses) {
+        const zircon::ir::Struct* record = nullptr;
+        for (const auto& package : dump.packages) {
+            for (const auto* list : {&package.classes, &package.structs})
+                for (const auto& candidate : *list)
+                    if (candidate.path == target) record = &candidate;
+        }
+        if (!record) {
+            LogError("'{}' is an enum; --uses only applies to classes and structs", target);
+            return 2;
+        }
+
+        if (!record->super.empty()) note("extends", record->super);
+        for (const auto& interface_path : record->interfaces) note("implements", interface_path);
+
+        // dedup per group. a class with forty AActor* properties references AActor once as far
+        // as this question goes.
+        std::set<std::string> seen_types;
+        std::function<void(const zircon::ir::TypeRef&)> walk =
+            [&](const zircon::ir::TypeRef& type) {
+                if (!type.name.empty() && seen_types.insert(type.name).second)
+                    note("uses", type.name);
+                for (const auto& param : type.params) walk(param);
+            };
+        for (const auto& property : record->properties) walk(property.type);
+        for (const auto& function : record->functions)
+            for (const auto& param : function.params) walk(param.type);
+    } else {
+        for (const auto& package : dump.packages) {
+            for (const auto* list : {&package.classes, &package.structs}) {
+                for (const auto& record : *list) {
+                    if (record.super == target) note("extended by", record.path);
+
+                    for (const auto& interface_path : record.interfaces)
+                        if (interface_path == target) note("implemented by", record.path);
+
+                    for (const auto& property : record.properties)
+                        if (TypeMentions(property.type, target))
+                            note("held by", record.path + "." + property.name);
+
+                    for (const auto& function : record.functions)
+                        for (const auto& param : function.params)
+                            if (TypeMentions(param.type, target))
+                                note("passed to", record.path + "." + function.name +
+                                                  "(" + param.name + ")");
+                }
+            }
+        }
+    }
+
+    std::size_t total = 0;
+    for (const auto& [group, entries] : groups) total += entries.size();
+
+    if (total == 0) {
+        Field("references", "none");
+        // own code so a script can tell "nothing points at this" from "the dump wouldn't load".
+        // same shape as find returning 3.
+        return 3;
+    }
+
+    const std::size_t cap = limit > 0 ? static_cast<std::size_t>(limit) : 40;
+    for (auto& [group, entries] : groups) {
+        std::sort(entries.begin(), entries.end());
+        Heading(std::format("{} ({})", group, entries.size()));
+        for (std::size_t i = 0; i < entries.size() && i < cap; ++i)
+            std::printf("  %s\n", entries[i].c_str());
+        if (entries.size() > cap)
+            std::printf("  %.*s... and %zu more%.*s\n",
+                        static_cast<int>(Dim().size()), Dim().data(),
+                        entries.size() - cap,
+                        static_cast<int>(Reset().size()), Reset().data());
+    }
+
+    Field("references", "{}", total);
     return 0;
 }
 
 int CommandDump(const TargetSpec& spec, std::string_view out_path,
                 std::string_view filter, bool with_names, bool with_script,
-                bool with_defaults) {
+                bool with_defaults, std::string_view emit_formats,
+                bool allow_partial) {
+    // resolve the formats before the walk. seventy thousand objects take a few seconds and
+    // finding out afterwards that a name was mistyped is a bad trade.
+    std::vector<const zircon::emit::Emitter*> emitters;
+    if (!emit_formats.empty() && !ResolveEmitters(emit_formats, emitters)) return 1;
+
     auto source = OpenTarget(spec);
     if (!source) {
         LogError("{}", source.error().message);
@@ -1031,7 +1411,27 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
     Field("properties", "{}", dump.TotalProperties());
     Field("functions",  "{}", dump.TotalFunctions());
     if (!dump.names.empty()) Field("names", "{}", dump.names.size());
-    return 0;
+
+    if (emitters.empty()) return 0;
+
+    // next to the dump, not in the cwd. `-o out/game.json --emit cpp_sdk` meaning "json over
+    // there, headers over here" would surprise everyone.
+    const std::filesystem::path base = std::filesystem::path(path).parent_path();
+    const bool split = emitters.size() > 1;
+
+    Heading("emit");
+    int worst = 0;
+    for (const auto* emitter : emitters) {
+        zircon::emit::EmitOptions emit_options;
+        emit_options.out_dir = OutDirFor(base.empty() ? "." : base.string(), emitter->name,
+                                         split);
+        emit_options.package_filter = filter;
+        emit_options.allow_partial  = allow_partial;
+
+        const int code = RunEmitter(*emitter, dump, emit_options, split);
+        if (code != 0) worst = code;
+    }
+    return worst;
 }
 
 // Reads the live values of one object's properties. The dump says where a member is;
@@ -1699,6 +2099,8 @@ int main(int argc, char** argv) {
     std::string report_style;
     bool        breaking_only = false;
     bool        allow_partial = false;
+    bool        strict = false;
+    bool        uses = false;
     bool        with_names = false;
     bool        with_script = false;
     bool        with_defaults = false;
@@ -1787,9 +2189,20 @@ int main(int argc, char** argv) {
             with_script = true;
         } else if (arg == "--defaults") {
             with_defaults = true;
+        } else if (arg == "--emit") {
+            // dump only: render as we write, so the common case is one command instead of two
+            // and one less chance to emit from a stale file
+            const auto value = next(arg);
+            if (!value) return 1;
+            emit_format = *value;
         } else if (arg == "--allow-partial") {
             allow_partial = true;
-        } else if (command == "validate" && validate_path.empty() && arg[0] != '-') {
+        } else if (arg == "--strict") {
+            strict = true;
+        } else if (arg == "--uses") {
+            uses = true;
+        } else if ((command == "validate" || command == "xref") &&
+                   validate_path.empty() && IsPositional(arg)) {
             validate_path = arg;
         } else if (arg == "--style") {
             const auto value = next(arg);
@@ -1797,11 +2210,11 @@ int main(int argc, char** argv) {
             report_style = *value;
         } else if (arg == "--breaking") {
             breaking_only = true;
-        } else if (command == "diff" && arg[0] != '-') {
+        } else if (command == "diff" && IsPositional(arg)) {
             if (diff_before.empty())     diff_before = arg;
             else if (diff_after.empty()) diff_after = arg;
             else { LogError("diff takes exactly two dumps"); return 1; }
-        } else if (command == "emit" && arg[0] != '-') {
+        } else if (command == "emit" && IsPositional(arg)) {
             // `emit <format> <dump>`: two bare arguments, in that order.
             if (emit_format.empty())        emit_format = arg;
             else if (validate_path.empty()) validate_path = arg;
@@ -1843,21 +2256,19 @@ int main(int argc, char** argv) {
     if (command == "write")       return CommandWrite(spec, name_filter, assignment);
     if (command == "find")        return CommandFind(spec, name_filter, predicate, limit);
     if (command == "dump")        return CommandDump(spec, out_path, name_filter, with_names,
-                                                     with_script, with_defaults);
-    if (command == "validate")    return CommandValidate(validate_path);
+                                                     with_script, with_defaults, emit_format,
+                                                     allow_partial);
+    if (command == "validate")    return CommandValidate(validate_path, strict, limit);
+    if (command == "xref")        return CommandXref(validate_path, name_filter, uses, limit);
     if (command == "emit")        return CommandEmit(emit_format, validate_path, out_path,
                                                      name_filter, allow_partial);
     if (command == "diff")        return CommandDiff(diff_before, diff_after, out_path,
                                                      name_filter, report_style,
                                                      breaking_only);
     if (command == "inspect")     return CommandInspect(spec, name_filter, limit);
+    if (command == "browse")  return CommandBrowse(spec);
     if (command == "modules") return CommandModules(spec);
     if (command == "scan")    return CommandScan(spec, pattern_text, scan_module, all_regions);
-
-    if (command == "browse") {
-        LogError("'{}' is not a command; run 'zircon --help' to see them", command);
-        return 2;
-    }
 
     LogError("unknown command: {}", command);
     PrintUsage();
