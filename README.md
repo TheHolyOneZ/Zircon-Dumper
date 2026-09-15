@@ -305,6 +305,20 @@ functions          11227  ->     11227
 no differences
 ```
 
+### It puts a dump online if you want one there
+
+`zircon publish` uploads a dump to [Zdex](https://zlogic.eu/zdex), which makes it
+browsable, searchable and diffable without anyone installing anything.
+
+```
+> zircon publish game.json --label "1.4.2 (Steam)"
+compressed       59.1 MB -> 3.4 MB (17.3x)
+url              https://zlogic.eu/zdex/d/42
+status           ready
+```
+
+Optional, opt-in, and off unless you ask. Details in [Publishing a dump](#publishing-a-dump).
+
 ---
 
 ## Three binaries — which one do you want?
@@ -368,6 +382,25 @@ actually written.
 While a dump is running the browser stops reading the game, and the Properties and Script
 tabs say so. That's deliberate: one reader at a time is easier to be certain of than a
 lock around every memory read.
+
+It publishes too. **Publish…** sits next to Dump… and uploads a dump to
+[Zdex](https://zlogic.eu/zdex) without leaving the window:
+
+```
+Publish to Zdex
+  Dump     ...\zircon-out\json\MyGame_Win64_Shipping.json
+  Game     MyGame            Build  1.4.2 (Steam)
+  Notes
+
+  [ Publish ]  [ Close ]  [ Open on Zdex ]
+  done, ready
+  https://zlogic.eu/zdex/d/9
+```
+
+It fills in the file from your last dump and the game from the attached process, so usually
+only the build label needs typing. If you haven't stored a key yet it asks for one there,
+into the same place `zircon login` uses. Cancelling mid-upload is safe — whatever reached
+the server stays, and the next attempt carries on from it.
 
 ### "Is there an installer?"
 
@@ -716,6 +749,53 @@ One format writes straight into `-o` the way it always has. Several get a subdir
 each, because `docs` and `graphs` would otherwise write over one another. A format that
 refuses does not stop the rest.
 
+## Publishing a dump
+
+[Zdex](https://zlogic.eu/zdex) indexes Zircon dumps and makes them browsable, searchable and
+diffable in a browser — useful when you want to look something up without a dump on disk, or
+hand a build to someone who isn't going to install anything.
+
+Publishing is entirely optional. Nothing uploads unless you ask it to.
+
+```
+zircon login                                     paste your API key once
+zircon publish game.json --label "1.4.2 (Steam)"
+```
+
+That prints a URL. `--label` is how you'll tell two builds apart later, so it's worth
+filling in; `--game` is guessed from the process the dump came from and only needs saying
+when the guess is wrong.
+
+`login` takes an **API key**, not an account — get one from your Zdex profile. There's no
+browser flow and no OAuth. The key lives in `%APPDATA%\Zircon\config.json` and nowhere else:
+not in the dump, not in a log line, not in anything committed. `zircon logout` deletes it.
+
+Dump and publish in one go:
+
+```
+zircon dump --pid 12345 --script --defaults -o game.json --publish --label "1.4.2"
+```
+
+Without `--publish` the dump just prints the command you'd need, so it's in front of you if
+you want it and out of the way if you don't. The GUI has a **Publish…** button that does the
+same thing — see [Can the GUI dump?](#can-the-gui-dump-or-does-it-only-browse).
+
+Pulling things back down:
+
+```
+zircon fetch 42              the dump JSON
+zircon fetch 42 --usmap      just the mappings
+zircon fetch 42 --sdk        the generated SDK, as a zip
+```
+
+Uploads are gzipped, chunked and resumable — a dropped connection picks up where it stopped
+instead of starting over. A 59 MB dump compresses to about 3 MB and takes a few seconds.
+Publishing the same dump twice is not an error; the server recognises it and points you at
+the one that's already there.
+
+`--no-wait` returns as soon as the upload lands rather than waiting for indexing to finish,
+and `--json` prints the result as JSON if you're scripting around it.
+
 ## Injecting (and when you don't need to)
 
 **Most of the time you don't need to inject anything.** Dumping, SDK generation, the live
@@ -1059,6 +1139,11 @@ diff          compare two dumps                 [--breaking] [--style json|markd
 browse        the live object browser
 inject        load the payload into a running game
 
+publish       upload a dump to Zdex and print where it landed
+fetch         download a published dump, its mappings or its SDK
+login         store a Zdex API key
+logout        forget it again
+
 install       add this folder to the user PATH (HKCU only, no elevation)
 uninstall     take it off again
 ```
@@ -1093,6 +1178,15 @@ And the options, in full:
     --where <c>    find: Name<op>Value, ops are = != < > <= >=
     --breaking     diff: only changes that break existing code
     --style <s>    diff: text (default), json or markdown
+    --publish      dump: publish it to Zdex once it is written
+    --game <name>  publish: which game this is (guessed from the process)
+    --label <s>    publish: which build, e.g. "1.4.2 (Steam)"
+    --notes <s>    publish: a line of context for whoever reads it
+    --no-wait      publish: return once uploaded, don't wait on indexing
+    --json         publish: machine-readable result on stdout
+    --open         publish: open the result in a browser when it's ready
+    --usmap        fetch: mappings instead of the dump (--sdk for the SDK zip)
+-y, --yes          publish: skip the confirmation
     --plugins <d>  load emitter plugins from a directory (repeatable)
     --allow-partial  let emitters run on a partial dump
 -v, --verbose      debug logging; repeat for trace
@@ -1209,10 +1303,11 @@ All phases P0–P7 complete, verified against sixteen live games from UE 4.22 to
 | **P3** emitters | cpp_sdk, usmap, ida, ghidra, binja, reclass, docs, graphs, frida_js, python_stubs, json |
 | **P4** diffing | 27 change kinds graded by what they break, migration report |
 | **P5** bytecode | ~90 Kismet opcodes, 100% of 1.16 MB decoded |
-| **P6** live browser | Dear ImGui, standalone *and* in-process; CDO defaults, live values |
+| **P6** live browser | Dear ImGui, standalone *and* in-process; CDO defaults, live values, dump and publish |
 | **P7** plugin API | C ABI + vendored Lua; emitters, FName decoders, global resolvers |
 | gap list | CDO defaults, interfaces, property flag names, class vtables — all closed |
 | 0.3.0 | three more emitters, a dump linter, a reference index, multi-format emit |
+| 0.4.0 | publishing to Zdex from the CLI and the GUI, and a read cache that no longer serves yesterday's bytes |
 
 Measured on Funnel Runners (UE 5.6):
 
@@ -1259,10 +1354,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-A build reports its version as `0.3.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
+A build reports its version as `0.4.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
 that is the only difference between a local build and a released one.
 
-Seven test suites, 1600 checks, none of which need a game installed. They run against
+Eight test suites, 1774 checks, none of which need a game installed. They run against
 synthetic memory, hand-built bytecode and checked-in fixtures.
 
 > If Strawberry Perl or MinGW is on PATH, CMake may pick up its GCC. Pass the Visual

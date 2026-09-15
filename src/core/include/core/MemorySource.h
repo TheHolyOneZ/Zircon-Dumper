@@ -29,6 +29,11 @@ public:
     // Returns whether writes are enabled afterwards.
     virtual bool EnableWrites(bool /*enable*/) { return false; }
 
+    // Drop anything kept from earlier reads. Only the cache does anything here. Needed by
+    // whoever holds a source over time -- the browser between refreshes, a dump started
+    // long after attach -- or it keeps handing back the bytes from first touch.
+    virtual void Invalidate() {}
+
     virtual std::span<const ModuleInfo> Modules() const = 0;
     virtual std::span<const RegionInfo> Regions() const = 0;
     virtual Capabilities                Caps()    const = 0;

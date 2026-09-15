@@ -7,12 +7,16 @@
 #include "engine/ValueReader.h"
 #include "engine/ValueWriter.h"
 #include "ir/Json.h"
+#include "zdex/Client.h"
+#include "zdex/Config.h"
+#include "zdex/Upload.h"
 
 #include "imgui.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>
 
 // <windows.h> defines GetClassName as a macro expanding to GetClassNameW, quietly turning
 // every engine::GetClassName call into a window-manager one. This file means the engine's.
@@ -110,7 +114,11 @@ Browser::Browser() {
     }
 }
 
-Browser::~Browser() { JoinDump(); }
+Browser::~Browser() {
+    publish_cancel_ = true;
+    JoinDump();
+    JoinPublish();
+}
 
 void Browser::Draw() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -132,6 +140,8 @@ void Browser::Draw() {
 
             ImGui::BeginDisabled(dumping_);
             if (ImGui::SmallButton("Dump...")) dump_panel_open_ = true;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Publish...")) publish_panel_open_ = true;
             ImGui::SameLine();
             if (ImGui::SmallButton("Detach")) Detach();
             ImGui::EndDisabled();
@@ -171,6 +181,7 @@ void Browser::Draw() {
     ImGui::EndChild();
 
     DrawDumpPanel();
+    DrawPublishPanel();
     ApplyFrozen();
 
     ImGui::End();
@@ -712,6 +723,12 @@ void Browser::StartDump() {
         dump_status_ = "walking the object graph...";
     }
 
+    // The cache is full of pages browsing put there, maybe a long time ago. Dumping through
+    // it mixes two moments of a process that has been collecting garbage in between: an
+    // outer pointer cached before a GC resolves against whatever owns that memory now,
+    // which is how a Blueprint class ends up sitting inside a texture.
+    memory_->Invalidate();
+
     engine::BuildOptions options;
     options.include_script   = dump_script_;
     options.include_defaults = dump_defaults_;
@@ -772,6 +789,259 @@ void Browser::StartDump() {
 
         status(std::format("done -> {}", out_dir));
         dumping_ = false;
+    });
+}
+
+
+// --- publishing ------------------------------------------------------------------------
+
+void Browser::DrawPublishPanel() {
+    if (publish_panel_open_) {
+        // Fill in what can be guessed, once, so the common case is open-and-click. The dump
+        // folder is where the last dump went, and the game is the executable minus the bits
+        // Unreal adds to it.
+        if (publish_path_[0] == '\0') {
+            const auto guess = std::filesystem::path(dump_dir_) / "json";
+            std::error_code ec;
+            std::string newest;
+            std::filesystem::file_time_type when{};
+            for (const auto& entry : std::filesystem::directory_iterator(guess, ec)) {
+                if (entry.path().extension() != ".json") continue;
+                const auto stamp = entry.last_write_time(ec);
+                if (newest.empty() || stamp > when) { newest = entry.path().string(); when = stamp; }
+            }
+            std::snprintf(publish_path_, sizeof(publish_path_), "%s", newest.c_str());
+        }
+        if (publish_game_[0] == '\0' && !target_name_.empty()) {
+            std::string name = target_name_;
+            for (const char* suffix : {"-Win64-Shipping.exe", "-Win64-Test.exe",
+                                       "-WinGDK-Shipping.exe", "-Win32-Shipping.exe", ".exe"}) {
+                const std::size_t len = std::strlen(suffix);
+                if (name.size() >= len && name.compare(name.size() - len, len, suffix) == 0) {
+                    name.resize(name.size() - len);
+                    break;
+                }
+            }
+            std::snprintf(publish_game_, sizeof(publish_game_), "%s", name.c_str());
+        }
+        publish_key_missing_ = !zdex::LoadConfig().HasKey();
+
+        ImGui::OpenPopup("Publish to Zdex");
+        publish_panel_open_ = false;
+    }
+
+    const ImVec2 centre = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
+
+    if (!ImGui::BeginPopupModal("Publish to Zdex", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    ImGui::TextDisabled("Uploads a dump to zlogic.eu/zdex so it can be browsed and diffed.");
+    ImGui::Spacing();
+
+    // Without a key there is nothing to do but get one, so ask for it here rather than
+    // sending someone to a terminal to run 'zircon login'. Same file either way.
+    if (publish_key_missing_) {
+        ImGui::SeparatorText("API key");
+        ImGui::TextWrapped("No key stored yet. Create one at zlogic.eu/zdex/account#apikeys "
+                           "and paste it here; it is kept in %%APPDATA%%\\Zircon and nowhere "
+                           "else.");
+        ImGui::SetNextItemWidth(-90.0f);
+        ImGui::InputText("##key", publish_key_, sizeof(publish_key_),
+                         ImGuiInputTextFlags_Password);
+        ImGui::SameLine();
+        if (ImGui::Button("Save key", ImVec2(80.0f, 0.0f))) {
+            zdex::Config config = zdex::LoadConfig();
+            config.api_key = publish_key_;
+            std::string error;
+            if (zdex::SaveConfig(config, error)) {
+                publish_key_missing_ = false;
+                std::memset(publish_key_, 0, sizeof(publish_key_));
+            } else {
+                std::lock_guard lock(publish_mutex_);
+                publish_error_ = error;
+            }
+        }
+        ImGui::Spacing();
+    }
+
+    ImGui::BeginDisabled(publishing_ || publish_key_missing_);
+
+    ImGui::SeparatorText("Dump");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##path", publish_path_, sizeof(publish_path_));
+    ImGui::TextDisabled("The .json Zircon wrote. A .json.gz or .zip works too.");
+
+    ImGui::SeparatorText("How it gets listed");
+
+    // Labels above rather than beside. ImGui puts them after the widget, which at this width
+    // pushes the second one off the right edge.
+    const float column = ImGui::GetContentRegionAvail().x * 0.5f - 6.0f;
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted("Game");
+    ImGui::SetNextItemWidth(column);
+    ImGui::InputText("##game", publish_game_, sizeof(publish_game_));
+    ImGui::EndGroup();
+
+    ImGui::SameLine();
+
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted("Build");
+    ImGui::SetNextItemWidth(column);
+    ImGui::InputText("##label", publish_label_, sizeof(publish_label_));
+    ImGui::EndGroup();
+
+    ImGui::TextDisabled("Build is how two dumps of the same game tell each other apart, "
+                        "e.g. 1.4.2 (Steam).");
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##notes", publish_notes_, sizeof(publish_notes_));
+    ImGui::TextDisabled("Notes, optional.");
+
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    std::string status, error, url, note;
+    {
+        std::lock_guard lock(publish_mutex_);
+        status = publish_status_;
+        error  = publish_error_;
+        url    = publish_url_;
+        note   = publish_note_;
+    }
+
+    if (publishing_) {
+        ImGui::TextUnformatted(status.c_str());
+        if (!note.empty()) ImGui::TextDisabled("%s", note.c_str());
+        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) publish_cancel_ = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("Whatever has arrived stays; the next run carries on from there.");
+    } else {
+        const bool ready = publish_path_[0] != '\0' && publish_game_[0] != '\0' &&
+                           publish_label_[0] != '\0' && !publish_key_missing_;
+        ImGui::BeginDisabled(!ready);
+        if (ImGui::Button("Publish", ImVec2(120.0f, 0.0f))) StartPublish();
+        ImGui::EndDisabled();
+        if (!ready && !publish_key_missing_)
+            ImGui::SetItemTooltip("Needs a file, a game and a build label.");
+
+        ImGui::SameLine();
+        if (ImGui::Button("Close", ImVec2(120.0f, 0.0f))) {
+            JoinPublish();
+            ImGui::CloseCurrentPopup();
+        }
+
+        if (!url.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Open on Zdex", ImVec2(140.0f, 0.0f)))
+                ::ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+
+    if (!error.empty()) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.35f, 0.35f, 1.0f));
+        ImGui::TextWrapped("%s", error.c_str());
+        ImGui::PopStyleColor();
+    } else if (!url.empty() && !publishing_) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted(status.c_str());
+        MonoScope mono;
+        ImGui::TextUnformatted(url.c_str());
+    }
+
+    ImGui::EndPopup();
+}
+
+void Browser::JoinPublish() {
+    if (publish_thread_.joinable()) publish_thread_.join();
+}
+
+void Browser::StartPublish() {
+    if (publishing_) return;
+    JoinPublish();
+
+    {
+        std::lock_guard lock(publish_mutex_);
+        publish_status_ = "starting...";
+        publish_error_.clear();
+        publish_url_.clear();
+        publish_note_.clear();
+    }
+
+    zdex::UploadRequest request;
+    request.path  = publish_path_;
+    request.game  = publish_game_;
+    request.label = publish_label_;
+    request.notes = publish_notes_;
+    request.wait  = true;
+
+    publish_cancel_ = false;
+    publishing_ = true;
+
+    // Nothing here touches the target, so this can run alongside browsing; it only reads a
+    // file and talks to the network.
+    publish_thread_ = std::thread([this, request] {
+        const auto say = [this](std::string line, std::string detail) {
+            std::lock_guard lock(publish_mutex_);
+            publish_status_ = std::move(line);
+            publish_note_   = std::move(detail);
+        };
+
+        zdex::Config config = zdex::LoadConfig();
+        zdex::Client client(config, zdex::UserAgent(ZIRCON_VERSION));
+        client.on_retry = [&](const std::string& reason, int seconds) {
+            say("retrying", reason + "; in " + std::to_string(seconds) + "s");
+        };
+
+        zdex::UploadHooks hooks;
+        hooks.keep_going = [this] { return !publish_cancel_; };
+        hooks.progress = [&](zdex::UploadPhase phase, std::uint64_t done, std::uint64_t total,
+                             std::string_view detail) {
+            const auto percent = [&] { return total ? done * 100 / total : 0; };
+            switch (phase) {
+            case zdex::UploadPhase::Compressing:
+                say(std::format("compressing  {}%", percent()), {});
+                break;
+            case zdex::UploadPhase::Resuming:
+                say("resuming an earlier upload", {});
+                break;
+            case zdex::UploadPhase::Uploading:
+                say(std::format("uploading  {}%", percent()), std::string(detail));
+                break;
+            case zdex::UploadPhase::Finishing:
+                say("finishing", {});
+                break;
+            case zdex::UploadPhase::Indexing:
+                say(std::format("indexing  {}%", done), std::string(detail));
+                break;
+            }
+        };
+
+        const zdex::UploadReport report = zdex::Upload(client, request, hooks);
+
+        std::lock_guard lock(publish_mutex_);
+        publish_note_.clear();
+        if (!report.ok) {
+            publish_status_ = "failed";
+            publish_error_  = report.message.empty() ? report.error : report.message;
+            if (report.outcome == zdex::Outcome::Auth)
+                publish_error_ += "  (the stored key was refused)";
+        } else {
+            publish_url_ = report.url;
+            publish_status_ = report.duplicate
+                ? "already on Zdex - " + report.message
+                : (report.status.empty() ? "done" : "done, " + report.status);
+            if (report.status == "pending")
+                publish_status_ += " (waiting for review)";
+            if (report.status == "failed" && !report.status_error.empty())
+                publish_error_ = report.status_error;
+        }
+        publishing_ = false;
     });
 }
 
@@ -992,6 +1262,11 @@ void Browser::RebuildIndex() {
     entries_.clear();
     if (!attached_) return;
 
+    // Reindex means "what is in there now", so read the target, not what the cache
+    // remembers. Slot count is still from attach time though, so anything created since is
+    // missing -- separate hole, see the log.
+    memory_->Invalidate();
+
     const auto& array = reflection_.array;
     entries_.reserve(static_cast<std::size_t>(array.num_elements));
 
@@ -1045,6 +1320,11 @@ void Browser::RefreshRows(bool force) {
         if (last_refresh_ >= 0.0 && now - last_refresh_ < refresh_interval_) return;
     }
     last_refresh_ = now;
+
+    // This exists to show the value *now*. Without it the refresh slider just picks how
+    // often the cache gets re-read, and a value whose page nothing evicts sits there
+    // looking live and never moves.
+    memory_->Invalidate();
 
     const Entry& entry = entries_[selected_];
 

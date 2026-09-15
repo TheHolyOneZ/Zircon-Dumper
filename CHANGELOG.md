@@ -2,6 +2,127 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.4.0 — 2026-09-15
+
+### The GUI was showing you memory from whenever it first looked
+
+This one took a bug report to find, because nothing on the fixture side can catch it and
+the CLI is immune by accident.
+
+Every provider gets wrapped in `MakeCached` — a 64 MiB direct-mapped page cache, without
+which External mode is roughly two orders of magnitude too slow for a full walk. It has
+exactly one invalidation path: `Write` drops the pages it just changed. Nothing else, ever.
+No age, no generation, no way for a caller to ask for fresh bytes.
+
+That is correct for the CLI, which opens the process, derives, walks and exits inside a few
+seconds. The target barely moves in that window. The GUI builds its cache once at attach
+and keeps it until detach, which makes the same code mean something else entirely:
+
+- `RefreshRows` re-reads the selected object's properties on a timer, so the refresh slider
+  decided how often to re-read *the cache*. A value whose page nothing happened to evict
+  sat there looking live and never moved. The live object browser was not live.
+- A dump started later walked the object graph through pages put there by browsing. Mixing
+  bytes from two moments in a running target is not a small error: UE recycles objects
+  across a GC, so an `Outer` pointer cached before a level change resolves afterwards
+  against whatever took that memory.
+
+That last one is what got reported — Blueprint classes claiming a package that belongs to
+an unrelated asset. Reproduced it on Funnel Runners (UE 5.6) by doing what a person does:
+attach, browse a few hundred `BP_SqWaterTower_Destr` objects, load into a match, dump.
+
+```
+  BP_SqWaterTower_Destr_C   package: <0x30a05030605020c>
+  BP_MobileArea_M_C         package: /Game/AdvancedPhotoMode/Textures/Keyboard/T_Keyboard_R
+```
+
+14 `_C` classes with a package that isn't theirs, 8 of them not even a name. 31 properties
+with no name at all. 3 array dimensions in the hundreds of millions. Same build, same game,
+same clicks, with the fix: 0, 0, 0.
+
+`IMemorySource::Invalidate()` now exists — a no-op everywhere except the cache, which drops
+every tag. The GUI calls it before a dump, before a reindex, and on every value refresh.
+Dropping 64 MiB per refresh tick sounds expensive and isn't: a few hundred properties is a
+few hundred page reads, four times a second, which is what an uncached read would have cost
+all along.
+
+The ENGINEERING-LOG note about an enum default reading as `3` through the dump path and
+`ECC_Visibility` through the live path was the same thing, a year of confusion earlier.
+
+Still open, and separate: the GUI sizes its object table from `num_elements` as it was at
+attach. Objects created since then aren't in the table, so Reindex can't find them. Nothing
+reads wrong, there's just less of it.
+
+### `zircon publish` — dumps go to Zdex without leaving the terminal
+
+Zdex indexes Zircon dumps and makes them browsable, searchable and diffable. The whole path
+is four commands:
+
+```
+zircon login                     paste an API key; stored in %APPDATA%\Zircon\config.json
+zircon publish dump.json         gzip, chunk, upload, wait for indexing, print the URL
+zircon fetch 42 --usmap          pull a published dump's mappings or SDK back down
+zircon logout                    forget the key
+```
+
+`login` takes an API key, not an account. There is no browser flow and no OAuth; the key is
+the credential, it lives in one file, and `logout` deletes it. It never goes in a dump, a
+log line, or anything in the project.
+
+A dump is offered for publishing right after `zircon dump` writes it, as a line you can
+copy. Nothing uploads on its own.
+
+Underneath: a DEFLATE encoder (fixed Huffman, LZ77 with hash chains) written for this, since
+pulling in zlib for one job is not worth the dependency. Verified byte-identical against
+Python's zlib across 15 shaped cases plus a real 59 MB dump — 17.3x at 133 MB/s. Files
+under 64 KB skip compression, because a 971-byte dump compresses to 92 bytes and the server
+rejects anything that small before it can tell you *why* it's rejecting it.
+
+Chunked and resumable, so a dropped connection resumes instead of restarting. HTTPS through
+WinHTTP with a real User-Agent, because Cloudflare answers generic ones with a plain-text
+`error code: 1010` that is not JSON and does not explain itself.
+
+Rate limits are reported, not waited out. The upload quota returns `Retry-After` in the
+region of most of an hour, and a CLI that blocks silently for 54 minutes looks like it has
+hung. Anything over two minutes prints the server's own message and exits.
+
+### The GUI publishes too
+
+A **Publish...** button next to Dump..., because telling someone who is already looking at
+the dump they just made to go and open a terminal is silly. It guesses the file from the
+last dump folder and the game from the attached process, asks for a build label, shows the
+same phases the CLI prints, and ends with the URL and an Open on Zdex button. If no key is
+stored it takes one there rather than sending you to `zircon login` -- same file either way.
+
+The flow underneath moved into the zdex library as `zdex::Upload()`: compress, init or
+resume, send the chunks, finish, poll. Both the CLI and the GUI call it and supply their own
+hooks for showing progress. Writing the orchestration out a second time in the GUI was the
+obvious shortcut, and this project already has a scar from exactly that -- the
+`ClassifyObject` bug in 0.3.0 was the same mistake made twice, one file apart, and only one
+copy got fixed the first time.
+
+### Resume never resumed
+
+Uploads are resumable, and the resume had never once fired. The record that says "this file
+has a half-finished upload" was keyed on a fingerprint of the file *being sent* — which, for
+anything large enough to compress, is a temporary `.gz` written fresh on every run. New file,
+new timestamp, new fingerprint, no match, start over.
+
+Nothing failed, which is why it sat there: an interrupted publish re-ran and worked, just
+from the beginning and against a second upload session.
+
+Keyed on the dump the user actually named now. That's the right question anyway — the
+encoder writes `mtime 0` into the gzip header specifically so the same dump always
+compresses to the same bytes, so the source identifies the payload. Resuming also checks the
+stored payload length before continuing, rather than splicing chunks from two different
+compressions together if that ever stops being true.
+
+### Smaller
+
+- `ParseJson` accepted `error code: 1010` as the number 0, because the number scanner took
+  a leading `e`. It wants a digit after the optional sign now. Cloudflare's plain-text 403
+  was parsing as valid JSON and the error came out empty.
+- `zircon --help` covers `login`, `logout`, `publish` and `fetch`.
+
 ## 0.3.0 — 2026-09-14
 
 ### Two engine bugs the new linter found on a real game

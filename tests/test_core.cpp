@@ -74,6 +74,13 @@ public:
     Capabilities Caps() const override { return Capabilities{true, false, false, true}; }
     std::string Describe() const override { return "fake"; }
 
+    // Changes the bytes behind the source's back, the way a running target does. Not a
+    // Write - that one tells the cache to drop the page, which is the case we already
+    // handle.
+    void Poke(std::uint64_t offset, std::uint8_t value) {
+        if (offset < bytes_.size()) bytes_[offset] = value;
+    }
+
     int read_calls = 0;
 
 private:
@@ -254,6 +261,50 @@ void TestCache() {
     std::uint8_t tail[16] = {};
     const std::size_t got = cached->Read(base + bytes.size() - 4, tail, sizeof(tail));
     CHECK(got == 4);
+}
+
+// What went wrong in the GUI: it attaches once and keeps the same source for the whole
+// session, so every value it ever showed was the value at the moment that page was first
+// touched. In a dump started later that also means outer pointers from before a GC being
+// resolved against memory something else now owns.
+void TestCacheInvalidate() {
+    std::vector<std::uint8_t> bytes(64 * 1024, 0);
+    bytes[8] = 0x11;
+
+    const auto base = static_cast<Address>(0x140000000ull);
+    auto inner = std::make_unique<FakeMemory>(base, bytes);
+    FakeMemory* raw = inner.get();
+
+    auto cached = MakeCached(std::move(inner), 1 << 20);
+
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 8) == 0x11);
+
+    // The target moves on. Nothing tells the cache, because nothing can.
+    raw->Poke(8, 0x22);
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 8) == 0x11);
+
+    cached->Invalidate();
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 8) == 0x22);
+
+    // And it is a drop, not a one-shot bypass: the page is cached again afterwards.
+    const int after = raw->read_calls;
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 8) == 0x22);
+    CHECK(raw->read_calls == after);
+
+    // Invalidating clears every slot, not just the last one touched. Page 2 has to be in
+    // the cache before it can go stale, so read it first.
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 9000) == 0x00);
+    raw->Poke(8, 0x33);
+    raw->Poke(9000, 0x44);
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 9000) == 0x00);   // still the stale one
+    cached->Invalidate();
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 8) == 0x33);
+    CHECK(ReadOr<std::uint8_t>(*cached, base + 9000) == 0x44);
+
+    // A source with nothing to cache must still accept the call.
+    FakeMemory plain(base, bytes);
+    plain.Invalidate();
+    CHECK(ReadOr<std::uint8_t>(plain, base + 8) == 0x11);
 }
 
 void TestPeImage() {
@@ -1136,6 +1187,7 @@ int main() {
     TestRipRelative();
     TestReadHelpers();
     TestCache();
+    TestCacheInvalidate();
     TestPeImage();
     TestStaticSourceRejectsLiveObjects();
     TestUnrealDetection();

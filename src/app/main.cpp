@@ -22,6 +22,7 @@
 #include "diff/Diff.h"
 #include "emit/Emitter.h"
 #include "ir/Json.h"
+#include "Publish.h"
 #include "ir/Lint.h"
 
 #include <algorithm>
@@ -159,6 +160,12 @@ void PrintUsage() {
     std::printf("  %sbrowse%s        Interactive object browser (zircon-gui.exe)\n", c.data(), r.data());
     std::printf("  %sinject%s        Load the payload DLL into a running game\n\n", c.data(), r.data());
 
+    std::printf("%sShare it%s (Zdex, at zlogic.eu/zdex)\n", b.data(), r.data());
+    std::printf("  %spublish%s       Upload a dump and print where it landed\n", c.data(), r.data());
+    std::printf("  %sfetch%s         Download a published dump, its mappings or its SDK\n", c.data(), r.data());
+    std::printf("  %slogin%s         Store an API key so publishing works\n", c.data(), r.data());
+    std::printf("  %slogout%s        Forget the stored key\n\n", c.data(), r.data());
+
     std::printf("%sSetup%s\n", b.data(), r.data());
     std::printf("  %sinstall%s       Add this folder to your PATH (per-user, no elevation)\n", c.data(), r.data());
     std::printf("  %suninstall%s     Take it off again\n\n", c.data(), r.data());
@@ -189,6 +196,15 @@ void PrintUsage() {
                 "      --set <N=V>    write: the property and value, e.g. MaxWalkSpeed=1337\n"
                 "      --where <cond> find: Name<op>Value, ops = != < > <= >=\n"
                 "      --breaking     diff: only changes that break existing code\n"
+                "      --publish      dump: publish it to Zdex once it is written\n"
+                "      --game <name>  publish: which game this is (guessed from the process)\n"
+                "      --label <s>    publish: which build, e.g. \"1.4.2 (Steam)\"\n"
+                "      --notes <s>    publish: a line of context for whoever reads it\n"
+                "      --no-wait      publish: return once uploaded, without waiting on indexing\n"
+                "      --usmap        fetch: mappings instead of the dump (--sdk for the SDK zip)\n"
+                "      --json         publish: machine-readable result on stdout\n"
+                "      --open         publish: open the result in a browser when it is ready\n"
+                "  -y, --yes          publish: skip the confirmation\n"
                 "  -v, --verbose      Debug logging (repeat for trace)\n"
                 "      --color/--no-color  Force colour on or off (also honours NO_COLOR)\n"
                 "  -h, --help         Show this help\n"
@@ -204,7 +220,21 @@ void PrintUsage() {
     std::printf("  %szircon validate game.json --strict%s\n", d.data(), r.data());
     std::printf("  %szircon xref game.json -f CharacterMovementComponent%s\n", d.data(), r.data());
     std::printf("  %szircon browse --pid 1234%s\n", d.data(), r.data());
+    std::printf("  %szircon publish game.json --label \"1.4.2 (Steam)\"%s\n", d.data(), r.data());
 }
+
+// What `dump --publish` carries through to the publish step. A struct because
+// CommandDump already takes eight parameters and none of these are its business
+// beyond handing them on.
+struct PublishAfterDump {
+    bool requested{false};
+    std::string game;
+    std::string label;
+    std::string notes;
+    bool wait{true};
+    bool assume_yes{false};
+    bool open_browser{false};
+};
 
 // Bare argument, not a flag. Own function because arg[0] on an empty string_view is UB,
 // and you get an empty argv entry any time a shell expands a variable to nothing.
@@ -1367,7 +1397,7 @@ int CommandXref(std::string_view dump_path, std::string_view query, bool uses, i
 int CommandDump(const TargetSpec& spec, std::string_view out_path,
                 std::string_view filter, bool with_names, bool with_script,
                 bool with_defaults, std::string_view emit_formats,
-                bool allow_partial) {
+                bool allow_partial, const PublishAfterDump& publish) {
     // resolve the formats before the walk. seventy thousand objects take a few seconds and
     // finding out afterwards that a name was mistyped is a bad trade.
     std::vector<const zircon::emit::Emitter*> emitters;
@@ -1412,7 +1442,36 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
     Field("functions",  "{}", dump.TotalFunctions());
     if (!dump.names.empty()) Field("names", "{}", dump.names.size());
 
-    if (emitters.empty()) return 0;
+    // Whether or not they publish now, the next step belongs in front of them while
+    // they are still looking at the file they just made.
+    const auto suggest_publish = [&]() -> int {
+        const std::string game = publish.game.empty()
+            ? zircon::app::GameNameFromProcess(dump.header.source.process)
+            : publish.game;
+        const std::string label = publish.label.empty()
+            ? zircon::app::LabelFromTimestamp(dump.header.created_utc)
+            : publish.label;
+
+        if (!publish.requested) {
+            zircon::app::PrintPublishHint(path, game, label);
+            return 0;
+        }
+
+        zircon::app::PublishOptions options;
+        options.path         = path;
+        options.game         = game;
+        options.label        = label;
+        options.notes        = publish.notes;
+        options.wait         = publish.wait;
+        options.assume_yes   = publish.assume_yes;
+        options.open_browser = publish.open_browser;
+
+        std::printf("\n");
+        Heading("publish");
+        return zircon::app::CommandPublish(options);
+    };
+
+    if (emitters.empty()) return suggest_publish();
 
     // next to the dump, not in the cwd. `-o out/game.json --emit cpp_sdk` meaning "json over
     // there, headers over here" would surprise everyone.
@@ -1431,7 +1490,9 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
         const int code = RunEmitter(*emitter, dump, emit_options, split);
         if (code != 0) worst = code;
     }
-    return worst;
+
+    const int published = suggest_publish();
+    return worst != 0 ? worst : published;
 }
 
 // Reads the live values of one object's properties. The dump says where a member is;
@@ -2101,6 +2162,17 @@ int main(int argc, char** argv) {
     bool        allow_partial = false;
     bool        strict = false;
     bool        uses = false;
+    bool        publish_after = false;
+    bool        no_wait = false;
+    bool        json_output = false;
+    bool        assume_yes = false;
+    bool        open_browser = false;
+    std::string zdex_key;
+    std::string zdex_game;
+    std::string zdex_label;
+    std::string zdex_notes;
+    std::string fetch_kind;
+    std::string publish_path;
     bool        with_names = false;
     bool        with_script = false;
     bool        with_defaults = false;
@@ -2201,9 +2273,40 @@ int main(int argc, char** argv) {
             strict = true;
         } else if (arg == "--uses") {
             uses = true;
+        } else if (arg == "--publish") {
+            publish_after = true;
+        } else if (arg == "--no-wait") {
+            no_wait = true;
+        } else if (arg == "--json") {
+            json_output = true;
+        } else if (arg == "-y" || arg == "--yes") {
+            assume_yes = true;
+        } else if (arg == "--open") {
+            open_browser = true;
+        } else if (arg == "--usmap" || arg == "--sdk") {
+            fetch_kind = arg.substr(2);
+        } else if (arg == "--key") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            zdex_key = *value;
+        } else if (arg == "--game") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            zdex_game = *value;
+        } else if (arg == "--label") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            zdex_label = *value;
+        } else if (arg == "--notes") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            zdex_notes = *value;
         } else if ((command == "validate" || command == "xref") &&
                    validate_path.empty() && IsPositional(arg)) {
             validate_path = arg;
+        } else if ((command == "publish" || command == "fetch" || command == "login") &&
+                   publish_path.empty() && IsPositional(arg)) {
+            publish_path = arg;
         } else if (arg == "--style") {
             const auto value = next(arg);
             if (!value) return 1;
@@ -2255,11 +2358,40 @@ int main(int argc, char** argv) {
     if (command == "read")        return CommandRead(spec, name_filter, limit);
     if (command == "write")       return CommandWrite(spec, name_filter, assignment);
     if (command == "find")        return CommandFind(spec, name_filter, predicate, limit);
-    if (command == "dump")        return CommandDump(spec, out_path, name_filter, with_names,
-                                                     with_script, with_defaults, emit_format,
-                                                     allow_partial);
+    if (command == "dump") {
+        PublishAfterDump publish;
+        publish.requested    = publish_after;
+        publish.game         = zdex_game;
+        publish.label        = zdex_label;
+        publish.notes        = zdex_notes;
+        publish.wait         = !no_wait;
+        publish.assume_yes   = assume_yes;
+        publish.open_browser = open_browser;
+        return CommandDump(spec, out_path, name_filter, with_names,
+                           with_script, with_defaults, emit_format,
+                           allow_partial, publish);
+    }
     if (command == "validate")    return CommandValidate(validate_path, strict, limit);
     if (command == "xref")        return CommandXref(validate_path, name_filter, uses, limit);
+    if (command == "login")       return zircon::app::CommandLogin(
+                                             zdex_key.empty() ? publish_path : zdex_key);
+    if (command == "logout")      return zircon::app::CommandLogout();
+    if (command == "fetch")       return zircon::app::CommandFetch(
+                                             std::strtoll(publish_path.c_str(), nullptr, 10),
+                                             fetch_kind.empty() ? "json" : fetch_kind,
+                                             out_path);
+    if (command == "publish") {
+        zircon::app::PublishOptions publish;
+        publish.path         = publish_path;
+        publish.game         = zdex_game;
+        publish.label        = zdex_label;
+        publish.notes        = zdex_notes;
+        publish.wait         = !no_wait;
+        publish.json_output  = json_output;
+        publish.assume_yes   = assume_yes;
+        publish.open_browser = open_browser;
+        return zircon::app::CommandPublish(publish);
+    }
     if (command == "emit")        return CommandEmit(emit_format, validate_path, out_path,
                                                      name_filter, allow_partial);
     if (command == "diff")        return CommandDiff(diff_before, diff_after, out_path,

@@ -18,6 +18,11 @@ constexpr std::size_t kPageSize  = 1u << kPageShift;   // 4 KiB
 // Direct-mapped rather than LRU on purpose. The access pattern is dominated by repeated
 // reads of a few structures — UObject headers, the FName pool — so true LRU bookkeeping
 // buys almost nothing and charges for it on every hit.
+//
+// Nothing ages out either. A page sits in its slot until something else wants it, which is
+// fine for a one-shot walk and wrong for anything longer: the target keeps running, GC
+// recycles objects, and a slot nothing conflicts with keeps serving bytes from whenever it
+// was first read. Anything long-lived calls Invalidate().
 class CachedMemorySource final : public IMemorySource {
 public:
     CachedMemorySource(std::unique_ptr<IMemorySource> inner, std::size_t cache_bytes)
@@ -64,6 +69,11 @@ public:
     }
 
     bool EnableWrites(bool enable) override { return inner_->EnableWrites(enable); }
+
+    void Invalidate() override {
+        std::fill(tags_.begin(), tags_.end(), kInvalidTag);
+        inner_->Invalidate();
+    }
 
     bool Write(Address addr, const void* in, std::size_t size) override {
         const bool ok = inner_->Write(addr, in, size);

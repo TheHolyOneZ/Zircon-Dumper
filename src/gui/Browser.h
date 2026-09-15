@@ -60,10 +60,16 @@ private:
     void DrawInspector();
     void DrawScriptPanel();
     void DrawDumpPanel();
+    void DrawPublishPanel();
 
     // Worker thread. While it runs the UI does not touch the target at all; see dumping_.
     void StartDump();
     void JoinDump();
+
+    // Publishing touches the network and a file on disk, never the target, so it gets its
+    // own thread and its own flag rather than borrowing dumping_.
+    void StartPublish();
+    void JoinPublish();
 
     void Attach(std::uint32_t pid);
     void Detach();
@@ -190,6 +196,24 @@ private:
     // One flag per registered emitter in the order Emitters() reports them, so a new format
     // shows up here without this file knowing its name.
     std::vector<char> dump_formats_;
+
+    // --- publishing ---
+    std::thread       publish_thread_;
+    std::atomic<bool> publishing_{false};
+    std::atomic<bool> publish_cancel_{false};
+    std::mutex        publish_mutex_;       // guards the four fields below
+    std::string       publish_status_;
+    std::string       publish_error_;
+    std::string       publish_url_;
+    std::string       publish_note_;
+
+    bool publish_panel_open_{false};
+    char publish_path_[512]{};
+    char publish_game_[128]{};
+    char publish_label_[128]{};
+    char publish_notes_[256]{};
+    char publish_key_[64]{};       // only used when nothing is stored yet
+    bool publish_key_missing_{false};
 
     bool exit_requested_{false};
 };
