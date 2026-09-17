@@ -2,6 +2,106 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.5.0 — 2026-09-16
+
+### A game that would not dump, and a worse one that did
+
+Atomic Heart (UE 4.27, Steam) attached cleanly, found 95,130 objects, derived the name pool
+and the whole UObject layout, and then stopped:
+
+```
+UStruct layout: super +0x48, children +0x50, childprops +0x58, size +-0x1, align +-0x1
+[error] reflection is incomplete; cannot produce a dump
+```
+
+The first theory was that the dump had been taken while shaders were still compiling. Worth
+checking, and the screenshot said 86%, so the first run proved nothing. Waiting it out
+changed nothing: same failure, same offsets, main menu, 111 FPS.
+
+**PropertiesSize is anchored on one exact number.** A candidate offset is kept only if
+`/Script/CoreUObject.Object` reports a size of `outer_offset + 8` there — i.e. if
+OuterPrivate is the last member of UObject. That is true of stock UE and it is the whole
+reason the field can be found at all without a version table. Atomic Heart appends to
+UObject, so the real figure is 48 where the anchor wanted 40, nothing matched, and the
+derivation failed closed.
+
+Failing closed was right. Refusing to emit beats picking a plausible-but-wrong field, and
+this is the fourth time that policy has paid for itself. The gap was that a correct answer
+was reachable.
+
+Reading the object out of the target settles what the shape actually is:
+
+```
+0x30  sizeof(UObject) = 48                       8 more than its members account for
+0x30  UField::Next
+0x38  FStructBaseChain::StructBaseChainArray     a UE5 structure, in a 4.27 build
+0x40  FStructBaseChain::NumStructBasesInChainMinusOne
+0x48  SuperStruct   0x50 Children   0x58 ChildProperties
+0x60  PropertiesSize = 48   0x64 MinAlignment = 8
+```
+
+The chain depth at `+0x40` reads 0 for `Object`, 1 for `Actor`, 2 for `Struct`, 3 for
+`Class`, which is `NumStructBasesInChainMinusOne` and nothing else.
+
+Neither neighbour rescues the anchor, incidentally. Working back from SuperStruct assumes
+`Next` is right before it, and the base chain sits in between, so that overshoots by 16.
+
+The exact figure is tried first, so every target that already worked takes the identical
+path. Only when it finds nothing does the fallback run, anchored on things that do not care
+where UObject ends: the size is at least what the members account for, it is 8-aligned, no
+class is smaller than the root, and the next dword reads as a real alignment. A build that
+turns out to extend UObject says so in the log and in the dump header rather than passing
+quietly.
+
+### The same assumption, one file over, quietly truncating every dump
+
+With PropertiesSize fixed Atomic Heart dumped: 4,763 classes and **1,640 functions**. For a
+game that size that is far too few, and it lints clean, because nothing in the linter knows
+how many functions a game ought to have.
+
+`UField::Next` is found by walking `UStruct::Children` and keeping the offset whose chains
+"stay in the object array and terminate". A field that reads null everywhere terminates
+every chain immediately and satisfies that perfectly — and the scan took the first offset
+that passed, starting from the same stock `sizeof(UObject)` that had just been proved wrong
+for this build. It settled on a field that links nothing, every Children list came out one
+entry long, and no warning was printed.
+
+Chains have to actually link now, and the offset that links the most wins. There is a proper
+anchor available too: UField is a UObject plus one pointer, so Next sits exactly at
+`sizeof(UObject)` — which by then has been read out of the engine rather than assumed. Same
+game, same process: **1,640 -> 13,368 functions.**
+
+This is the more serious of the two. The first bug refused to produce anything; this one
+produced something wrong and called it clean.
+
+### Nothing else moved
+
+Both changes are in the derivation every target depends on, so "it works on the new game" is
+not evidence. Six games were dumped twice on the same running process, once with 0.4.0 and
+once with this build, and diffed:
+
+| target | engine | types | |
+|---|---|---|---|
+| HRDINA | 4.22 | 3,172 | byte-identical |
+| Nightmare Kart | 4.25 | 3,745 | byte-identical |
+| Peepo Island | 5.0 | 6,059 | byte-identical |
+| Mizeria | 5.2 | 6,370 | byte-identical |
+| Ready or Not | 5.3 | 10,731 | byte-identical |
+| Backrooms: Escape Together | 5.7 | 13,599 | byte-identical |
+
+43,676 types across both property models and both name pools, `no differences` on every one.
+Atomic Heart goes from exit 4 to 392 packages, 4,763 classes, 33,300 properties, 13,368
+functions, and `validate --strict` clean.
+
+### Smaller
+
+- An unresolved offset used to print as `+-0x1`, which reads like a real offset and sent at
+  least one person looking in the wrong place. It says `unresolved` now.
+- The end-to-end check on `/Script/CoreUObject.Object` treated `outer_offset + 8` as the
+  size rather than the floor, so it would have failed a fork even once the derivation
+  handled one. It compares against the derived size now, and a fork earns slightly less
+  confidence than a stock build rather than being called broken.
+
 ## 0.4.0 — 2026-09-15
 
 ### The GUI was showing you memory from whenever it first looked

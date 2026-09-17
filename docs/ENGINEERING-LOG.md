@@ -127,8 +127,10 @@ The rule the phase settled on: **a derivation needs a positive distinguishing pr
 plus an independent anchor with a known-correct value.** Internal consistency alone was
 wrong every single time it was the only test. In practice that means:
 
-- `PropertiesSize` is anchored on `/Script/CoreUObject.Object` reporting exactly the
-  UObject size that the separately derived object layout implies.
+- `PropertiesSize` is anchored on `/Script/CoreUObject.Object` reporting the size of a
+  UObject, cross-checked against no class being smaller than the root. It used to demand
+  *exactly* the size the object layout implies, which 0.5.0 had to relax: a fork is free to
+  append to UObject, and then that figure is wrong while the field is fine.
 - `Offset_Internal` must make a struct's own properties *tile* it, not merely fit in it.
 - Subclass slots are cross-checked three ways at once: `ObjectProperty` must target a
   `Class`, `StructProperty` a `ScriptStruct`, `ArrayProperty` an `FField` — three
@@ -851,3 +853,214 @@ hand-written `class UClass*` in `Basic.hpp`; `/W3` is clean again.
 Worth keeping because of what it says about the test: a claim is only maintained if
 something re-checks the whole of it, and a compile test that greps for `error` will watch
 a warning count go from 0 to 27,334 without comment.
+
+## 0.4.0 — a cache with no way to say "that's old now"
+
+### The bug the fixtures could never have caught
+
+Reported from outside: a 0.3.0 GUI dump of Funnel Runners where 36 of 12,856 types came out
+with a package belonging to an unrelated asset —
+`BP_SqWaterTower_Destr_C` in
+`/Game/RuralGasStation/Textures/T_CoffeeMachine_OcclusionRoughnessMetallic`. A Blueprint
+class cannot live inside a texture, so the outer pointer was wrong, not the name lookup.
+
+The CLI didn't reproduce it. Neither did `--names`, which the report mentioned and which was
+the obvious variable to isolate first. 12,876 types, 0 mismatches. Ran the GUI with the same
+boxes ticked and got 0 as well.
+
+What made it appear was doing what a person does with a live browser: attach, look at things
+for a while, keep the window open, dump later. Specifically — attach, filter to
+`BP_SqWaterTower_Destr` and click through sixteen of them, load into a match, then dump.
+
+```
+_C classes with a foreign package       14   (8 of them not even a valid name)
+properties with no name                 31
+array_dim in the hundreds of millions    3
+```
+
+Same build, same game, same clicks, with the fix: 0, 0, 0.
+
+### What it actually was
+
+`CachedMemorySource` — 64 MiB, direct-mapped, 4 KiB pages. Written for one reason: External
+mode issues millions of small reads and every one is a syscall, which puts an uncached full
+walk about two orders of magnitude behind Internal.
+
+Its entire invalidation story:
+
+```cpp
+bool Write(Address addr, const void* in, std::size_t size) override {
+    const bool ok = inner_->Write(addr, in, size);
+    if (ok) InvalidateRange(addr, size);   // and that is all of it
+    return ok;
+}
+```
+
+A page enters a slot and stays until something else hashes to that slot. There is no age, no
+generation counter, and `IMemorySource` had no method a caller could use to ask for fresh
+bytes even if it wanted to.
+
+For the CLI that is not a bug, it's the right design. Open, derive, walk, exit — a few
+seconds, during which the target barely moves.
+
+The GUI builds one cache at attach and holds it until detach, which turns the same code into
+two different defects:
+
+**The live object browser was not live.** `RefreshRows` re-reads the selected object's
+properties on a timer, so the refresh slider was choosing how often to re-read *the cache*.
+Values did sometimes move, which is why nobody caught it — direct-mapped means a page gets
+evicted whenever something conflicts for its slot, so the display was a mix of live values
+and values frozen at whenever that page was first touched. Intermittently-correct is worse
+than broken; broken gets reported.
+
+**A dump taken later walked the graph through pages put there by browsing.** UE recycles
+objects across a GC. An `Outer` pointer cached before a level change resolves, after it,
+against whatever now owns that memory — which is exactly how a Blueprint class ends up
+claiming a texture. 14 of 12,847 is 0.1%, which is small enough to look like noise and large
+enough to be wrong.
+
+### The one already in this file
+
+The `--defaults` entry above records an enum default reading as `3` through the dump path and
+`ECC_Visibility` through the live path, attributed to `Reflection::Context()` not wiring up
+`enum_layout`. That wiring was genuinely missing and fixing it was correct. But two entry
+points disagreeing about the same property, one of them long-lived and one of them not, is
+this bug's signature, and it was sitting in the log unrecognised.
+
+### The fix, and why it is not expensive
+
+`IMemorySource::Invalidate()` — virtual, default no-op, so every provider except the cache
+ignores it. The cache fills its tag array with the invalid tag and forwards down the chain.
+
+The GUI calls it before a dump, before a reindex, and on every value refresh. Dropping 64 MiB
+of cache four times a second reads worse than it runs: a selected object is a few hundred
+properties, so a refresh is a few hundred page reads — which is what the uncached read would
+have cost, and what the browser was supposed to be paying all along. The refresh slider
+bounds it.
+
+`test_core.cpp` pins the behaviour with a fake source that changes its bytes behind the
+cache's back, the way a running target does. Removing the fix fails four checks.
+
+### What is still wrong
+
+The GUI takes `num_elements` from `Reflect()` at attach and never re-reads it, so its object
+table is sized to the world as it was then. Objects created since are not in it, and Reindex
+can't find them — it re-reads every slot it knows about, but it doesn't know about new ones.
+Nothing reads *wrong*, there is just less of it than there should be. Re-reading the count
+means storing where in `FUObjectArray` it was found, which `ObjectArrayInfo` currently
+doesn't carry.
+
+### The general point
+
+Every correctness argument this project makes — L5 cross-provider agreement, L6
+self-consistency — compares *outputs*. All three providers sit behind the same cache with
+the same policy, so a defect in the caching layer is reproduced faithfully by all of them and
+agreement stays perfect while the answer is wrong. Same shape as the enum-width bug in 0.3.0,
+one layer lower.
+
+And the condition needed a person: attach, browse, wait, change level, dump. No fixture has a
+clock, and nothing in CI keeps a memory source alive long enough for the target to move
+underneath it.
+
+## 0.5.0 — the first target that defeated the derivation
+
+### Two bugs, one assumption
+
+Atomic Heart is a UE 4.27 build that appends to `UObject`. Every anchor in this project that
+said "OuterPrivate is the last member of UObject" was wrong on it, and that phrasing appears
+in two files.
+
+**`StructLayout.cpp` refused to derive.** `PropertiesSize` is kept only if
+`/Script/CoreUObject.Object` reports exactly `outer_offset + 8` there. Real figure 48,
+expected 40, no candidate survived, `properties_size` stayed `-1`, and `MinAlignment` was
+never attempted because it is derived inside the success branch. Two `-1`s, one cause.
+
+**`FunctionLayout.cpp` derived the wrong thing and said nothing.** `UField::Next` is found by
+walking `Children` and keeping the offset whose chains "stay in the object array and
+terminate". A field that reads null everywhere terminates every chain immediately and scores
+a perfect hundred percent. The scan started at the same stock `sizeof(UObject)` and took the
+*first* offset that passed, so it settled on a field that links nothing. Every Children list
+came out one entry long: 4,763 classes, 1,640 functions, `validate --strict` clean.
+
+The second is the one worth sitting with. The first failed loudly and cost a dump. The second
+produced a dump that lints clean, round-trips, diffs, and is missing 85% of its functions.
+
+### What the build actually looks like
+
+```
+0x30  sizeof(UObject) = 48                       8 past where the members end
+0x30  UField::Next
+0x38  FStructBaseChain::StructBaseChainArray     UE5, in a 4.27 build
+0x40  FStructBaseChain::NumStructBasesInChainMinusOne
+0x48  SuperStruct   0x50 Children   0x58 ChildProperties
+0x60  PropertiesSize = 48   0x64 MinAlignment = 8
+```
+
+Read out of the process rather than inferred. The depth counter at `+0x40` is 0 for `Object`,
+1 for `Actor`, 2 for `Struct`, 3 for `Class` — `NumStructBasesInChainMinusOne` and nothing
+else could produce that sequence.
+
+### Why the obvious fix was wrong
+
+The issue report proposed anchoring on `super_struct - 8`, reasoning that `UField` is
+`UObject` plus one pointer so `offsetof(Next) == sizeof(UObject)`. The reasoning is sound;
+the arithmetic assumes `SuperStruct` sits immediately after `Next`, and on this build the
+base chain sits in between. `0x48 - 8` is 64; the answer is 48. It would have missed and
+failed closed in exactly the same way.
+
+That is worth recording because the proposal looked obviously correct, was written by
+someone with the offsets in front of them, and was still wrong. The number was inferred from
+deltas rather than read, and the delta had two causes that were assumed to be one.
+
+### The rule that replaced it
+
+Exact figure first, so every target that already worked takes the identical path and cannot
+drift. Only on no match does the fallback run, anchored on properties that do not reference
+UObject's tail at all:
+
+- at least `outer_offset + 8`, because those members demonstrably exist
+- 8-aligned, because UObject holds pointers
+- no class smaller than the root, because everything derives from UObject
+- an alignment in the following dword
+
+Four constraints, none of which care what a fork appended. `UField::Next` then anchors on the
+measured `sizeof(UObject)` — the report's reasoning, applied in the direction where it holds,
+with the number read instead of inferred — and its chains must *link*, not merely terminate.
+
+### Proving nothing else moved
+
+A change to `DeriveStructLayout` touches every target, so "the new game works" is not
+evidence. Six games were dumped twice against the same live process, once with 0.4.0 and once
+with this build:
+
+```
+HRDINA                      4.22    3,172 types    no differences
+Nightmare Kart              4.25    3,745 types    no differences
+Peepo Island                5.0     6,059 types    no differences
+Mizeria                     5.2     6,370 types    no differences
+Ready or Not                5.3    10,731 types    no differences
+Backrooms: Escape Together  5.7    13,599 types    no differences
+```
+
+43,676 types, both property models, both name pools, 100% byte-identical on every one.
+
+### The shape of the mistake
+
+Both bugs are the same shape as the ones already in this file: **a test that a wrong answer
+passes trivially.** The `ClassifyObject` bug compared a class name that Blueprint types never
+match. The CDO decoy passes a self-consistency check perfectly. Here, a field full of zeroes
+satisfies "chains terminate" better than the real field does, because it terminates sooner.
+
+The pattern is that a constraint phrased as an absence — does not loop, does not leave the
+array, does not disagree — is satisfied best by a field containing nothing. Every such check
+needs a paired constraint phrased as a presence. "Terminates" needed "and links". "Reports a
+plausible size" needed "and nothing is smaller than the root".
+
+### What the shader theory was worth
+
+The first hypothesis was that the dump had been taken while shaders compiled. It was worth
+checking and the first run could not rule it out, because shaders were genuinely at 86% at
+the time. Waiting for 100% changed nothing: identical failure, identical offsets.
+
+The useful part is that the screenshot caught it. A run that *looks* controlled and is not is
+how a wrong conclusion gets published, and nothing in the log would have said so.

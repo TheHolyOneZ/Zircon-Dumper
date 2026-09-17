@@ -895,11 +895,31 @@ Examples of the actual reasoning used:
 | the object array | the object in slot *i* stores *i* in its own `InternalIndex` |
 | `ClassPrivate` vs `OuterPrivate` | follow each repeatedly: class converges to a fixed point (the class of `UClass` is `UClass`), outer terminates at null |
 | the name pool | block 0 begins with `"None"`, always the first name interned |
-| `PropertiesSize` | `/Script/CoreUObject.Object` must report exactly the `UObject` size that the separately derived object layout implies |
+| `PropertiesSize` | `/Script/CoreUObject.Object` reports the size of a `UObject`, and no class is smaller than the root |
+| `UField::Next` | it lands on `sizeof(UObject)`, and its chains have to *link*, not merely terminate |
 | `Offset_Internal` | a struct's own properties must *tile* it, at distinct offsets, ending inside it |
 | `UFunction::Func` | it is the code pointer that points somewhere **different** per function |
 | the class default object | it points at an object whose class is *this* class, named `Default__*` |
 | what an object *is* | walk its meta-class chain, not its class name |
+
+### When a fork changes the engine itself
+
+Most licensee forks rename things. Some change the layout. A few change `UObject`.
+
+Atomic Heart is a UE 4.27 build that appends to `UObject` *and* carries UE5's
+`FStructBaseChain` inside `UStruct`, so `sizeof(UObject)` is 48 where the member offsets
+alone imply 40. Anything anchored on "OuterPrivate is the last member" is wrong on that
+build — which, until 0.5.0, meant it refused to dump at all.
+
+The rule that replaced it does not ask where `UObject` ends. It asks for things that are
+true whatever a fork did: the size is at least what the members account for, it is
+8-aligned, nothing that derives from `UObject` is smaller than it, and an alignment follows
+it. A build that turns out to extend `UObject` is reported rather than smoothed over:
+
+```
+[info ] this build extends UObject: sizeof(UObject) is 48 bytes, 8 more than the members
+        alone account for
+```
 
 Every derivation reports a confidence value and the evidence behind it, and every
 conclusion lands in the dump header. Since 0.3.0 `zircon validate --strict` reads the
@@ -913,7 +933,7 @@ found: the evidence being recorded does not on its own mean the pieces fit toget
 > with a known-correct value.* Internal consistency alone was wrong every single time it
 > was the only test.
 
-That was learned six times, each time from real game data:
+That was learned eight times, each time from real game data:
 
 | What was selected instead of the real field | Why it scored perfectly |
 |---|---|
@@ -924,6 +944,7 @@ That was learned six times, each time from real game data:
 | a field that is always zero, as `Offset_Internal` | trivially satisfies `0 <= v < size` for every property |
 | a shared thunk pointer, as `UFunction::Func` | 100% "points into executable memory", beating the real field where some entries are null |
 | a target's class *name*, as the test for what it is | `"Class"` is right for every native class, and no Blueprint one — 532 properties on one game silently lost their type |
+| a field that is null everywhere, as `UField::Next` | chains "terminate and stay in the array" — one that links nothing terminates soonest, so it beats the real field |
 
 The corollary, applied throughout: **never emit plausible-but-wrong output.** An
 unresolvable type becomes an opaque byte array of the correct size; an unknown bytecode
@@ -1292,7 +1313,7 @@ not a missing feature.
 
 ## Status
 
-All phases P0–P7 complete, verified against sixteen live games from UE 4.22 to UE 5.7.
+All phases P0–P7 complete, verified against seventeen live games from UE 4.22 to UE 5.7.
 `CHANGELOG.md` records what changed per release.
 
 | | |
@@ -1308,6 +1329,7 @@ All phases P0–P7 complete, verified against sixteen live games from UE 4.22 to
 | gap list | CDO defaults, interfaces, property flag names, class vtables — all closed |
 | 0.3.0 | three more emitters, a dump linter, a reference index, multi-format emit |
 | 0.4.0 | publishing to Zdex from the CLI and the GUI, and a read cache that no longer serves yesterday's bytes |
+| 0.5.0 | licensee forks that extend `UObject` itself, and a truncation that made every dump quietly short |
 
 Measured on Funnel Runners (UE 5.6):
 
@@ -1354,10 +1376,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-A build reports its version as `0.4.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
+A build reports its version as `0.5.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
 that is the only difference between a local build and a released one.
 
-Eight test suites, 1774 checks, none of which need a game installed. They run against
+Eight test suites, 1794 checks, none of which need a game installed. They run against
 synthetic memory, hand-built bytecode and checked-in fixtures.
 
 > If Strawberry Perl or MinGW is on PATH, CMake may pick up its GCC. Pass the Visual

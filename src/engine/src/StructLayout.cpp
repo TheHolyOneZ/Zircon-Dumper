@@ -163,22 +163,38 @@ UStructLayout DeriveStructLayout(core::IMemorySource& memory,
     // --- PropertiesSize ---------------------------------------------------------------
     // Two independent constraints, both required:
     //   1. a derived class is never smaller than its base
-    //   2. /Script/CoreUObject.Object reports exactly the size of a UObject, which the
-    //      separately derived object layout already told us
+    //   2. /Script/CoreUObject.Object reports the size of a UObject
     // The second is an anchor, not a heuristic, and it's what rules out fields that merely
     // happen to be monotonic.
-    const std::int32_t expected_object_size =
+    //
+    // Knowing what a UObject weighs is the hard half. For stock UE, OuterPrivate is the
+    // last member, so the separately derived object layout gives it exactly. A fork that
+    // appends its own fields to UObject breaks that, and then nothing matches at all.
+    //
+    // Neighbouring fields do not rescue it. UField is a UObject plus one pointer, so Next
+    // would give the size -- except a build carrying UE5's FStructBaseChain puts sixteen
+    // bytes between Next and SuperStruct, and working back from SuperStruct overshoots by
+    // exactly that much. Both routes assume a tail that a fork is free to change.
+    //
+    // So: the exact figure first, which keeps every target that already worked identical.
+    // Only when that finds nothing, anchor on things that say nothing about the tail:
+    //   - at least outer_offset + 8, because those members demonstrably exist
+    //   - 8-aligned, because UObject holds pointers
+    //   - no class smaller than the root, since every class derives from UObject
+    //   - a real alignment in the next dword
+    const std::int32_t stock_object_size =
         static_cast<std::int32_t>(object_layout.outer_offset + 8);
 
-    int best_size_offset = -1;
-    int best_size_score  = 0;
+    // A fork can append to UObject; it cannot append a kilobyte and stay an engine.
+    constexpr std::int32_t kMaxObjectTailGrowth = 256;
+    constexpr std::int32_t kMaxStructBytes      = 1 << 20;
 
-    for (int offset = search_from; offset <= kMaxStructOffset; offset += 4) {
-        // Anchor first. One read, and it kills almost every candidate.
-        std::int32_t root_size{};
-        if (!core::ReadInto(memory, layout.object_class + offset, root_size)) continue;
-        if (root_size != expected_object_size) continue;
+    const auto sane_size = [](std::int32_t size) {
+        return size > 0 && size <= kMaxStructBytes;
+    };
 
+    // How many class/super pairs agree that a derived type is no smaller than its base.
+    const auto monotonic_score = [&](int offset) {
         int consistent = 0;
         for (const auto klass : classes) {
             const auto super = core::ReadOr<Address>(memory, klass + layout.super_struct);
@@ -187,26 +203,124 @@ UStructLayout DeriveStructLayout(core::IMemorySource& memory,
             std::int32_t size{}, super_size{};
             if (!core::ReadInto(memory, klass + offset, size)) continue;
             if (!core::ReadInto(memory, super + offset, super_size)) continue;
-
-            constexpr std::int32_t kMaxStructBytes = 1 << 20;
-            if (size <= 0 || size > kMaxStructBytes) continue;
-            if (super_size <= 0 || super_size > kMaxStructBytes) continue;
+            if (!sane_size(size) || !sane_size(super_size)) continue;
             if (size < super_size) continue;
             ++consistent;
         }
+        return consistent;
+    };
 
+    // Nothing derives from UObject and comes out smaller than it. Independent of where
+    // UObject ends, which is the whole point.
+    const auto nothing_smaller_than_root = [&](int offset, std::int32_t root_size) {
+        int checked = 0;
+        int not_smaller = 0;
+        for (const auto klass : classes) {
+            std::int32_t size{};
+            if (!core::ReadInto(memory, klass + offset, size)) continue;
+            if (!sane_size(size)) continue;
+            ++checked;
+            if (size >= root_size) ++not_smaller;
+        }
+        return checked > 0 && not_smaller == checked;
+    };
+
+    // MinAlignment sits in the dword after PropertiesSize. Used here as a second opinion on
+    // the candidate rather than only as a follow-up read, because a field that is monotonic
+    // by accident is unlikely to be followed by a plausible alignment for every class.
+    const auto alignment_follows = [&](int offset) {
+        const auto plausible = [&](bool as_u16) {
+            int count = 0;
+            for (const auto klass : classes) {
+                std::uint32_t value{};
+                if (as_u16) {
+                    std::uint16_t narrow{};
+                    if (!core::ReadInto(memory, klass + offset + 4, narrow)) continue;
+                    value = narrow;
+                } else {
+                    if (!core::ReadInto(memory, klass + offset + 4, value)) continue;
+                }
+                if (value > 0 && value <= 64 && (value & (value - 1)) == 0) ++count;
+            }
+            return count;
+        };
+        const int needed = static_cast<int>(classes.size()) * 3 / 4;
+        return plausible(false) >= needed || plausible(true) >= needed;
+    };
+
+    int          best_size_offset = -1;
+    int          best_size_score  = 0;
+    std::int32_t best_root_size   = 0;
+
+    for (int offset = search_from; offset <= kMaxStructOffset; offset += 4) {
+        // Anchor first. One read, and it kills almost every candidate.
+        std::int32_t root_size{};
+        if (!core::ReadInto(memory, layout.object_class + offset, root_size)) continue;
+        if (root_size != stock_object_size) continue;
+
+        const int consistent = monotonic_score(offset);
         if (consistent > best_size_score) {
             best_size_score  = consistent;
             best_size_offset = offset;
+            best_root_size   = root_size;
         }
     }
 
-    if (best_size_offset >= 0 && best_size_score >= static_cast<int>(classes.size()) / 2) {
+    const bool stock_anchor_held =
+        best_size_offset >= 0 && best_size_score >= static_cast<int>(classes.size()) / 2;
+
+    if (!stock_anchor_held) {
+        best_size_offset = -1;
+        best_size_score  = 0;
+
+        for (int offset = search_from; offset <= kMaxStructOffset; offset += 4) {
+            std::int32_t root_size{};
+            if (!core::ReadInto(memory, layout.object_class + offset, root_size)) continue;
+
+            if (root_size < stock_object_size) continue;
+            if (root_size > stock_object_size + kMaxObjectTailGrowth) continue;
+            if (root_size % 8 != 0) continue;
+            if (!nothing_smaller_than_root(offset, root_size)) continue;
+            if (!alignment_follows(offset)) continue;
+
+            const int consistent = monotonic_score(offset);
+            if (consistent > best_size_score) {
+                best_size_score  = consistent;
+                best_size_offset = offset;
+                best_root_size   = root_size;
+            }
+        }
+
+        // One assumption fewer held here, so ask for more of the sample to agree than the
+        // stock path does before believing it.
+        if (best_size_offset >= 0 &&
+            best_size_score < static_cast<int>(classes.size()) * 3 / 4) {
+            best_size_offset = -1;
+        }
+    }
+
+    if (best_size_offset >= 0) {
         layout.properties_size = best_size_offset;
-        layout.evidence.push_back(std::format(
-            "PropertiesSize at +{:#x}: /Script/CoreUObject.Object reports {} bytes, and "
-            "{} class/super pairs satisfy size(derived) >= size(base)",
-            best_size_offset, expected_object_size, best_size_score));
+        layout.object_size     = best_root_size;
+        layout.extends_uobject = best_root_size != stock_object_size;
+
+        if (!layout.extends_uobject) {
+            layout.evidence.push_back(std::format(
+                "PropertiesSize at +{:#x}: /Script/CoreUObject.Object reports {} bytes, and "
+                "{} class/super pairs satisfy size(derived) >= size(base)",
+                best_size_offset, best_root_size, best_size_score));
+        } else {
+            core::LogInfo("this build extends UObject: sizeof(UObject) is {} bytes, {} more "
+                          "than the members alone account for",
+                          best_root_size, best_root_size - stock_object_size);
+            layout.evidence.push_back(std::format(
+                "PropertiesSize at +{:#x}: /Script/CoreUObject.Object reports {} bytes -- {} "
+                "more than its members account for, so this build extends UObject. No class "
+                "is smaller than the root, an alignment follows, and {} class/super pairs "
+                "satisfy size(derived) >= size(base)",
+                best_size_offset, best_root_size, best_root_size - stock_object_size,
+                best_size_score));
+        }
 
         // MinAlignment follows PropertiesSize, though not always as a full int32. At least
         // one shipping UE5 build keeps 8 in the low half of that dword with other data
@@ -335,28 +449,38 @@ UStructLayout DeriveStructLayout(core::IMemorySource& memory,
         const std::int32_t root_size = core::ReadOr<std::int32_t>(
             memory, layout.object_class + layout.properties_size);
 
-        const bool no_super  = IsNull(root_super);
-        const int  expected  = object_layout.outer_offset + 8;   // outer is the last field
-        const bool size_fits = root_size == expected;
+        const bool no_super = IsNull(root_super);
+
+        // The floor, not the figure: those members are there, so a UObject is at least that
+        // big. A build that appends to UObject is above it and still correct.
+        const int  floor     = object_layout.outer_offset + 8;
+        const bool size_fits = root_size == layout.object_size && root_size >= floor;
 
         layout.evidence.push_back(std::format(
-            "UObject: super {}, PropertiesSize {} (object layout implies exactly {})",
-            no_super ? "null" : "NOT null", root_size, expected));
+            "UObject: super {}, PropertiesSize {} (its members account for {})",
+            no_super ? "null" : "NOT null", root_size, floor));
 
         if (no_super && size_fits) {
-            layout.confidence = std::min(0.98f, layout.confidence + 0.55f);
+            // A shade lower for a fork, since it rests on one assumption fewer than a stock
+            // build does -- enough to notice in the header, not enough to distrust.
+            const float earned = layout.extends_uobject ? 0.45f : 0.55f;
+            layout.confidence = std::min(0.98f, layout.confidence + earned);
         } else {
-            core::LogWarn("UObject sanity check failed: super {}, size {} vs expected {}",
-                          no_super ? "null" : "non-null", root_size, expected);
+            core::LogWarn("UObject sanity check failed: super {}, size {} (members account "
+                          "for {})", no_super ? "null" : "non-null", root_size, floor);
             layout.evidence.push_back("end-to-end check FAILED on /Script/CoreUObject.Object");
             layout.confidence *= 0.3f;
         }
     }
 
-    core::LogInfo("UStruct layout: super +{:#x}, children +{:#x}, childprops +{:#x}, "
-                  "size +{:#x}, align +{:#x}",
-                  layout.super_struct, layout.children, layout.child_properties,
-                  layout.properties_size, layout.min_alignment);
+    // "+{:#x}" on an unresolved -1 prints "+-0x1", which reads like an offset rather than
+    // like a failure.
+    const auto at = [](int offset) {
+        return offset < 0 ? std::string("unresolved") : std::format("+{:#x}", offset);
+    };
+    core::LogInfo("UStruct layout: super {}, children {}, childprops {}, size {}, align {}",
+                  at(layout.super_struct), at(layout.children), at(layout.child_properties),
+                  at(layout.properties_size), at(layout.min_alignment));
     return layout;
 }
 

@@ -91,35 +91,97 @@ UFunctionLayout DeriveFunctionLayout(core::IMemorySource& memory,
     // --- UField::Next -----------------------------------------------------------------
     // Walked from UStruct::Children. Every link lands on another array object and the chain
     // terminates; one that loops or leaves the array isn't the field list.
-    for (int offset = object_layout.outer_offset + 8;
-         offset <= kMaxProbe && layout.field_next < 0; offset += 8) {
-        if (offset == struct_layout.super_struct || offset == struct_layout.children ||
-            offset == struct_layout.child_properties)
-            continue;
-
-        int good = 0;
+    //
+    // Terminating is not enough on its own. A field that reads null everywhere terminates
+    // every chain immediately and satisfies that perfectly, which makes it the best-scoring
+    // candidate rather than a rejected one. On a build where the stock position for Next
+    // holds nothing, a first-match scan stops there and truncates every Children list to a
+    // single entry -- and nothing downstream can tell, because a short list is a legitimate
+    // thing for a class to have.
+    //
+    // So the chains have to link, and the offset that links the most wins. UField is a
+    // UObject plus one pointer, so sizeof(UObject) is where Next belongs -- and by this
+    // point that has been read out of the engine rather than assumed from the members.
+    const auto chain_quality = [&](int offset, int& sane_out) {
+        int sane  = 0;
+        int links = 0;
         for (const auto klass : classes_with_children) {
             Address current = core::ReadOr<Address>(memory, klass + struct_layout.children);
             std::set<std::uint64_t> seen;
-            bool sane = true;
+            bool sane_here = true;
+            int  steps     = 0;
 
             for (int step = 0; step < kMaxChainLength; ++step) {
                 const auto next = core::ReadOr<Address>(memory, current + offset);
                 if (IsNull(next)) break;
-                if (!IsArrayObject(memory, array, next))    { sane = false; break; }
-                if (!seen.insert(Raw(next)).second)         { sane = false; break; }
+                if (!IsArrayObject(memory, array, next))    { sane_here = false; break; }
+                if (!seen.insert(Raw(next)).second)         { sane_here = false; break; }
                 current = next;
+                ++steps;
             }
-            if (sane) ++good;
+            if (sane_here) { ++sane; links += steps; }
         }
+        sane_out = sane;
+        return links;
+    };
 
-        if (!classes_with_children.empty() &&
-            good >= static_cast<int>(classes_with_children.size()) * 9 / 10) {
-            layout.field_next = offset;
-            layout.evidence.push_back(std::format(
-                "UField::Next at +{:#x}: {}/{} Children chains stay in the object array "
-                "and terminate", offset, good, classes_with_children.size()));
+    const int needed_sane = static_cast<int>(classes_with_children.size()) * 9 / 10;
+
+    int best_next  = -1;
+    int best_links = 0;
+    int best_sane  = 0;
+
+    // Try the anchor before scanning. On a stock build it is the first offset the scan would
+    // have probed anyway, so those targets land on the same answer by construction rather
+    // than by a scan that merely ought to agree.
+    if (!classes_with_children.empty() && struct_layout.object_size > 0) {
+        const int anchored = struct_layout.object_size;
+        if (anchored != struct_layout.super_struct && anchored != struct_layout.children &&
+            anchored != struct_layout.child_properties) {
+            int sane = 0;
+            const int links = chain_quality(anchored, sane);
+            if (sane >= needed_sane && links > 0) {
+                best_next  = anchored;
+                best_links = links;
+                best_sane  = sane;
+            }
         }
+    }
+
+    if (best_next < 0 && !classes_with_children.empty()) {
+        for (int offset = object_layout.outer_offset + 8; offset <= kMaxProbe; offset += 8) {
+            if (offset == struct_layout.super_struct || offset == struct_layout.children ||
+                offset == struct_layout.child_properties)
+                continue;
+
+            int sane  = 0;
+            const int links = chain_quality(offset, sane);
+            if (sane < needed_sane) continue;
+            if (links <= best_links) continue;
+
+            best_links = links;
+            best_sane  = sane;
+            best_next  = offset;
+        }
+    }
+
+    if (best_next >= 0 && best_links > 0) {
+        layout.field_next = best_next;
+
+        const bool matches_object_size = struct_layout.object_size == best_next;
+        layout.evidence.push_back(std::format(
+            "UField::Next at +{:#x}: {}/{} Children chains stay in the object array and "
+            "terminate, {} links followed{}",
+            best_next, best_sane, classes_with_children.size(), best_links,
+            matches_object_size ? ", and it lands exactly on sizeof(UObject)" : ""));
+
+        if (!matches_object_size && struct_layout.object_size > 0) {
+            core::LogWarn("UField::Next at +{:#x} but sizeof(UObject) is {}; expected them to "
+                          "agree", best_next, struct_layout.object_size);
+        }
+    } else if (!classes_with_children.empty()) {
+        core::LogWarn("could not identify UField::Next: no offset produced a chain that both "
+                      "links and terminates");
     }
 
     // --- UFunction::FunctionFlags -----------------------------------------------------

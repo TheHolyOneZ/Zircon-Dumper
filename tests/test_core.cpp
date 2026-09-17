@@ -9,6 +9,7 @@
 #include "engine/EngineProfile.h"
 #include "engine/ClassLayout.h"
 #include "engine/EnumLayout.h"
+#include "engine/FunctionLayout.h"
 #include "engine/Hooks.h"
 #include "engine/NamePool.h"
 #include "engine/ObjectArray.h"
@@ -771,6 +772,238 @@ SyntheticWorld BuildObjectWorld(Address base, int class_count, bool with_decoy) 
     return world;
 }
 
+
+// --- synthetic UStruct world -----------------------------------------------------
+//
+// A class graph whose super chains all terminate at an object named "Object", which is what
+// DeriveStructLayout keys on. Parameterised by how far UObject has been extended, because
+// the interesting case is a licensee fork that appends to UObject itself: Atomic Heart is a
+// UE 4.27 build where sizeof(UObject) is 8 bytes past where its members end, and it also
+// carries UE5's FStructBaseChain between UField::Next and SuperStruct.
+struct StructWorld {
+    std::vector<std::uint8_t> bytes;
+    Address                   base{};
+
+    zircon::engine::ObjectArrayInfo array;
+    zircon::engine::UObjectLayout   object_layout;
+    zircon::engine::NamePoolInfo    pool;
+
+    int object_size{};   // what the world says sizeof(UObject) is
+    int field_next{};
+    int super{};
+    int children{};
+    int child_props{};
+    int prop_size{};
+};
+
+// `tail_growth` is how much the fork appended to UObject; `chain_bytes` is padding between
+// UField::Next and SuperStruct, standing in for FStructBaseChain.
+StructWorld BuildStructWorld(Address base, int tail_growth, int chain_bytes) {
+    constexpr int kIndex = 0x0C;
+    constexpr int kClass = 0x10;
+    constexpr int kName  = 0x18;
+    constexpr int kOuter = 0x20;
+    constexpr std::uint32_t kObjSize = 0x140;
+
+    StructWorld world;
+    world.base        = base;
+    world.object_size = kOuter + 8 + tail_growth;
+    world.field_next  = world.object_size;
+    world.super       = world.field_next + 8 + chain_bytes;
+    world.children    = world.super + 8;
+    world.child_props = world.children + 8;
+    world.prop_size   = world.child_props + 8;
+
+    constexpr int kClassCount = 48;
+    constexpr int kFuncsPer   = 3;
+
+    std::vector<std::string> names = {"None", "Class", "Object", "Function"};
+    for (int i = 0; i < kClassCount; ++i) names.push_back("Klass" + std::to_string(i));
+    for (int i = 0; i < kClassCount * kFuncsPer; ++i) names.push_back("Fn" + std::to_string(i));
+
+    auto pool = BuildNamePool(base, names, false);
+    world.pool.blocks            = base + pool.blocks_offset;
+    world.pool.block_offset_bits = 16;
+    world.pool.stride            = 2;
+    world.pool.len_shift         = 6;
+
+    auto name_id = [&](const std::string& want) -> std::uint32_t {
+        for (const auto& [id, text] : pool.entries)
+            if (text == want) return id;
+        return 0;
+    };
+
+    constexpr std::uint64_t kArrayAt    = 0x2000;
+    constexpr std::uint64_t kChunkTable = 0x2400;
+    constexpr std::uint64_t kSlotsAt    = 0x2800;
+    constexpr std::uint64_t kObjectsAt  = 0x8000;
+
+    // meta("Class"), meta("Function"), root("Object"), then classes and their functions.
+    const std::int32_t total = 3 + kClassCount + kClassCount * kFuncsPer;
+
+    world.bytes = pool.bytes;
+    world.bytes.resize(kObjectsAt + static_cast<std::size_t>(total + 2) * kObjSize, 0);
+
+    auto put64 = [&](std::uint64_t at, std::uint64_t v) {
+        std::memcpy(world.bytes.data() + at, &v, sizeof(v));
+    };
+    auto put32 = [&](std::uint64_t at, std::uint32_t v) {
+        std::memcpy(world.bytes.data() + at, &v, sizeof(v));
+    };
+    auto slot = [&](int i) { return kObjectsAt + static_cast<std::uint64_t>(i) * kObjSize; };
+
+    const std::uint64_t meta_class = slot(0);
+    const std::uint64_t meta_func  = slot(1);
+    const std::uint64_t root       = slot(2);
+
+    put32(meta_class + kIndex, 0);
+    put64(meta_class + kClass, Raw(base) + meta_class);     // its own class
+    put32(meta_class + kName,  name_id("Class"));
+    put64(meta_class + world.super, Raw(base) + root);
+    put32(meta_class + world.prop_size, world.object_size + 0x80);
+
+    put32(meta_func + kIndex, 1);
+    put64(meta_func + kClass, Raw(base) + meta_class);
+    put32(meta_func + kName,  name_id("Function"));
+    put64(meta_func + world.super, Raw(base) + root);
+    put32(meta_func + world.prop_size, world.object_size + 0x40);
+
+    // The root. Its own size is the number the anchor has to find, and on a fork it is not
+    // what the member offsets alone would suggest.
+    put32(root + kIndex, 2);
+    put64(root + kClass, Raw(base) + meta_class);
+    put32(root + kName,  name_id("Object"));
+    put64(root + world.super, 0);                           // no super: that is the anchor
+    put32(root + world.prop_size, world.object_size);
+    put32(root + world.prop_size + 4, 8);                   // MinAlignment
+
+    for (int i = 0; i < kClassCount; ++i) {
+        const std::uint64_t klass = slot(3 + i);
+        put32(klass + kIndex, 3 + i);
+        put64(klass + kClass, Raw(base) + meta_class);
+        put32(klass + kName,  name_id("Klass" + std::to_string(i)));
+        put64(klass + world.super, Raw(base) + root);
+        put32(klass + world.prop_size, world.object_size + 0x10 * (i + 1));
+        put32(klass + world.prop_size + 4, 8);
+
+        // A Children list of UFunctions, linked through UField::Next. Several per class, so
+        // an offset that reads null everywhere cannot pass for the link field.
+        for (int f = 0; f < kFuncsPer; ++f) {
+            const int fi = i * kFuncsPer + f;
+            const std::uint64_t fn = slot(3 + kClassCount + fi);
+            put32(fn + kIndex, 3 + kClassCount + fi);
+            put64(fn + kClass, Raw(base) + meta_func);
+            put32(fn + kName,  name_id("Fn" + std::to_string(fi)));
+            put32(fn + world.prop_size, world.object_size);
+            put32(fn + world.prop_size + 4, 8);
+
+            if (f == 0) put64(klass + world.children, Raw(base) + fn);
+            else        put64(slot(3 + kClassCount + fi - 1) + world.field_next,
+                              Raw(base) + fn);
+        }
+    }
+
+    constexpr std::uint32_t kItemSize = 24;
+    for (std::int32_t i = 0; i < total; ++i)
+        put64(kSlotsAt + static_cast<std::uint64_t>(i) * kItemSize, Raw(base) + slot(i));
+    put64(kChunkTable, Raw(base) + kSlotsAt);
+    put64(kArrayAt,    Raw(base) + kChunkTable);
+
+    world.array.inner              = base + kArrayAt;
+    world.array.gobjects           = base + kArrayAt;
+    world.array.chunked            = true;
+    world.array.num_elements       = total;
+    world.array.max_elements       = total;
+    world.array.num_chunks         = 1;
+    world.array.max_chunks         = 1;
+    world.array.elements_per_chunk = static_cast<std::uint32_t>(total);
+    world.array.item_size          = kItemSize;
+    world.array.index_offset       = kIndex;
+    world.array.confidence         = 1.0f;
+
+    world.object_layout.index_offset  = kIndex;
+    world.object_layout.class_offset  = kClass;
+    world.object_layout.name_offset   = kName;
+    world.object_layout.outer_offset  = kOuter;
+    world.object_layout.uclass_object = base + meta_class;
+    world.object_layout.confidence    = 1.0f;
+
+    return world;
+}
+
+void TestStructLayoutOnForks() {
+    using zircon::engine::DeriveStructLayout;
+    const auto base = static_cast<Address>(0x140000000ull);
+
+    // Stock: UObject ends where its members end, and nothing sits before SuperStruct.
+    {
+        auto world = BuildStructWorld(base, 0, 0);
+        FakeMemory memory(base, world.bytes);
+        const auto layout = DeriveStructLayout(memory, world.array, world.pool,
+                                               world.object_layout);
+        CHECK(layout.Valid());
+        CHECK(layout.super_struct    == world.super);
+        CHECK(layout.children        == world.children);
+        CHECK(layout.properties_size == world.prop_size);
+        CHECK(layout.min_alignment   == world.prop_size + 4);
+        CHECK(layout.object_size     == world.object_size);
+        CHECK(!layout.extends_uobject);
+    }
+
+    // The Atomic Heart shape: 8 bytes appended to UObject, and 16 more between UField::Next
+    // and SuperStruct. Before this was handled the anchor looked for a size that nothing
+    // reported, no candidate survived, and the whole dump was refused.
+    {
+        auto world = BuildStructWorld(base, 8, 0x10);
+        FakeMemory memory(base, world.bytes);
+        const auto layout = DeriveStructLayout(memory, world.array, world.pool,
+                                               world.object_layout);
+        CHECK(layout.Valid());
+        CHECK(layout.properties_size == world.prop_size);
+        CHECK(layout.min_alignment   == world.prop_size + 4);
+        CHECK(layout.object_size     == world.object_size);
+        CHECK(layout.extends_uobject);
+        // Reported, not swept up: a build that changes UObject should say so.
+        CHECK(layout.object_size == world.object_layout.outer_offset + 8 + 8);
+    }
+
+    // A larger tail, with no base chain, to be sure the two are handled independently.
+    {
+        auto world = BuildStructWorld(base, 0x18, 0);
+        FakeMemory memory(base, world.bytes);
+        const auto layout = DeriveStructLayout(memory, world.array, world.pool,
+                                               world.object_layout);
+        CHECK(layout.Valid());
+        CHECK(layout.properties_size == world.prop_size);
+        CHECK(layout.object_size     == world.object_size);
+        CHECK(layout.extends_uobject);
+    }
+}
+
+void TestFieldNextIgnoresAlwaysNull() {
+    using zircon::engine::DeriveStructLayout;
+    using zircon::engine::DeriveFunctionLayout;
+    const auto base = static_cast<Address>(0x140000000ull);
+
+    // On a fork the stock position for UField::Next holds nothing. A field that is null
+    // everywhere terminates every chain immediately, so "stays in the array and terminates"
+    // is satisfied perfectly by a field that links nothing at all -- and the scan used to
+    // take the first offset that passed. Every Children list came out one entry long.
+    auto world = BuildStructWorld(base, 8, 0x10);
+    FakeMemory memory(base, world.bytes);
+
+    const auto struct_layout = DeriveStructLayout(memory, world.array, world.pool,
+                                                  world.object_layout);
+    CHECK(struct_layout.Valid());
+
+    zircon::engine::FPropertyLayout property_layout;   // not needed for the Next scan
+    const auto fn = DeriveFunctionLayout(memory, world.array, world.pool,
+                                         world.object_layout, struct_layout, property_layout);
+    CHECK(fn.field_next == world.field_next);
+    // The stock position is exactly the offset that reads null here.
+    CHECK(fn.field_next != world.object_layout.outer_offset + 8);
+}
+
 void TestClassDefaultObject() {
     using zircon::engine::DeriveClassLayout;
     using zircon::engine::GetClassDefaultObject;
@@ -1193,6 +1426,8 @@ int main() {
     TestUnrealDetection();
     TestVersionFingerprint();
     TestNamePool();
+    TestStructLayoutOnForks();
+    TestFieldNextIgnoresAlwaysNull();
     TestClassDefaultObject();
     TestSplitEnumArrays();
     TestNameEntryArrayPool();

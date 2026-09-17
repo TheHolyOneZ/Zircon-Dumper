@@ -5,6 +5,7 @@
 #include "engine/ObjectArray.h"
 #include "engine/ObjectLayout.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,17 @@ struct UStructLayout {
     // The object for /Script/CoreUObject.Object, found while deriving. It is the root of
     // every class chain and a useful anchor for later passes.
     core::Address object_class{};
+
+    // What /Script/CoreUObject.Object reports as its own size, i.e. sizeof(UObject) in the
+    // target. Stock builds put OuterPrivate last, so this is object_layout.outer_offset + 8;
+    // a fork that appends its own fields to UObject makes it larger, and then it is the only
+    // honest source for that number. -1 until PropertiesSize is derived.
+    std::int32_t object_size{-1};
+
+    // Set when object_size came out larger than a stock UObject, i.e. the target extends
+    // UObject itself. Worth surfacing: it says the build is a fork at the deepest level, not
+    // merely a renamed executable.
+    bool extends_uobject{false};
 
     float confidence{0.0f};
     std::vector<std::string> evidence;

@@ -38,6 +38,13 @@ they can agree and all three be wrong the same way, which is exactly what happen
 Funnel Runners before 0.3.0 — every provider faithfully reproduced the same 176 defects.
 L6 is the dump checked against itself rather than against another copy of itself.
 
+**None of the six levels look at how long the tool has been attached**, which is how the
+0.4.0 cache bug got past all of them. Every level compares outputs, and all three providers
+sit behind the same read cache with the same policy, so a defect in that layer is reproduced
+identically by all of them — agreement stays perfect while the answer is wrong. Reproducing
+it took a sequence rather than a target: attach, browse, leave the window open, change level,
+then dump. Anything run against the GUI now has to be run that way, not as attach-and-dump.
+
 ---
 
 ## Status
@@ -52,22 +59,28 @@ L6 is the dump checked against itself rather than against another copy of itself
 | **Mizeria** | **5.2** | **L5** | almost pure C++; no Blueprint script to decompile |
 | **Ready Or Not** | **5.3** | **L5** | no version string; pins where FProperty moved |
 | **Dark Pals: The 1st Floor** | **5.5** | **L5** | brackets the FProperty change from below |
-| **Funnel Runners** | **5.6** | **L6** | the reference target; re-run in full for 0.3.0 |
+| **Funnel Runners** | **5.6** | **L6** | the reference target; re-run in full for 0.3.0, and for the 0.4.0 GUI-path fix |
 | **Subnautica 2** | **5.6-era** | **L4** | licensee-branded; largest target. L5 is not reachable on it — see below |
 | **Backrooms Escape Together** | **5.7** | **L5** | newest engine; moved three things, see below |
 | **Motorslice** | **5.7** | **L5** | the second 5.7 sample; it is what closed the enum gap |
 | **RV There Yet** | **5.6-era** | **L5** | licensee-branded, no UE version string anywhere |
 | **Little Nightmares Enhanced** | **4.27** | **L5** | first UE4 target ever run |
+| **Atomic Heart** | **4.27** | **L3** | extends `UObject` and backports `FStructBaseChain`; the only target that ever failed to derive |
 | **Deep Rock Galactic** | **4.27-era** | **L5** | no version string at all; era identified from layout |
 | **FF7 Rebirth** | **4.26** | **L5** | Square Enix fork; needed three real fixes |
-| Atomic Heart | 4.27 | L0 | heavily customised renderer |
 | Little Nightmares III | 4.27 | L0 | launcher exe separate from shipping exe |
 | Ready Or Not | 4.27 / 5.x | L0 | no version string |
 
-**Sixteen targets verified, UE 4.22 through UE 5.7 — every engine era Zircon claims to
-support, every one implemented. Fifteen reach full provider agreement; the sixteenth is the
-one target where L5 cannot mean anything, for reasons that are the game's and not the
-tool's.**
+**Seventeen targets verified, UE 4.22 through UE 5.7 — every engine era Zircon claims to
+support, every one implemented. Fifteen reach full provider agreement; of the other two, one
+is where L5 cannot mean anything for reasons that are the game's and not the tool's, and the
+other is Atomic Heart, added in 0.5.0 and not yet run past L3.**
+
+Atomic Heart is worth its own line. It is the only target in any sweep that attached, found
+its objects, and then could not derive a layout — a 4.27 build that appends to `UObject` and
+carries UE5's `FStructBaseChain` inside `UStruct`. Every anchor that assumed where `UObject`
+ends was wrong on it. See the 0.5.0 entry in `CHANGELOG.md`; it is the regression case for
+any future change to `DeriveStructLayout`.
 
 Only UE 5.4 has never been run, and it is now bracketed by 5.3 and 5.5 rather than by 5.2
 and 5.5.
@@ -362,8 +375,10 @@ Every engine era is covered. What is left is breadth within eras, not missing su
    The residual risk is not zero, but it is small enough that the two downloads would be
    buying documentation rather than coverage. If one is bought anyway, make it 5.4: it sits
    directly against the boundary and would pin down exactly which release moved it.
-2. **Atomic Heart, Little Nightmares III, Ready Or Not** — more 4.27, so low value now.
-   Atomic Heart's customised renderer is the interesting one.
+2. **Little Nightmares III** — more 4.27, so low value now. Atomic Heart was run in 0.5.0
+   and was anything but low value: it is the only target that has ever defeated the layout
+   derivation, and it did so by changing `UObject` itself. Worth remembering when the next
+   entry on this list looks like breadth rather than coverage.
 3. **UE 4.20 / 4.21** — would add nothing structural. `TNameEntryArray` is the same across
    4.20 – 4.22 and 4.22 passes at L5, so these are breadth only.
 
