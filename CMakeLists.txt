@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.5.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.6.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -155,6 +155,19 @@ set_target_properties(zircon_emit PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # so it sits beside core/ rather than above ir/ - it never sees a Dump, only a file on
 # disk and a server. Kept apart from core/ because core/ is what every other layer leans
 # on and none of them should acquire a dependency on WinHTTP.
+# il2cpp/ is the second runtime backend. Like engine/ it leans on core/ for memory and PE
+# parsing and knows nothing about output formats, so it sits beside engine/ rather than
+# under it -- neither one needs the other.
+add_library(zircon_il2cpp STATIC
+  src/il2cpp/src/Runtime.cpp
+  src/il2cpp/src/MethodLayout.cpp
+  src/il2cpp/src/InProcessBridge.cpp
+  src/il2cpp/src/Walker.cpp
+)
+target_include_directories(zircon_il2cpp PUBLIC src/il2cpp/include)
+target_link_libraries(zircon_il2cpp PUBLIC zircon_core zircon_ir)
+set_target_properties(zircon_il2cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(zircon_zdex STATIC
   src/zdex/src/Gzip.cpp
   src/zdex/src/Json.cpp
@@ -194,7 +207,7 @@ if(ZIRCON_BUILD_CLI)
   endif()
 
   add_executable(zircon src/app/main.cpp src/app/Publish.cpp ${ZIRCON_RC_CLI})
-  target_link_libraries(zircon PRIVATE zircon_engine zircon_emit zircon_diff zircon_plugin zircon_zdex)
+  target_link_libraries(zircon PRIVATE zircon_engine zircon_emit zircon_diff zircon_plugin zircon_zdex zircon_il2cpp)
   set_target_properties(zircon PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
 endif()
 
@@ -218,7 +231,7 @@ if(ZIRCON_BUILD_GUI)
   add_library(zircon_gui_lib STATIC src/gui/Host.cpp src/gui/Browser.cpp)
   target_include_directories(zircon_gui_lib PUBLIC src/gui res)
   # zircon_emit so the browser can write a dump itself, not only browse one.
-  target_link_libraries(zircon_gui_lib PUBLIC zircon_engine zircon_emit zircon_imgui zircon_zdex)
+  target_link_libraries(zircon_gui_lib PUBLIC zircon_engine zircon_il2cpp zircon_emit zircon_imgui zircon_zdex)
   set_target_properties(zircon_gui_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
   add_executable(zircon_gui WIN32 src/gui/main_gui.cpp ${ZIRCON_RC_GUI})
@@ -312,7 +325,7 @@ endif()
 # both dumps and opens the live UI, and neither half is worth duplicating.
 if(ZIRCON_BUILD_DLL)
   add_library(zircon_payload SHARED src/dll/dllmain.cpp ${ZIRCON_RC_DLL})
-  target_link_libraries(zircon_payload PRIVATE zircon_engine zircon_emit zircon_ir)
+  target_link_libraries(zircon_payload PRIVATE zircon_engine zircon_emit zircon_ir zircon_il2cpp)
   if(ZIRCON_BUILD_GUI)
     target_link_libraries(zircon_payload PRIVATE zircon_gui_lib)
     target_compile_definitions(zircon_payload PRIVATE ZIRCON_WITH_GUI=1)
@@ -359,6 +372,11 @@ if(ZIRCON_BUILD_TESTS)
   target_link_libraries(zircon_kismet_tests PRIVATE zircon_engine)
   set_target_properties(zircon_kismet_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
   add_test(NAME kismet COMMAND zircon_kismet_tests)
+
+  add_executable(zircon_il2cpp_tests tests/test_il2cpp.cpp)
+  target_link_libraries(zircon_il2cpp_tests PRIVATE zircon_il2cpp)
+  set_target_properties(zircon_il2cpp_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
+  add_test(NAME il2cpp COMMAND zircon_il2cpp_tests)
 
   add_executable(zircon_zdex_tests tests/test_zdex.cpp)
   target_link_libraries(zircon_zdex_tests PRIVATE zircon_zdex)

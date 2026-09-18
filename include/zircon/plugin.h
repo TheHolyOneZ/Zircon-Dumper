@@ -68,11 +68,11 @@ extern "C" {
  * A plugin built against 1.0 therefore runs on a 1.7 host, and one built against 1.7
  * declines a 1.0 host instead of calling through a vtable slot that is not there. */
 #define ZN_ABI_MAJOR 1
-#define ZN_ABI_MINOR 1
+#define ZN_ABI_MINOR 2
 
 /* The IR schema the host is serving. Independent of the ABI: the ABI is how you ask, the
  * schema is what there is to ask about. */
-#define ZN_SCHEMA_VERSION 1
+#define ZN_SCHEMA_VERSION 2
 
 /* ------------------------------------------------------------------ status codes */
 
@@ -105,7 +105,8 @@ typedef enum ZnKind {
     ZN_KIND_PARAM,
     ZN_KIND_STATEMENT,
     ZN_KIND_TYPE,
-    ZN_KIND_OPTIONS
+    ZN_KIND_OPTIONS,
+    ZN_KIND_ACCESSOR   /* a C# property: 1.2 */
 } ZnKind;
 
 /* What a field holds, for introspection. */

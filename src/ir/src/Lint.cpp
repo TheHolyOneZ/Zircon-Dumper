@@ -144,7 +144,13 @@ void CheckStruct(Context& context, const Struct& record) {
                                   record.inherited_size, record.size));
     }
 
-    if (record.size <= 0 && !record.properties.empty()) {
+    const bool any_instance_member = [&] {
+        for (const auto& property : record.properties)
+            if (!property.is_static && !property.offset_unresolved) return true;
+        return false;
+    }();
+
+    if (record.size <= 0 && any_instance_member) {
         context.Error("zero-size-with-members", record.path,
                       std::format("reports {} bytes but declares {} properties",
                                   record.size, record.properties.size()));
@@ -162,7 +168,16 @@ void CheckStruct(Context& context, const Struct& record) {
     std::unordered_set<std::string> property_names;
     for (const auto& property : record.properties) {
         ++context.report.properties_checked;
-        ordered.push_back(&property);
+
+        // Only members that occupy the instance take part in the layout checks. A static
+        // lives in the type's own block; an unresolved offset has nothing to check. Both
+        // would fail every rule here for the wrong reason. Still checked for everything
+        // that's about the member itself.
+        //
+        // Both exclusions came from the first IL2CPP dump, where they were 10k false
+        // contradictions. See CHANGELOG 0.6.0.
+        const bool in_layout = !property.is_static && !property.offset_unresolved;
+        if (in_layout) ordered.push_back(&property);
 
         const std::string where = record.path + "." + property.name;
 
@@ -172,7 +187,7 @@ void CheckStruct(Context& context, const Struct& record) {
             context.Warn("duplicate-property", record.path,
                          std::format("'{}' is declared more than once", property.name));
 
-        if (property.offset < 0)
+        if (property.offset < 0 && !property.offset_unresolved)
             context.Error("negative-offset", where,
                           std::format("offset {}", property.offset));
 
@@ -183,7 +198,7 @@ void CheckStruct(Context& context, const Struct& record) {
         if (property.size < 0)
             context.Error("negative-size", where, std::format("size {}", property.size));
 
-        if (record.size > 0 && property.size > 0 &&
+        if (in_layout && record.size > 0 && property.size > 0 &&
             property.offset + property.size > record.size) {
             context.Error("member-overruns-type", where,
                           std::format("ends at {} in a {}-byte type",
@@ -218,7 +233,9 @@ void CheckStruct(Context& context, const Struct& record) {
                          return a->offset < b->offset;
                      });
 
-    for (std::size_t i = 1; i < ordered.size(); ++i) {
+    // Explicit layout means the type placed its own members and they may overlap. That's a
+    // C# union. Nothing below applies.
+    for (std::size_t i = 1; i < ordered.size() && !record.explicit_layout; ++i) {
         const Property& previous = *ordered[i - 1];
         const Property& current  = *ordered[i];
         if (previous.size <= 0 || current.size <= 0) continue;

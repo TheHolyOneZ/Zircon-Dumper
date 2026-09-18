@@ -7,6 +7,7 @@
 // standalone window attached externally and as an in-game overlay from the injected
 // payload. One implementation, two hosts.
 
+#include "core/ProcessList.h"
 #include "core/MemorySource.h"
 #include "engine/DumpBuilder.h"
 #include "engine/UnrealDetect.h"
@@ -55,6 +56,9 @@ private:
     };
 
     void DrawAttachPanel();
+    void DrawUnityNotice();
+    static std::vector<core::ProcessInfo> DetectUnityProcesses();
+    static std::string PayloadPath();
     void DrawStatusPanel();
     void DrawObjectList();
     void DrawInspector();
@@ -78,6 +82,9 @@ private:
 
     // --- attach state ---
     std::vector<engine::UnrealCandidate> candidates_;
+    std::vector<core::ProcessInfo>       unity_candidates_;
+    std::string                          unity_status_;
+    bool                                 unity_status_ok_{false};
     double                               candidates_refreshed_at_{-1.0};
     std::uint32_t                        attached_pid_{0};
     std::string                          target_name_;   // the executable, for the title bar

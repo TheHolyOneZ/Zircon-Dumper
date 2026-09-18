@@ -21,6 +21,9 @@
 #include "engine/ProcessEvent.h"
 #include "engine/StructLayout.h"
 #include "engine/UnrealDetect.h"
+#include "il2cpp/Bridge.h"
+#include "il2cpp/Runtime.h"
+#include "il2cpp/Walker.h"
 #include "ir/Json.h"
 
 #if ZIRCON_WITH_GUI
@@ -34,6 +37,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -73,24 +77,19 @@ void CloseConsole() {
 // mappings without asking. The rest are one CLI command away from the resulting dump.json.
 constexpr const char* kDefaultEmitters[] = {"cpp_sdk", "usmap", "json"};
 
-void RunDump(const engine::Reflection& reflection, const std::filesystem::path& out) {
-    engine::BuildOptions build;
-    build.include_script = true;
+// What a Unity target gets. json only for now -- the other emitters are Unreal-shaped and
+// printing a C# type as a UClass is worse than not offering it.
+constexpr const char* kIl2CppEmitters[] = {"json"};
 
-    core::LogInfo("building the dump (this walks every object once)");
-    const ir::Dump dump = engine::BuildDump(reflection, build);
-    core::LogInfo("dump: {} packages, {} classes, {} structs, {} enums, {} properties, "
-                  "{} functions",
-                  dump.packages.size(), dump.TotalClasses(), dump.TotalStructs(),
-                  dump.TotalEnums(), dump.TotalProperties(), dump.TotalFunctions());
-
+void WriteDump(const ir::Dump& dump, const std::filesystem::path& out,
+               std::span<const char* const> emitters) {
     std::string error;
     if (!emit::util::EnsureDirectory(out.string(), error)) {
         core::LogError("cannot create {}: {}", out.string(), error);
         return;
     }
 
-    for (const char* name : kDefaultEmitters) {
+    for (const char* name : emitters) {
         const auto* emitter = emit::FindEmitter(name);
         if (!emitter) continue;
 
@@ -105,6 +104,82 @@ void RunDump(const engine::Reflection& reflection, const std::filesystem::path& 
         for (const auto& warning : result.warnings) core::LogWarn("{}: {}", name, warning);
         core::LogInfo("{}: {} file(s) -> {}", name, result.files.size(), options.out_dir);
     }
+}
+
+// False when this isn't a Unity game: carry on into the Unreal path.
+bool RunIl2CppDump(core::IMemorySource& memory, const std::filesystem::path& out) {
+    const auto runtime = il2cpp::FindRuntime(memory);
+    if (!runtime) return false;
+
+    core::LogInfo("Unity IL2CPP: {} at {:#x}", runtime->module_name,
+                  core::Raw(runtime->module_base));
+    for (const auto& line : runtime->evidence) core::LogInfo("  - {}", line);
+
+    if (!runtime->api.Complete()) {
+        core::LogError("this build does not export everything the walk needs, so the dump "
+                       "would be missing whole categories rather than a few entries");
+        for (const auto& name : runtime->api.missing) core::LogError("  missing {}", name);
+        return true;   // handled: it is Unity, and the answer is no
+    }
+
+    // Reading consts is the one call that makes the runtime do work rather than answer, and
+    // the one a build might not survive. On by default (an enum without values is half an
+    // enum), off with a marker file beside the DLL like the ProcessEvent probe.
+    const bool read_consts = !std::filesystem::exists(out.parent_path() / "zircon-il2cpp-no-consts");
+    if (!read_consts)
+        core::LogInfo("const reading is off, so enums will carry names without values");
+
+    auto bridge = il2cpp::MakeInProcessBridge(*runtime, memory, read_consts);
+    if (!bridge) {
+        core::LogError("{}", bridge.error().message);
+        return true;
+    }
+
+    core::LogInfo("walking the runtime (domain, assemblies, images, classes)");
+    il2cpp::WalkOptions options;
+    il2cpp::WalkStats  stats;
+    ir::Dump dump = il2cpp::Walk(*bridge.value(), options, stats);
+
+    dump.header.tool_version  = ZIRCON_VERSION;
+    dump.header.source.kind    = "internal";
+    dump.header.source.process = memory.MainModule() ? memory.MainModule()->name : "";
+
+    core::LogInfo("dump: {} assemblies, {} classes, {} structs, {} enums, {} fields, "
+                  "{} methods, {} properties",
+                  stats.images, dump.TotalClasses(), dump.TotalStructs(), dump.TotalEnums(),
+                  stats.fields, stats.methods, stats.accessors);
+    core::LogInfo("{} method bodies resolved, {} of them shared with another method",
+                  stats.bodies, stats.shared_bodies);
+    if (stats.inflated)
+        core::LogInfo("{} generic instantiations swept out of the class cache", stats.inflated);
+    if (stats.indistinguishable)
+        core::LogInfo("{} instantiations were over another generic's parameter rather than a "
+                      "type, so only the first of each name is in the dump",
+                      stats.indistinguishable);
+    if (stats.open_generics)
+        core::LogInfo("{} open generic definitions, whose field offsets are left unresolved",
+                      stats.open_generics);
+    if (stats.enums_without_values)
+        core::LogWarn("{} enums kept their member names but not their values; this build's "
+                      "runtime will not read a const", stats.enums_without_values);
+
+    WriteDump(dump, out, kIl2CppEmitters);
+    core::LogInfo("publishable: 'zircon publish <the json above> --game ... --label ...'");
+    return true;
+}
+
+void RunDump(const engine::Reflection& reflection, const std::filesystem::path& out) {
+    engine::BuildOptions build;
+    build.include_script = true;
+
+    core::LogInfo("building the dump (this walks every object once)");
+    const ir::Dump dump = engine::BuildDump(reflection, build);
+    core::LogInfo("dump: {} packages, {} classes, {} structs, {} enums, {} properties, "
+                  "{} functions",
+                  dump.packages.size(), dump.TotalClasses(), dump.TotalStructs(),
+                  dump.TotalEnums(), dump.TotalProperties(), dump.TotalFunctions());
+
+    WriteDump(dump, out, kDefaultEmitters);
 }
 
 // Held for the lifetime of the payload: a generated SDK may call in at any point while
@@ -132,6 +207,24 @@ DWORD WINAPI PayloadThread(LPVOID) {
     if (main_module) {
         core::LogInfo("main module: {} at {:#x} ({} MiB)", main_module->name,
                       core::Raw(main_module->base), main_module->size >> 20);
+    }
+
+    // Unity before Unreal. IL2CPP is a yes/no; the Unreal check is a score that'll return
+    // a low number about a non-Unreal game and leave someone reading the wrong log.
+    {
+        const auto out = OutputDirectory();
+        std::string log_error;
+        if (emit::util::EnsureDirectory(out.string(), log_error))
+            core::SetLogFile((out / "zircon.log").string());
+
+        if (RunIl2CppDump(*memory, out)) {
+            core::LogInfo("output directory: {}", out.string());
+            core::LogInfo("press END to unload");
+            while ((::GetAsyncKeyState(VK_END) & 1) == 0) ::Sleep(50);
+            core::CloseLogFile();
+            CloseConsole();
+            ::FreeLibraryAndExitThread(g_self, 0);
+        }
     }
 
     // Confirm we are inside something Unreal-shaped, so a mis-injection is obvious now

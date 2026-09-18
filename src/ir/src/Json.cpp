@@ -186,6 +186,12 @@ void WriteProperty(Writer& writer, const Property& property) {
     if (property.flags     != defaults.flags)     { writer.Key("flags");     writer.UInt(property.flags); }
     WriteStringArray(writer, "flag_names", property.flag_names);
 
+    if (property.boxed_offset != defaults.boxed_offset) {
+        writer.Key("boxed_offset"); writer.Int(property.boxed_offset);
+    }
+    if (property.is_static)         { writer.Key("is_static");         writer.Bool(true); }
+    if (property.offset_unresolved) { writer.Key("offset_unresolved"); writer.Bool(true); }
+
     if (property.is_bitfield) {
         writer.Key("is_bitfield"); writer.Bool(true);
         writer.Key("byte_mask");   writer.Int(property.byte_mask);
@@ -228,6 +234,8 @@ void WriteFunction(Writer& writer, const Function& function) {
     if (function.native_rva != defaults.native_rva) {
         writer.Key("native_rva"); writer.Hex(function.native_rva);
     }
+    if (function.token != defaults.token) { writer.Key("token"); writer.UInt(function.token); }
+    if (function.shared_body) { writer.Key("shared_body"); writer.Bool(true); }
     if (!function.script.empty()) {
         writer.Key("script");
         writer.BeginArray();
@@ -255,6 +263,13 @@ void WriteStruct(Writer& writer, const Struct& record) {
     writer.Key("name"); writer.String(record.name);
     writer.Key("path"); writer.String(record.path);
     if (!record.super.empty()) { writer.Key("super"); writer.String(record.super); }
+    if (!record.name_space.empty()) { writer.Key("namespace"); writer.String(record.name_space); }
+    if (record.is_interface) { writer.Key("is_interface"); writer.Bool(true); }
+    if (record.is_abstract)  { writer.Key("is_abstract");  writer.Bool(true); }
+    if (record.is_valuetype) { writer.Key("is_valuetype"); writer.Bool(true); }
+    if (record.is_generic)   { writer.Key("is_generic");   writer.Bool(true); }
+    if (record.explicit_layout) { writer.Key("explicit_layout"); writer.Bool(true); }
+    if (record.token != defaults.token) { writer.Key("token"); writer.UInt(record.token); }
 
     if (record.size           != defaults.size)           { writer.Key("size");           writer.Int(record.size); }
     if (record.alignment      != defaults.alignment)      { writer.Key("alignment");      writer.Int(record.alignment); }
@@ -282,6 +297,20 @@ void WriteStruct(Writer& writer, const Struct& record) {
         for (const auto& function : record.functions) WriteFunction(writer, function);
         writer.EndArray();
     }
+    if (!record.accessors.empty()) {
+        writer.Key("accessors");
+        writer.BeginArray();
+        for (const auto& accessor : record.accessors) {
+            writer.BeginObject();
+            writer.Key("name"); writer.String(accessor.name);
+            writer.Key("type"); WriteTypeRef(writer, accessor.type);
+            if (!accessor.getter.empty()) { writer.Key("getter"); writer.String(accessor.getter); }
+            if (!accessor.setter.empty()) { writer.Key("setter"); writer.String(accessor.setter); }
+            if (accessor.flags != 0) { writer.Key("flags"); writer.UInt(accessor.flags); }
+            writer.EndObject();
+        }
+        writer.EndArray();
+    }
     writer.EndObject();
 }
 
@@ -294,6 +323,7 @@ void WriteEnum(Writer& writer, const Enum& record) {
         writer.Key("underlying"); writer.String(record.underlying);
     }
     if (record.is_flags) { writer.Key("is_flags"); writer.Bool(true); }
+    if (!record.values_resolved) { writer.Key("values_resolved"); writer.Bool(false); }
 
     if (!record.values.empty()) {
         writer.Key("values");
@@ -316,6 +346,9 @@ void WriteHeader(Writer& writer, const Header& header) {
     writer.BeginObject();
     if (!header.tool_version.empty()) { writer.Key("tool_version"); writer.String(header.tool_version); }
     if (!header.created_utc.empty())  { writer.Key("created_utc");  writer.String(header.created_utc); }
+    if (header.runtime != Header{}.runtime) {
+        writer.Key("runtime"); writer.String(header.runtime);
+    }
     if (header.partial) { writer.Key("partial"); writer.Bool(true); }
 
     writer.Key("source");
@@ -767,6 +800,9 @@ private:
         out.field_mask = static_cast<std::uint8_t>(field_mask);
 
         if (!ReadNumber(value, "bit_index", out.bit_index)) return false;
+        if (!ReadNumber(value, "boxed_offset", out.boxed_offset)) return false;
+        if (!ReadBool(value, "is_static", out.is_static)) return false;
+        if (!ReadBool(value, "offset_unresolved", out.offset_unresolved)) return false;
         if (!ReadString(value, "default", out.default_value)) return false;
         return true;
     }
@@ -801,6 +837,8 @@ private:
         }
 
         if (!ReadHex(value, "native_rva", out.native_rva)) return false;
+        if (!ReadNumber(value, "token", out.token)) return false;
+        if (!ReadBool(value, "shared_body", out.shared_body)) return false;
         if (!ReadNumber(value, "script_size",  out.script_size))  return false;
         if (!ReadBool(value, "script_complete", out.script_complete)) return false;
 
@@ -838,6 +876,13 @@ private:
         if (prefix.size() > 1) return Fail(value, "cpp_prefix must be a single character");
         if (!prefix.empty()) out.cpp_prefix = prefix[0];
 
+        if (!ReadString(value, "namespace", out.name_space)) return false;
+        if (!ReadBool(value, "is_interface", out.is_interface)) return false;
+        if (!ReadBool(value, "is_abstract",  out.is_abstract))  return false;
+        if (!ReadBool(value, "is_valuetype", out.is_valuetype)) return false;
+        if (!ReadBool(value, "is_generic",   out.is_generic))   return false;
+        if (!ReadBool(value, "explicit_layout", out.explicit_layout)) return false;
+        if (!ReadNumber(value, "token", out.token)) return false;
         if (!ReadStringArray(value, "interfaces", out.interfaces)) return false;
 
         if (const Value* properties = value.Find("properties")) {
@@ -858,6 +903,23 @@ private:
                 out.functions.push_back(std::move(function));
             }
         }
+        if (const Value* accessors = value.Find("accessors")) {
+            if (accessors->type != Value::Type::Array)
+                return Fail(*accessors, "accessors must be an array");
+            for (const auto& item : accessors->items) {
+                if (item.type != Value::Type::Object)
+                    return Fail(item, "accessor must be an object");
+                Accessor accessor;
+                if (!ReadString(item, "name", accessor.name)) return false;
+                if (const Value* type = item.Find("type")) {
+                    if (!ReadTypeRef(*type, accessor.type)) return false;
+                }
+                if (!ReadString(item, "getter", accessor.getter)) return false;
+                if (!ReadString(item, "setter", accessor.setter)) return false;
+                if (!ReadNumber(item, "flags", accessor.flags)) return false;
+                out.accessors.push_back(std::move(accessor));
+            }
+        }
         return true;
     }
 
@@ -868,6 +930,7 @@ private:
         if (!ReadString(value, "path",       out.path))       return false;
         if (!ReadString(value, "underlying", out.underlying)) return false;
         if (!ReadBool(value, "is_flags", out.is_flags)) return false;
+        if (!ReadBool(value, "values_resolved", out.values_resolved)) return false;
 
         if (const Value* values = value.Find("values")) {
             if (values->type != Value::Type::Array)
@@ -889,6 +952,7 @@ private:
 
         if (!ReadString(value, "tool_version", out.tool_version)) return false;
         if (!ReadString(value, "created_utc",  out.created_utc))  return false;
+        if (!ReadString(value, "runtime", out.runtime)) return false;
         if (!ReadBool(value, "partial", out.partial)) return false;
 
         if (const Value* source = value.Find("source")) {
@@ -1083,6 +1147,84 @@ JsonExpected<Dump> ReadJsonFile(std::string_view path) {
     std::ostringstream buffer;
     buffer << file.rdbuf();
     return ParseJson(buffer.str());
+}
+
+JsonExpected<Header> ReadJsonHeaderFile(std::string_view path) {
+    // A megabyte is far past any header this tool writes and still nothing next to the
+    // dumps it writes them into.
+    constexpr std::size_t kPrefix = 1024 * 1024;
+
+    std::ifstream file{std::string(path), std::ios::binary};
+    if (!file) return JsonError{"cannot open '" + std::string(path) + "'", 0};
+
+    std::string prefix(kPrefix, '\0');
+    file.read(prefix.data(), static_cast<std::streamsize>(kPrefix));
+    prefix.resize(static_cast<std::size_t>(file.gcount()));
+
+    // Find the top-level "header" key, tracking strings so the word inside an evidence
+    // line can't be mistaken for it.
+    std::size_t depth = 0, start = std::string::npos;
+    bool in_string = false, escaped = false;
+
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        const char c = prefix[i];
+        if (in_string) {
+            if (escaped)        escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"')  in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 && prefix.compare(i, 9, "\"header\":") == 0) {
+                const std::size_t brace = prefix.find('{', i + 9);
+                if (brace == std::string::npos) break;
+                start = brace;
+                break;
+            }
+            in_string = true;
+            continue;
+        }
+        if (c == '{' || c == '[') ++depth;
+        else if (c == '}' || c == ']') {
+            if (depth == 0) break;
+            --depth;
+        }
+    }
+
+    if (start == std::string::npos)
+        return JsonError{"no header in the first " + std::to_string(prefix.size()) +
+                         " bytes of '" + std::string(path) + "'", 0};
+
+    // Brace-match the header object itself, again respecting strings.
+    std::size_t nesting = 0, end = std::string::npos;
+    in_string = false;
+    escaped   = false;
+    for (std::size_t i = start; i < prefix.size(); ++i) {
+        const char c = prefix[i];
+        if (in_string) {
+            if (escaped)        escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"')  in_string = false;
+            continue;
+        }
+        if (c == '"') { in_string = true; continue; }
+        if (c == '{') ++nesting;
+        else if (c == '}' && --nesting == 0) { end = i + 1; break; }
+    }
+
+    if (end == std::string::npos)
+        return JsonError{"the header in '" + std::string(path) + "' is cut off", start};
+
+    // Wrap it in a minimal document and hand it to the real parser. One reader.
+    std::string document = "{\"schema_version\":";
+    document += std::to_string(kSchemaVersion);
+    document += ",\"header\":";
+    document.append(prefix, start, end - start);
+    document += ",\"packages\":[]}";
+
+    auto parsed = ParseJson(document);
+    if (!parsed) return parsed.error();
+    return parsed.value().header;
 }
 
 } // namespace zircon::ir

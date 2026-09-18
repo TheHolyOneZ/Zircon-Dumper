@@ -2,16 +2,19 @@
 
 # Zircon
 
-**Unreal Engine reflection extraction and analysis toolkit.**
+**Game engine reflection extraction and analysis toolkit.**
 
-Point it at a UE game — running, crashed, or just sitting on disk — and get back the
+Point it at an Unreal game — running, crashed, or just sitting on disk — and get back the
 engine's entire type system: every class, struct, enum, property offset, function
 signature and Blueprint script. Then turn that into a C++ SDK, a `.usmap`, types for IDA,
 Ghidra or Binary Ninja, Frida bindings, Python stubs, readable Blueprint logic, or a report
 on what a patch just broke.
 
-<sub>Sixteen games verified · UE 4.22 → 5.7 · both property systems · both name pools ·
-no engine-version table anywhere in the codebase</sub>
+Since 0.6.0 it does the same for **Unity IL2CPP** games: every C# type, field offset,
+method RVA and enum value, out of the running game.
+
+<sub>Sixteen Unreal games verified · UE 4.22 → 5.7 · both property systems · both name
+pools · plus Unity IL2CPP · <b>no engine-version table anywhere in the codebase</b></sub>
 
 <sub>Cross-checked against Dumper-7 on the same UE 5.6 game:
 <b>26,625 of 26,625 shared member offsets agree exactly</b>, with 48,535 data members
@@ -796,6 +799,119 @@ the one that's already there.
 `--no-wait` returns as soon as the upload lands rather than waiting for indexing to finish,
 and `--json` prints the result as JSON if you're scripting around it.
 
+## Unity games
+
+Zircon dumps Unity IL2CPP games as well as Unreal ones. Same commands, same dump format,
+same emitters — `fingerprint` tells you which kind of game you're looking at, and everything
+downstream reads the answer off the dump.
+
+```
+zircon fingerprint --pid 12345
+```
+
+```
+runtime           Unity IL2CPP
+module            GameAssembly.dll at 0x7ffc1fc60000
+api               39/39 entry points resolved
+confidence        98%
+evidence
+  - GameAssembly.dll exports 237 il2cpp_* entry points; 39 of 39 the walk needs resolved
+  - every entry point resolved by name, so no metadata version is involved
+```
+
+### Unity dumps need injection. Unreal ones don't.
+
+This is the one real difference, and it's worth understanding before you reach for it.
+
+An Unreal game keeps its type information in memory as data, so Zircon reads it from
+outside and never touches the game. A Unity game keeps it behind functions —
+`il2cpp_field_get_offset` is a *call*, and no amount of reading memory will make it run. So
+for Unity, Zircon has to be inside the process:
+
+```
+zircon inject --pid 12345
+```
+
+The payload walks the runtime and writes `zircon-out\json\<Game>.json` next to
+`zircon.dll`. Press END in the game to unload it.
+
+The browser will do it for you: open `zircon-gui.exe` with a Unity game running and it
+lists what it found with an **Inject and dump** button beside each one. It cannot browse a
+Unity game afterwards — that is the same wall — but the dump is the part you wanted.
+
+`zircon dump --pid` on a Unity game will tell you this rather than failing later with a
+message about Unreal:
+
+```
+[error] this is a Unity IL2CPP game (GameAssembly.dll), and its type information only
+        exists as answers the runtime gives to calls
+[error] run 'zircon inject --pid 12345' instead
+```
+
+Injection still refuses outright if anti-cheat is loaded, exactly as it does for Unreal.
+
+### What you get
+
+```
+dump: 81 assemblies, 42605 classes, 6967 structs, 1641 enums, 91698 fields,
+      491938 methods, 83564 properties
+365202 method bodies resolved, 298569 of them shared with another method
+39520 generic instantiations swept out of the class cache
+833 open generic definitions, whose field offsets are left unresolved
+```
+
+Assemblies become packages, C# types become classes and structs, and method bodies are
+recorded as RVAs from `GameAssembly.dll` — module-relative, so a dump still means something
+after the game restarts and can be diffed against the next build.
+
+**Struct offsets are the thing most Unity SDKs get wrong.** The runtime reports every field
+offset measured from the start of a *boxed* object, header included, for structs just as much
+as for classes. Unboxed, a struct's data starts at zero. So half the published SDKs are wrong
+by exactly one object header. Zircon asks the runtime how big that header is rather than
+assuming, records the field's real place in the type as `offset`, and keeps the raw number
+beside it as `boxed_offset`:
+
+```json
+{ "name": "z", "type": {"raw": "System.Single"}, "offset": 8, "boxed_offset": 24 }
+```
+
+`UnityEngine.Vector3` comes out as twelve bytes with x, y and z at 0, 4 and 8 — which is what
+it is.
+
+### What it refuses to answer
+
+A dump says so rather than filling a gap with something plausible:
+
+| | |
+|---|---|
+| open generics | `List<T>` has no layout to have offsets in. Its members carry `offset_unresolved`; its *instantiations*, swept out of the runtime's class cache, have real ones |
+| consts and thread-statics | no storage and no single offset respectively — both `offset_unresolved` |
+| enum values, on some builds | the members keep their names and the enum carries `values_resolved: false`. Numbering them by position would look right and be wrong for every enum that assigns its own values |
+| shared method bodies | a never-referenced method is compiled to a shared stub, and identical bodies are folded by the linker, so N methods really do live at one address. Flagged `shared_body`, never claimed unique |
+
+If a build won't let Zircon read a const at all, put an empty file named
+`zircon-il2cpp-no-consts` next to `zircon.dll` and it won't try.
+
+### Unity dumps publish to Zdex like any other
+
+```
+zircon publish zircon-out\json\Cave_Crawlers.json --game "Cave Crawlers" --label "0.90.10 Steam"
+```
+
+Zdex reads `runtime` off the dump and lists it as a Unity IL2CPP build: same browsing,
+search and build-to-build diff as an Unreal dump, with C# type names and the assembly-
+qualified paths. It does not offer a `.usmap` or a C++ SDK for one, because neither exists
+for Unity, and says so instead of showing a broken button.
+
+Size is not a concern: a 42,000-class Unity dump is ~590 MB as JSON and ~21 MB once
+`publish` has gzipped it, which it does on its own. Drag the raw `.json` onto the web upload
+form and it is over the limit; let `publish` send it and it is not.
+
+`docs/IL2CPP.md` has the design, what is derived and how, and which games it has been run
+against.
+
+---
+
 ## Injecting (and when you don't need to)
 
 **Most of the time you don't need to inject anything.** Dumping, SDK generation, the live
@@ -933,7 +1049,7 @@ found: the evidence being recorded does not on its own mean the pieces fit toget
 > with a known-correct value.* Internal consistency alone was wrong every single time it
 > was the only test.
 
-That was learned eight times, each time from real game data:
+That was learned nine times, each time from real game data:
 
 | What was selected instead of the real field | Why it scored perfectly |
 |---|---|
@@ -945,6 +1061,7 @@ That was learned eight times, each time from real game data:
 | a shared thunk pointer, as `UFunction::Func` | 100% "points into executable memory", beating the real field where some entries are null |
 | a target's class *name*, as the test for what it is | `"Class"` is right for every native class, and no Blueprint one — 532 properties on one game silently lost their type |
 | a field that is null everywhere, as `UField::Next` | chains "terminate and stay in the array" — one that links nothing terminates soonest, so it beats the real field |
+| an IL2CPP invoker thunk, as a method's compiled body | a code pointer sitting immediately beside the real one, passing every "does this point at a function" test perfectly |
 
 The corollary, applied throughout: **never emit plausible-but-wrong output.** An
 unresolvable type becomes an opaque byte array of the correct size; an unknown bytecode
@@ -1117,6 +1234,9 @@ src/core/      IMemorySource + 4 providers, PeImage, PatternScanner, page cache,
 src/engine/    EngineProfile, ObjectArray, NamePool, ObjectLayout, StructLayout,
                PropertyLayout, ClassLayout, TypeResolver, FunctionLayout, EnumLayout,
                Kismet, ValueReader, DumpBuilder, UnrealDetect
+src/il2cpp/    the Unity backend, beside src/engine/ and independent of it:
+               Runtime (module + C API discovery), Bridge (the callable surface),
+               MethodLayout (where a method body lives), Walker (runtime -> IR)
 src/ir/        Model.h (the contract), hand-rolled JSON, Lint (structural checks)
 src/emit/      one file per output format, plus shared Util
 src/plugin/    the host side of the C ABI: node tables, vtable, loader
@@ -1128,7 +1248,7 @@ src/app/       CLI shell
 src/dll/       injected payload — dumps, emits, then opens the browser in-process
 src/gui/       Browser (host-agnostic UI) + Host (window, device, frame loop)
 res/           the icon and the version resources
-docs/          SCOPE.md, ARCHITECTURE.md, PLUGINS.md,
+docs/          SCOPE.md, ARCHITECTURE.md, PLUGINS.md, IL2CPP.md (the Unity backend),
                UE-Test.md (version coverage), ENGINEERING-LOG.md
 ```
 
@@ -1330,6 +1450,7 @@ All phases P0–P7 complete, verified against seventeen live games from UE 4.22 
 | 0.3.0 | three more emitters, a dump linter, a reference index, multi-format emit |
 | 0.4.0 | publishing to Zdex from the CLI and the GUI, and a read cache that no longer serves yesterday's bytes |
 | 0.5.0 | licensee forks that extend `UObject` itself, and a truncation that made every dump quietly short |
+| 0.6.0 | **Unity IL2CPP** as a second runtime backend, sharing the IR and therefore every emitter |
 
 Measured on Funnel Runners (UE 5.6):
 
@@ -1376,10 +1497,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-A build reports its version as `0.5.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
+A build reports its version as `0.6.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
 that is the only difference between a local build and a released one.
 
-Eight test suites, 1794 checks, none of which need a game installed. They run against
+Nine test suites, 1947 checks, none of which need a game installed. They run against
 synthetic memory, hand-built bytecode and checked-in fixtures.
 
 > If Strawberry Perl or MinGW is on PATH, CMake may pick up its GCC. Pass the Visual

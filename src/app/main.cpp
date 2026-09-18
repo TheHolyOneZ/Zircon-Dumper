@@ -19,6 +19,7 @@
 #include "engine/ValueWriter.h"
 #include "engine/TypeResolver.h"
 #include "engine/UnrealDetect.h"
+#include "il2cpp/Runtime.h"
 #include "diff/Diff.h"
 #include "emit/Emitter.h"
 #include "ir/Json.h"
@@ -128,13 +129,15 @@ void PrintUsage() {
     const auto r = term::Reset();
 
     std::printf("%sZircon%s %s%s%s\n", b.data(), r.data(), d.data(), kVersion, r.data());
-    std::printf("Unreal Engine reflection extraction and analysis toolkit.\n\n");
+    std::printf("Game engine reflection extraction and analysis toolkit.\n");
+    std::printf("%sUnreal Engine, and Unity IL2CPP from inside the process.%s\n\n",
+                d.data(), r.data());
 
     std::printf("%sUsage%s  zircon <command> [target] [options]\n\n", b.data(), r.data());
 
     std::printf("%sInspect a target%s\n", b.data(), r.data());
     std::printf("  %sdetect%s        List running Unreal Engine processes\n", c.data(), r.data());
-    std::printf("  %sfingerprint%s   Identify the engine version and derived layout\n", c.data(), r.data());
+    std::printf("  %sfingerprint%s   Identify the runtime: UE version and layout, or Unity IL2CPP\n", c.data(), r.data());
     std::printf("  %smodules%s       List modules visible in the target\n", c.data(), r.data());
     std::printf("  %snames%s         Dump the FName pool\n", c.data(), r.data());
     std::printf("  %sobjects%s       List every UObject full name\n", c.data(), r.data());
@@ -158,7 +161,9 @@ void PrintUsage() {
 
     std::printf("%sWork live%s\n", b.data(), r.data());
     std::printf("  %sbrowse%s        Interactive object browser (zircon-gui.exe)\n", c.data(), r.data());
-    std::printf("  %sinject%s        Load the payload DLL into a running game\n\n", c.data(), r.data());
+    std::printf("  %sinject%s        Load the payload DLL into a running game\n", c.data(), r.data());
+    std::printf("                %sthe only way to dump Unity: its type data is behind calls%s\n\n",
+                d.data(), r.data());
 
     std::printf("%sShare it%s (Zdex, at zlogic.eu/zdex)\n", b.data(), r.data());
     std::printf("  %spublish%s       Upload a dump and print where it landed\n", c.data(), r.data());
@@ -375,6 +380,24 @@ int CommandFingerprint(const TargetSpec& spec) {
 
     auto mem = MakeCached(std::move(source.value()));
     LogInfo("target: {}", mem->Describe());
+
+    // Unity first. IL2CPP is a yes/no (a module exports the API or it doesn't), the Unreal
+    // fingerprint is a score that will happily guess low about a non-Unreal game.
+    if (const auto unity = zircon::il2cpp::FindRuntime(*mem)) {
+        FieldStrong("runtime", "Unity IL2CPP");
+        Field("module", "{} at {:#x}", unity->module_name, Raw(unity->module_base));
+        Field("api", "{}/{} entry points resolved", unity->api.resolved,
+              unity->api.resolved + static_cast<int>(unity->api.missing.size()));
+        Field("confidence", "{:.0f}%", unity->confidence * 100.0);
+        Evidence(unity->evidence);
+
+        if (!unity->api.Complete()) {
+            LogWarn("this build does not export everything the walk needs; "
+                    "a dump would be incomplete");
+            return 3;
+        }
+        return 0;
+    }
 
     const auto profile = zircon::engine::FingerprintEngine(*mem);
 
@@ -1412,6 +1435,22 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
     auto memory = MakeCached(std::move(source.value()));
     LogInfo("target: {}", memory->Describe());
 
+    // Unity first, and only to refuse. IL2CPP answers come from calling into the runtime,
+    // which we can't do from out here. Say so now rather than fail later with an Unreal
+    // reflection message that sends someone looking in the wrong place.
+    if (const auto unity = zircon::il2cpp::FindRuntime(*memory)) {
+        LogError("this is a Unity IL2CPP game ({}), and its type information only exists "
+                 "as answers the runtime gives to calls", unity->module_name);
+        const std::string how = spec.kind == TargetSpec::Kind::Pid
+                                    ? std::format("--pid {}", spec.pid)
+                                    : std::format("--process {}", spec.value);
+        LogError("run 'zircon inject {}' instead; the payload walks it from inside and "
+                 "writes the dump next to the DLL", how);
+        Field("api", "{}/{} entry points resolved", unity->api.resolved,
+              zircon::il2cpp::RequiredEntryPointCount());
+        return 2;
+    }
+
     const auto reflection = zircon::engine::Reflect(*memory);
     if (!reflection.Valid()) {
         LogError("reflection is incomplete; cannot produce a dump");
@@ -1445,6 +1484,20 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
     // Whether or not they publish now, the next step belongs in front of them while
     // they are still looking at the file they just made.
     const auto suggest_publish = [&]() -> int {
+        // Asked of the dump in hand, not the file just written.
+        if (const auto refusal = zircon::app::PublishRefusal(dump.header.runtime);
+            !refusal.empty()) {
+            if (publish.requested) {
+                LogError("{}", refusal);
+                return 2;
+            }
+            // No hint either -- pointing at a command that will refuse is worse than nothing,
+            // and nothing looks like an oversight.
+            std::printf("\n");
+            LogInfo("not publishable: {}", refusal);
+            return 0;
+        }
+
         const std::string game = publish.game.empty()
             ? zircon::app::GameNameFromProcess(dump.header.source.process)
             : publish.game;

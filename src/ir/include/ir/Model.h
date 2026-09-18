@@ -15,7 +15,7 @@
 
 namespace zircon::ir {
 
-inline constexpr int kSchemaVersion = 1;
+inline constexpr int kSchemaVersion = 2;
 
 // ---------------------------------------------------------------------------------
 // Types
@@ -97,8 +97,26 @@ struct Property {
     std::int32_t offset{0};
     std::int32_t size{0};          // total bytes occupied: element size * array_dim
     std::int32_t array_dim{1};
-    std::uint64_t flags{0};        // EPropertyFlags, verbatim
+    std::uint64_t flags{0};        // EPropertyFlags, or FieldAttributes, verbatim
     std::vector<std::string> flag_names;
+
+    // IL2CPP only. What the runtime reported for this field, measured from the start of a
+    // *boxed* object -- header included, for structs as well as classes. Unboxed, a struct
+    // starts at 0, so a layout built from this alone is off by one header. Most published
+    // Unity SDKs get this wrong.
+    //
+    // `offset` is the field's place measured the same way the type's `size` is, so the two
+    // compare. This is the raw number kept next to it. -1 when they're the same thing
+    // (reference types, every Unreal dump).
+    std::int32_t  boxed_offset{-1};
+
+    // Static: storage per type, not per instance. `offset` is into a different block and
+    // doesn't belong in the instance layout.
+    bool          is_static{false};
+
+    // Offset unknown and nothing put in its place. The open-generic case: asking for a field
+    // offset on List<T> returns a number, and the number means nothing.
+    bool          offset_unresolved{false};
 
     // Bitfields. A BoolProperty that is a real bool has no mask; one packed into a byte
     // carries the mask the engine uses, which emitters need to reproduce the layout.
@@ -161,6 +179,14 @@ struct Function {
     // kind of plausible-but-unverified guess this tool refuses to emit. Struct::vtable_rva
     // gives the table itself, which is what the question is usually really asking.
 
+    // Metadata token. What disassembler scripts and C# decompilers key on. 0 when absent.
+    std::uint32_t token{0};
+
+    // More than one method lives at native_rva. Unreferenced methods get a shared stub and
+    // the linker folds identical bodies, so "this address is this method" is sometimes
+    // false. Counted from the finished dump, not assumed.
+    bool          shared_body{false};
+
     std::int32_t  script_size{0};      // bytes of Kismet bytecode
 
     // Decompiled statements. Empty unless the dump was taken with script decompilation
@@ -172,6 +198,20 @@ struct Function {
     bool script_complete{true};
 
     bool operator==(const Function&) const = default;
+};
+
+// A C# property: name, type, and the methods behind it. Unreal has no equivalent (a
+// UProperty is a field, which is what ir::Property means here), so empty on Unreal dumps.
+// Rebuilt from get_/set_ because a stub assembly that declares those as methods won't
+// compile against code written for the real thing.
+struct Accessor {
+    std::string name;
+    TypeRef     type;
+    std::string getter;         // method name, empty when the property is write-only
+    std::string setter;         // empty when it is read-only
+    std::uint32_t flags{0};
+
+    bool operator==(const Accessor&) const = default;
 };
 
 // ---------------------------------------------------------------------------------
@@ -190,6 +230,11 @@ struct Enum {
     std::string  path;
     std::string  underlying{"uint8"};
     bool         is_flags{false};
+
+    // False when members were recovered but values weren't. The IL2CPP API can't always
+    // read a const; names are certain, numbers may be absent. Better than invented ones.
+    bool         values_resolved{true};
+
     std::vector<EnumValue> values;
 
     bool operator==(const Enum&) const = default;
@@ -202,6 +247,26 @@ struct Struct {
     std::string  path;             // "/Script/Engine.Actor"
     std::string  super;            // path of the base, empty at the root
     bool         is_class{false};
+
+    // C# namespace. Kept apart from `path` because splitting "UnityEngine.UI.Button" back
+    // apart at the dots is guesswork. Empty on Unreal dumps.
+    std::string  name_space;
+
+    // What the runtime says the type is. All false on Unreal, where is_class is the whole
+    // distinction. C# has more shapes than two.
+    bool         is_interface{false};
+    bool         is_abstract{false};
+    bool         is_valuetype{false};
+
+    // Open generic definition, List`1 not List<int>. No real offsets; members carry
+    // offset_unresolved.
+    bool         is_generic{false};
+
+    // [StructLayout(LayoutKind.Explicit)]. The type placed its own fields, so members may
+    // overlap and the layout checks that would call that a contradiction don't apply.
+    bool         explicit_layout{false};
+
+    std::uint32_t token{0};        // metadata token, 0 when the source has none
 
     std::int32_t size{0};
     std::int32_t alignment{0};
@@ -225,6 +290,7 @@ struct Struct {
     std::vector<std::string> interfaces;
     std::vector<Property>    properties;   // declared here only, never inherited
     std::vector<Function>    functions;
+    std::vector<Accessor>    accessors;    // C# properties; empty on Unreal dumps
 
     // There is deliberately no address for the class default object here. A CDO is
     // heap-allocated by the class constructor at runtime, so it has no module-relative
@@ -280,6 +346,10 @@ struct SourceInfo {
 struct Header {
     std::string   tool_version;
     std::string   created_utc;
+
+    // "unreal" or "il2cpp". Small field, load-bearing -- publish gates on it, Zdex reads it
+    // to decide how to render. Gated on what the dump says, never the filename.
+    std::string   runtime{"unreal"};
 
     // True when the source could not supply everything, e.g. a static PE with no live
     // objects. Emitters that need object data refuse a partial dump instead of

@@ -1,8 +1,11 @@
 #include "Browser.h"
 
 #include "Host.h"
+#include "core/Injector.h"
+#include "core/ProcessList.h"
 #include "core/Log.h"
 #include "emit/Emitter.h"
+#include "il2cpp/Runtime.h"
 #include "engine/Kismet.h"
 #include "engine/ValueReader.h"
 #include "engine/ValueWriter.h"
@@ -66,14 +69,25 @@ struct MonoScope {
 // A folder beside whichever binary is hosting the browser. Never beside the game: those
 // directories are routinely read-only, and a write that fails quietly is worse than one
 // that fails loudly.
-std::string DefaultOutputDirectory() {
-    wchar_t buffer[MAX_PATH * 2] = {};
-    if (::GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer))) == 0)
-        return "zircon-out";
+// Folder of the module this code lives in, not the process exe. Standalone they're the same
+// file; injected, the exe is the game and this code is in zircon.dll, next to which the
+// payload writes its dump. A null handle sent the publish panel to the game's folder and it
+// opened blank.
+std::filesystem::path ThisModuleDirectory() {
+    HMODULE self = nullptr;
+    ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(&ThisModuleDirectory), &self);
 
-    std::error_code ec;
-    const auto directory = std::filesystem::path(buffer).parent_path() / "zircon-out";
-    return directory.string();
+    wchar_t buffer[MAX_PATH * 2] = {};
+    if (::GetModuleFileNameW(self, buffer, static_cast<DWORD>(std::size(buffer))) == 0)
+        return {};
+    return std::filesystem::path(buffer).parent_path();
+}
+
+std::string DefaultOutputDirectory() {
+    const auto here = ThisModuleDirectory();
+    return (here.empty() ? std::filesystem::path("zircon-out") : here / "zircon-out").string();
 }
 
 // The executable's own name. A pid identifies the process to the machine, not to whoever
@@ -187,6 +201,117 @@ void Browser::Draw() {
     ImGui::End();
 }
 
+// "No Unreal Engine processes detected" in front of someone running a Unity game is true
+// and answers the wrong question.
+// Where zircon.dll sits: beside this code, which is next to zircon-gui.exe in a release and
+// in a build tree alike, and is the DLL itself when this code is running injected.
+std::string Browser::PayloadPath() {
+    const auto here = ThisModuleDirectory();
+    return here.empty() ? std::string{} : (here / "zircon.dll").string();
+}
+
+void Browser::DrawUnityNotice() {
+    if (unity_candidates_.empty()) return;
+
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.89f, 0.90f, 0.93f, 1.0f));
+    ImGui::TextUnformatted("Unity IL2CPP games");
+    ImGui::PopStyleColor();
+    ImGui::TextDisabled("A Unity game keeps its type information behind functions rather than "
+                        "in memory, so it cannot be browsed from out here. Dumping it means "
+                        "loading the payload into it, which is what this does.");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    const std::string payload = PayloadPath();
+    std::error_code ec;
+    const bool have_payload = !payload.empty() && std::filesystem::exists(payload, ec);
+
+    if (ImGui::BeginTable("unity", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("PID",     ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableHeadersRow();
+
+        for (const auto& process : unity_candidates_) {
+            ImGui::TableNextRow();
+            ImGui::PushID(static_cast<int>(process.pid));
+
+            ImGui::TableNextColumn();
+            { MonoScope mono; ImGui::TextDisabled("%u", process.pid); }
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(process.name.c_str());
+            ImGui::TableNextColumn();
+
+            ImGui::BeginDisabled(!have_payload);
+            if (ImGui::Button("Inject and dump", ImVec2(-FLT_MIN, 0.0f))) {
+                if (const auto result = core::Inject(process.pid, payload)) {
+                    unity_status_ = "payload loaded into pid " + std::to_string(process.pid) +
+                                    "; it writes the dump beside zircon.dll and opens a "
+                                    "console showing the walk";
+                    unity_status_ok_ = true;
+                } else {
+                    unity_status_ = result.error().message;
+                    unity_status_ok_ = false;
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    if (!have_payload) {
+        ImGui::TextColored(ImVec4(0.90f, 0.55f, 0.45f, 1.0f),
+                           "zircon.dll is not next to this executable, so there is nothing "
+                           "to inject.");
+    } else if (!unity_status_.empty()) {
+        const ImVec4 colour = unity_status_ok_ ? ImVec4(0.45f, 0.80f, 0.45f, 1.0f)
+                                               : ImVec4(0.90f, 0.55f, 0.45f, 1.0f);
+        ImGui::TextColored(colour, "%s", unity_status_.c_str());
+    }
+
+    ImGui::TextDisabled("Injection is refused outright if the target has anti-cheat loaded. "
+                        "The dump publishes to Zdex like any other: 'zircon publish' on the "
+                        "json it wrote.");
+}
+
+// Unity games the picker should mention but can't browse.
+//
+// Found by looking for GameAssembly.dll beside the exe, not by reading the process -- this
+// runs while the picker is on screen and opening every process on the machine for a
+// question nobody asked yet isn't worth it. A hint; what a target actually is still comes
+// from its export table.
+std::vector<core::ProcessInfo> Browser::DetectUnityProcesses() {
+    std::vector<core::ProcessInfo> found;
+    std::error_code ec;
+
+    // Unity's crash handler sits beside the game and passes the folder test. Named rather
+    // than inferred; nothing about the process distinguishes it.
+    const auto is_unity_helper = [](std::string_view name) {
+        return name == "UnityCrashHandler64.exe" || name == "UnityCrashHandler32.exe";
+    };
+
+    for (auto& process : core::EnumerateProcesses()) {
+        if (process.path.empty()) continue;   // no access to look, so no claim either way
+        if (is_unity_helper(process.name)) continue;
+
+        const auto folder = std::filesystem::path(process.path).parent_path();
+        for (const char* runtime : {"GameAssembly.dll", "UnityPlayer.dll"}) {
+            if (!std::filesystem::exists(folder / runtime, ec)) continue;
+            if (std::string(runtime) == "UnityPlayer.dll" &&
+                !std::filesystem::exists(folder / "GameAssembly.dll", ec))
+                break;                        // Unity, but the Mono backend
+            found.push_back(std::move(process));
+            break;
+        }
+    }
+    return found;
+}
+
 void Browser::DrawAttachPanel() {
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.89f, 0.90f, 0.93f, 1.0f));
@@ -201,12 +326,17 @@ void Browser::DrawAttachPanel() {
     const double now = ImGui::GetTime();
     if (candidates_refreshed_at_ < 0.0 || now - candidates_refreshed_at_ > 2.0) {
         candidates_ = engine::DetectUnrealProcesses(0.2f);
+        unity_candidates_ = DetectUnityProcesses();
         candidates_refreshed_at_ = now;
     }
 
     if (candidates_.empty()) {
         ImGui::TextDisabled("No Unreal Engine processes detected. Start a game.");
-    } else if (ImGui::BeginTable("procs", 5,
+        DrawUnityNotice();
+        return;
+    }
+
+    if (ImGui::BeginTable("procs", 5,
                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                                  ImGuiTableFlags_SizingFixedFit)) {
         ImGui::TableSetupColumn("Score",   ImGuiTableColumnFlags_WidthFixed, 60.0f);
@@ -1187,6 +1317,21 @@ void Browser::Attach(std::uint32_t pid) {
     }
 
     memory_ = core::MakeCached(std::move(source.value()));
+
+    // Unity before Unreal, and only to say so. We attach from outside and IL2CPP answers
+    // come from calling in, so the message is what to run instead, not a reflection error
+    // that points the wrong way.
+    if (const auto unity = il2cpp::FindRuntime(*memory_)) {
+        attach_error_ = "this is a Unity IL2CPP game (" + unity->module_name +
+                        "). Its type information only exists as answers the runtime gives to "
+                        "calls, which cannot be made from out here -- run 'zircon inject "
+                        "--pid " + std::to_string(pid) + "' and the payload will dump it from "
+                        "inside.";
+        memory_.reset();
+        status_.clear();
+        return;
+    }
+
     reflection_ = engine::Reflect(*memory_);
 
     if (!reflection_.Valid()) {

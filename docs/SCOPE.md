@@ -2,10 +2,13 @@
 
 ## What it is
 
-A reflection extraction and analysis toolkit for Unreal Engine games. It reads a UE
-process (or a dump, or a binary on disk), reconstructs the engine's reflection data
-into a versioned intermediate representation, and emits that IR into as many useful
-formats as it can.
+A reflection extraction and analysis toolkit for game engines. It reads a running game
+(or a dump, or a binary on disk), reconstructs the engine's reflection data into a versioned
+intermediate representation, and emits that IR into as many useful formats as it can.
+
+Unreal came first and is the deeper of the two. Since 0.6.0 there is a second backend for
+Unity IL2CPP, which produces the same IR and therefore reaches the same emitters. The two
+share `core/` and `ir/` and nothing else.
 
 It is not "a better Dumper-7". Dumper-7 is one feature of this tool (the C++ SDK
 emitter), reached through a pipeline that also produces diffs, disassembler types,
@@ -16,7 +19,8 @@ mappings, decompiled script bytecode, and a live inspector.
 | Decision | Choice |
 |---|---|
 | Memory access | `IMemorySource` abstraction, four providers shipped up front |
-| Engine coverage | UE4.20 → UE5.5, runtime fingerprint + offset auto-derivation |
+| Engine coverage | UE4.20 → UE5.7, runtime fingerprint + offset auto-derivation |
+| Second runtime | Unity IL2CPP, via the exported embedding API rather than metadata parsing |
 | Output strategy | Reflection → IR → N emitters; IR is the contract |
 | Language / toolchain | C++20, MSVC (VS2022), CMake + Ninja, x64 Windows first |
 | Auditing | every derivation reports evidence; the finished dump is lint-checkable |
@@ -86,6 +90,7 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
 | Reverse reference index over the type system | no | ⭐ 0.3.0, `xref` |
 | Live interactive object browser | no | ⭐ |
 | Plugin API for custom emitters | no | ⭐ |
+| Publishing dumps to a shared index | no | ⭐ 0.4.0, `publish` → Zdex, opt-in |
 | Non-Windows hosts | no | ➖ not in v1 |
 | Anti-cheat evasion | no | ➖ explicitly excluded |
 | Editing live property values | yes | ✅ 0.2.0, opt-in |

@@ -10,15 +10,26 @@ How the code is laid out and why. For what the tool does, see the README.
                  +---------- emit/  +  diff/ -----------------+
                                 \      /
                                   ir/                <- pure data, links nothing
-                                   ^
-                              engine/                <- Unreal reflection
-                                   ^
+                                 ^    ^
+                        engine/       il2cpp/        <- two runtimes, side by side
+                                 ^    ^
                                 core/                <- memory, PE, patterns
 ```
 
-Arrows point one way. `core/` knows nothing about Unreal. `engine/` knows nothing about
-output formats. `ir/` knows nothing about anything. `emit/` and `diff/` see the IR and
-never touch a process.
+Arrows point one way. `core/` knows nothing about any engine. `engine/` and `il2cpp/` know
+nothing about output formats, and nothing about each other. `ir/` knows nothing about
+anything. `emit/` and `diff/` see the IR and never touch a process.
+
+`il2cpp/` sits *beside* `engine/` rather than under it, because a Unity game and an Unreal
+game have nothing in common until they reach the IR. Sharing the IR is what makes a second
+backend worth having at all: every emitter, the linter, the diff and the browser work on a
+Unity dump the day the walk starts filling one in, with no changes.
+
+The one asymmetry: `engine/` reads memory and never touches the target, while `il2cpp/` must
+*call* into it — `il2cpp_field_get_offset` is a function, and reading memory will not make it
+run. So the Unity path injects where the Unreal path never has to. `il2cpp/Bridge.h` is an
+interface rather than a direct set of calls for that reason: it is the seam a minidump reader
+and an external no-inject reader slot into later.
 
 This is enforced by the CMake targets rather than by convention: `zircon_ir` links
 nothing at all, and `zircon_emit` and `zircon_diff` link only `zircon_ir`. Violating the

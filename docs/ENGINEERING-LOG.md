@@ -1064,3 +1064,90 @@ the time. Waiting for 100% changed nothing: identical failure, identical offsets
 
 The useful part is that the screenshot caught it. A run that *looks* controlled and is not is
 how a wrong conclusion gets published, and nothing in the log would have said so.
+
+---
+
+## 0.6.0 — a second runtime, and three lessons that generalise
+
+Unity IL2CPP support lives in `src/il2cpp/` and is documented in `docs/IL2CPP.md`. What
+belongs here is the part that is not about Unity at all.
+
+### The ninth time a wrong answer scored perfectly
+
+`MethodInfo` holds two or three code pointers, and exactly one of them is the method's
+compiled body. The others are the invoker thunk and, since Unity 2021.2, a second body
+pointer for value-type adjustors.
+
+The invoker is the best decoy this project has produced. It sits immediately beside the real
+field. It points into executable memory 100% of the time. It appears in the exception
+directory. Every test of the form "does this look like a pointer to code" it passes perfectly,
+because it *is* a pointer to code.
+
+What separates it is not a property of pointers but a property of invokers: **one thunk serves
+every method of a given signature shape.** So it repeats across a sample where a body does
+not, and it stays constant inside one argument shape where a body varies. That is the positive
+distinguishing property, and the exception directory — written by the linker from a source the
+runtime knows nothing about — is the independent anchor.
+
+Both are expressed as comparisons between two measured numbers rather than as thresholds
+either has to clear, which matters: the absolute figures move with how varied the sample is,
+and the ordering does not.
+
+### A threshold that was wrong in kind, not in value
+
+The first version gated a slot on "at least 90% of its values are function entry points in the
+exception directory". On the first real game that rejected all three code slots.
+
+The instinct is to lower the number. The number was not the problem. A leaf function — no
+frame, no calls, nothing to unwind — is entitled to have no `.pdata` entry at all, and IL2CPP
+emits enormous numbers of one-line accessors that are exactly that. Measured, code slots score
+between 20% and 80%, and the 20% is the invoker slot, which is almost entirely leaves.
+
+The check was asking the wrong question. "Is this a function entry point" is a fine
+corroboration and a bad gate; "does this land in an executable section" is the gate, because a
+pointer into the metadata blob fails it outright and a code pointer passes it always.
+
+The general form: **when a constraint rejects everything, ask what it is actually measuring
+before adjusting what it accepts.**
+
+### A guard that was worse than the fault it caught
+
+Reading a C# const meant calling into the runtime, and a const has no storage of its own, so
+the call might walk off the end of something. The obvious defence is `__try`/`__except`.
+
+It is not a defence. The runtime takes a lock on the way in, and unwinding out of the middle
+of it leaves that lock held. The process does not die at the fault — it dies a little later,
+somewhere unrelated, with nothing in the log connecting the two. That is strictly worse than
+the crash, because the crash at least says where it was.
+
+**A structured-exception guard around a call into someone else's runtime is not a safety net.**
+It is safe around a copy that holds no locks, which is exactly where `InternalMemorySource`
+already uses one. So the read goes through the memory provider with its bounds checked first,
+and the runtime is asked only where it cannot — unguarded, honestly, with a switch to turn it
+off for a build that does not survive it.
+
+The postscript is worth having too: this guard was removed on the theory that it was crashing
+Road 96, and it was not. The theory was tested — the target dies with const reading switched
+off entirely — and the real cause turned out to be three separate things, none of them this.
+Removing it was still right. A hypothesis being wrong does not make the code it condemned
+correct.
+
+### The linter earning its keep twice in one afternoon
+
+`validate --strict` over the first Unity dump reported 34,315 errors.
+
+Ten thousand of them were the linter's own fault: it was applying instance-layout rules to
+static fields, which live in a different block entirely, and to members whose offset is
+explicitly marked unresolved. It also treated two members at one offset as a contradiction,
+which it is, unless the type declared an explicit layout — which is how C# writes a union.
+
+The rest were real, and one of them was the good one: **`Vector3.z` runs past the end of
+`Vector3`.** The type's size had been recorded unboxed, because that is what a struct
+declaration is, while its field offsets were recorded boxed, because that is what the runtime
+reports. Both numbers were right and they were measured from different origins, so nothing in
+the record could be compared with anything else in it.
+
+Nothing in the walk could have found that. Only reading the finished output back and checking
+it against itself could, which is the whole argument for having the linter at all.
+
+Zero errors now, on a 49,572-type dump.

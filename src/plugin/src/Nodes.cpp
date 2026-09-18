@@ -83,6 +83,7 @@ const Field kHeader[] = {
     ZN_NODE("engine",       Header, ZN_KIND_ENGINE, v.engine),
     ZN_LIST("offsets",      Header, ZN_KIND_OFFSET, offsets),
     ZN_STRS("globals",      Header, globals),
+    ZN_STR ("runtime",      Header, v.runtime),
 };
 
 const Field kSource[] = {
@@ -119,7 +120,14 @@ const Field kStruct[] = {
     ZN_STR ("name",           Struct, v.name),
     ZN_STR ("path",           Struct, v.path),
     ZN_STR ("super",          Struct, v.super),
+    ZN_STR ("namespace",      Struct, v.name_space),
     ZN_BOOL("is_class",       Struct, v.is_class),
+    ZN_BOOL("is_interface",   Struct, v.is_interface),
+    ZN_BOOL("is_abstract",    Struct, v.is_abstract),
+    ZN_BOOL("is_valuetype",   Struct, v.is_valuetype),
+    ZN_BOOL("is_generic",     Struct, v.is_generic),
+    ZN_BOOL("explicit_layout", Struct, v.explicit_layout),
+    ZN_NUM ("token",          Struct, v.token),
     ZN_NUM ("size",           Struct, v.size),
     ZN_NUM ("alignment",      Struct, v.alignment),
     ZN_NUM ("inherited_size", Struct, v.inherited_size),
@@ -128,6 +136,7 @@ const Field kStruct[] = {
     ZN_STRS("interfaces",     Struct, interfaces),
     ZN_LIST("properties",     Struct, ZN_KIND_PROPERTY, properties),
     ZN_LIST("functions",      Struct, ZN_KIND_FUNCTION, functions),
+    ZN_LIST("accessors",      Struct, ZN_KIND_ACCESSOR, accessors),
 };
 
 const Field kEnum[] = {
@@ -135,6 +144,7 @@ const Field kEnum[] = {
     ZN_STR ("path",       Enum, v.path),
     ZN_STR ("underlying", Enum, v.underlying),
     ZN_BOOL("is_flags",   Enum, v.is_flags),
+    ZN_BOOL("values_resolved", Enum, v.values_resolved),
     ZN_LIST("values",     Enum, ZN_KIND_ENUM_VALUE, values),
 };
 
@@ -155,6 +165,9 @@ const Field kProperty[] = {
     ZN_NUM ("byte_mask",   Property, v.byte_mask),
     ZN_NUM ("field_mask",  Property, v.field_mask),
     ZN_NUM ("bit_index",   Property, v.bit_index),
+    ZN_NUM ("boxed_offset",      Property, v.boxed_offset),
+    ZN_BOOL("is_static",         Property, v.is_static),
+    ZN_BOOL("offset_unresolved", Property, v.offset_unresolved),
     ZN_STR ("default",     Property, v.default_value),
 };
 
@@ -164,6 +177,8 @@ const Field kFunction[] = {
     ZN_STRS("flag_names",      Function, flag_names),
     ZN_LIST("params",          Function, ZN_KIND_PARAM, params),
     ZN_NUM ("native_rva",      Function, v.native_rva),
+    ZN_NUM ("token",           Function, v.token),
+    ZN_BOOL("shared_body",     Function, v.shared_body),
     ZN_NUM ("script_size",     Function, v.script_size),
     ZN_LIST("script",          Function, ZN_KIND_STATEMENT, script),
     ZN_BOOL("script_complete", Function, v.script_complete),
@@ -194,6 +209,14 @@ const Field kType[] = {
     ZN_STR ("raw",    TypeRef, v.raw),
     ZN_NUM ("size",   TypeRef, v.size),
     ZN_LIST("params", TypeRef, ZN_KIND_TYPE, params),
+};
+
+const Field kAccessor[] = {
+    ZN_STR ("name",   Accessor, v.name),
+    ZN_NODE("type",   Accessor, ZN_KIND_TYPE, v.type),
+    ZN_STR ("getter", Accessor, v.getter),
+    ZN_STR ("setter", Accessor, v.setter),
+    ZN_NUM ("flags",  Accessor, v.flags),
 };
 
 const Field kOptions[] = {
@@ -240,9 +263,10 @@ const Table kTables[] = {
     Make("statement",  kStatement),
     Make("type",       kType),
     Make("options",    kOptions),
+    Make("accessor",   kAccessor),
 };
 
-static_assert(std::size(kTables) == ZN_KIND_OPTIONS + 1,
+static_assert(std::size(kTables) == ZN_KIND_ACCESSOR + 1,
               "every ZnKind needs a table, or kind_name indexes out of range");
 
 const Table* TableFor(std::uint32_t kind) {

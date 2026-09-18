@@ -2,6 +2,241 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.6.0 — 2026-09-18
+
+### Unity
+
+Zircon dumps Unity IL2CPP games now, as a second runtime backend beside the Unreal one.
+Neither knows the other exists; they meet at the IR, which means every emitter, the linter,
+the diff and the browser work on a Unity dump the day it lands.
+
+**The reason this is worth doing at all.** Every IL2CPP dumper in existence parses
+`global-metadata.dat` and the registration structs in the binary. Both change shape between
+metadata versions — 16, 19 through 24.5, 27.x, 29.x, 31.x — so those tools carry a table of
+struct layouts per version, break on each Unity release until somebody hand-adds the new one,
+and are stopped outright by a game that encrypts its metadata.
+
+None of that is necessary against a running game. `GameAssembly.dll` exports the IL2CPP
+embedding C API by name, and that API is a public contract Unity has kept stable since 5.x.
+So don't parse the metadata, *ask the runtime*. There is no version knowledge anywhere in
+`src/il2cpp/`, and encryption stops mattering entirely: by the time the process is running,
+the runtime has already decrypted it.
+
+It is the same refusal that defines the Unreal side, and it lands harder here.
+
+```
+zircon fingerprint --pid 12980       says Unity IL2CPP, 39/39 entry points, 98%
+zircon inject --pid 12980            the payload walks it and writes the dump
+```
+
+Measured across ten installed games, oldest to newest: 232 to 241 `il2cpp_*` exports each,
+and every one of the 39 the walk needs present on all ten. The 35 optional ones — the object
+header size, the enum base type, the class token, the static field block — were present on
+all ten as well, and are still treated as optional, because the moment one of them is
+required a stripped build that the walk could have handled gets refused for the sake of a
+nicety.
+
+### Where a method's code lives, without being told
+
+The API answers almost everything about a method. It does not answer where the compiled body
+is: there is no `il2cpp_method_get_pointer`, and the body is the single most valuable thing
+in an IL2CPP dump. It has to come out of `MethodInfo`, whose layout moves — 2021.2 inserted a
+second code pointer, and fields have been appended repeatedly.
+
+So it is derived, from the process, the same way everything in `src/engine/` is:
+
+- `name`, `klass` and `return_type` by **exact pointer match** — the API hands back the very
+  pointer the struct holds, so the slot holding it is not a guess
+- the metadata token by exact 32-bit match, confirming the block really is a `MethodInfo`
+- every code pointer sits **below** `name`, which is not a fact about any particular Unity
+  release: the struct has only ever grown by appending
+
+That leaves two or three code pointers and the question of which one is the body. The wrong
+answer is extremely attractive here — the invoker thunk is a code pointer sitting immediately
+beside the body, and it passes every "does this look like code" test perfectly. It is told
+apart by what an invoker *is*: one thunk serves every method of a given signature shape, so
+across a sample it repeats far more than a body does and barely varies inside one argument
+shape. Stated as a comparison between two measured numbers rather than a threshold either has
+to clear, because the absolute figures move with the sample and the ordering does not.
+
+Then it is checked against the exception directory, which the linker writes from a completely
+different source than anything the runtime knows, and the answer is refused outright if the
+two disagree.
+
+On the corpus it derives two different layouts with no version knowledge whatsoever:
+
+```
+Cave Crawlers   body 0x0   invoker 0x10   name 0x18      three code pointers
+Schedule I      body 0x0   invoker 0x10   name 0x18
+Road 96         body 0x0   invoker 0x8    name 0x10      two — an older Unity
+```
+
+### The `.pdata` threshold that was wrong in kind
+
+First attempt gated a slot on "at least 90% of its values are function entry points in the
+exception directory". On the first real game that rejected all three code slots and the dump
+came out with no RVAs at all — correctly, since it refused rather than guessing, but for a
+bad reason.
+
+A leaf function is entitled to have no unwind data, and IL2CPP emits an enormous number of
+one-line accessors that are exactly that. Real coverage is 71–80% for bodies and as low as
+**20%** for invokers, which are almost all leaves. The threshold was not mistuned; it was
+measuring the wrong thing. The gate now asks whether the value lands in an executable
+section, where a pointer into the metadata scores zero and a code pointer scores everything,
+and the exception directory corroborates rather than decides.
+
+With that, Schedule I resolves 448,166 method bodies where it had resolved none.
+
+### Traps the format sets, and what came of each
+
+**Value-type offsets include the object header.** The runtime measures every field offset
+from the start of a *boxed* object, for structs as much as for classes, and half the Unity
+SDKs in the wild are wrong by exactly that header. Zircon asks the runtime for the header
+size rather than assuming 0x10, records the field's place in the type as `offset` and keeps
+the raw number beside it as `boxed_offset`.
+
+That one was half-right on the first pass: the type's size was recorded unboxed and its
+offsets boxed, so nothing in the record could be compared with anything else in it. The
+project's own linter found it, reporting that `Vector3.z` ran past the end of `Vector3`.
+
+**Open generics lie.** `il2cpp_field_get_offset` on an uninstantiated `List<T>` returns a
+number and the number means nothing. Those come back `offset_unresolved`. So do consts, which
+have no storage, and thread-statics, which the runtime signals by answering with a negative
+offset.
+
+**A generic parameter is not a type.** Asked to describe the `T` in `List<T>` as though it
+were one, an older runtime does not return nonsense — it walks into a null and takes the
+process with it. Nor is a pointer type: asked for the class behind one, IL2CPP goes and
+*builds* one, allocating and locking, which an injected thread is in no position to ask for.
+The walk now only asks for a class where one already exists.
+
+**Shared bodies are real.** A never-referenced method is compiled to a shared stub and
+identical bodies are folded together by the linker, so N methods legitimately live at one
+address. Counted from the finished dump and flagged, never claimed unique.
+
+**An instantiation has to be named as one.** `il2cpp_class_get_name` answers `List`1` for
+`List<int>` and `List<string>` alike. Built from that, 52,255 records in one game collapsed
+onto 14,522 paths. The type's own name carries the arguments; the class's does not.
+
+**A C# name is only unique inside its assembly** — every assembly declares a `<Module>`, and
+a game with eighty assemblies declares eighty of them. Paths are assembly-qualified, in the
+spelling .NET uses. This is the same thing the Unreal side does by starting every path with
+`/Script/Engine`.
+
+### A guard that was worse than the fault
+
+The first way of reading a const wrapped the runtime call in `__try`/`__except`, on the
+reasoning that a const has no storage and the call might walk off the end of something.
+
+That is worse than the fault it catches. The runtime takes a lock on the way in, and
+unwinding out of the middle of it leaves that lock held — so the process does not die at the
+fault, it dies a little later somewhere unrelated, with nothing in the log connecting the
+two. A guard around a call into someone else's runtime is not a safety net.
+
+Reading is guarded where guarding is safe: in the memory provider, around a copy that holds
+no locks. The walk reads the static block directly when it can bounds-check it, and asks the
+runtime only when it cannot. A build that does not survive being asked can be told not to be,
+with a `zircon-il2cpp-no-consts` marker beside the DLL — the same gate the ProcessEvent probe
+has used since 0.2.0.
+
+Enum values come out right where the runtime will answer: `KeyCode.Backspace = 8`,
+`Delete = 127`, `Tab = 9` — the real, non-sequential values, not a count of positions.
+Where it will not, the members keep their names and the enum says `values_resolved: false`.
+Numbering them by position would look right and be wrong for every enum that assigns its own.
+
+### Publishing
+
+Unity dumps publish to Zdex. That was going to be refused — Zdex indexed the Unreal schema
+and nothing else — until it turned out the cost of teaching it otherwise was far lower than
+it looked, for one reason: the walk fills the *existing* IR rather than a parallel one, so
+Zdex's own storage already fit. Assemblies land where packages do, C# types where UClasses
+do. Zdex learned the rest in its own schema 2 work the same day: a runtime discriminator, C#
+rendering, assembly-qualified type URLs, and no `.usmap` or SDK offered for a build that has
+neither.
+
+What remains of the gate is for a runtime neither side has heard of, refused at the client
+rather than sent to a server that would only reject it.
+
+Verified against the live server, not the local one: the 565 MB Cave Crawlers dump published
+in one command (22 MB gzipped), and the same Unreal game dumped three ways — the CLI from
+outside, the payload from inside, the standalone browser from outside — published from each
+and diffed identical by Zdex itself.
+
+**Zdex needs its own update for any of this**, Unreal included: before it, the server
+accepted schema 1 only, and 0.6.0 emits 2 for both runtimes.
+
+### The IR grew, and the schema went to 2
+
+`runtime` on the header, which is the field publishing gates on. `namespace`, `is_interface`,
+`is_abstract`, `is_valuetype`, `is_generic`, `explicit_layout` and a metadata token on a type.
+`boxed_offset`, `is_static` and `offset_unresolved` on a member. `token` and `shared_body` on
+a function. `values_resolved` on an enum. And `accessors` — C# properties, rebuilt from the
+`get_`/`set_` methods standing behind them, because a stub assembly that declares those as
+methods does not compile against code written for the real thing.
+
+Old dumps read unchanged; every new field has a default that means "this dump does not say".
+`ZN_SCHEMA_VERSION` went to 2 and the plugin ABI to 1.2, with a new `ZN_KIND_ACCESSOR` and
+every new field readable by name from Lua and from a C plugin.
+
+### The linter learned what it was looking at
+
+Run over the first Unity dump, `validate --strict` reported 34,315 errors. Ten thousand of
+them were its own: it was applying instance-layout rules to static fields, which live in a
+different block, and to members whose offset is explicitly unresolved. Those checks now skip
+both. It also treated two members at one offset as a contradiction, which it is — unless the
+type declared an explicit layout, which is how C# writes a union.
+
+The rest were real, and each one is a paragraph above. The count is now **zero errors** on a
+49,572-type dump, which is the number that matters: the tool's own self-consistency check
+passes on the tool's own output.
+
+### Verified against the binary, not against itself
+
+A dump that agrees with the runtime it came from proves only that the questions were asked
+consistently. So the numbers were checked against something that never saw the runtime: the
+compiled code.
+
+An auto-property getter compiles to a load from its backing field. Take the field offset the
+dump recorded, take the method RVA the dump recorded, disassemble what is at that RVA in
+`GameAssembly.dll` on disk, and see whether the offset is the displacement being loaded.
+
+**95 of 95 agreed.** Across seven assemblies, every auto-property getter that could be
+checked reads from exactly the offset the dump gives for its backing field, at exactly the
+address the dump gives for the method. Both numbers confirmed at once, by the compiler.
+
+```
+Player.CameraRotX      rva 0x3c3cc0   f3 0f 10 81 f0 05 00 00   movss xmm0,[rcx+0x5f0]
+                                      dump says offset 1520  =  0x5f0
+Player.StickTransform  rva 0x3c4170   48 8b 81 08 07 00 00 c3   mov rax,[rcx+0x708]; ret
+                                      dump says offset 1800  =  0x708
+```
+
+Three of the ninety-five looked wrong at first and were not: a getter returning a struct by
+value takes a hidden return buffer in `rcx`, which pushes `this` into `rdx`. The offsets were
+right; the disassembler reading them was too simple.
+
+### Also
+
+- The publish panel inside the injected payload now finds the dump the payload just wrote.
+  `GetModuleFileNameW(nullptr, …)` answers with the *process* executable, which injected is
+  the game's — so the panel looked in the game's folder, found nothing, and opened blank.
+  It now asks for the module its own code lives in, which is `zircon.dll` when injected and
+  `zircon-gui.exe` when not.
+- The browser lists running Unity games with an **Inject and dump** button beside each, so
+  the one thing it can do for a Unity target does not require dropping to the CLI. It still
+  cannot browse one afterwards, and says so rather than appearing to fail.
+- `zircon fingerprint` checks Unity before Unreal. IL2CPP answers definitively — a module
+  exports the embedding API or it does not — where the Unreal fingerprint is a scored
+  judgement that will return a low number about a game that was never Unreal.
+- `zircon dump --pid` against a Unity game refuses with the reason and the command to run
+  instead, rather than failing later with a message about Unreal reflection.
+- The walk logs each assembly as it goes, and the log is flushed a line at a time. A walk that
+  takes a game down leaves behind the name of what it was reading when it did.
+- Dropped a leftover unused local in `src/app/Publish.cpp` that had been costing a warning
+  since 0.4.0, against a README that claims zero.
+
+---
+
 ## 0.5.0 — 2026-09-16
 
 ### A game that would not dump, and a worse one that did

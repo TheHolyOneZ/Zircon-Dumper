@@ -11,10 +11,14 @@ A good report against a game I do not own is worth more than most patches.
 ## The rule the whole project is built on
 
 **Nothing is keyed off an engine version number.** There is no table of offsets per UE
-release anywhere in this repository, and there will not be one. Every offset is derived at
-runtime from a property that is structural to the engine rather than incidental to a build.
-That is why the tool holds up on licensee forks, renamed executables, builds carrying no
-version string, and engine versions that did not exist when it was written.
+release anywhere in this repository, and there will not be one. The same rule binds the Unity
+backend, where it is the entire reason that backend exists: every other IL2CPP dumper carries
+a table of struct layouts per metadata version, and `src/il2cpp/` carries none.
+
+Every offset is derived at runtime from a property that is structural to the engine rather
+than incidental to a build. That is why the tool holds up on licensee forks, renamed
+executables, builds carrying no version string, and engine versions that did not exist when it
+was written.
 
 A patch that adds `if (version == "5.4") offset = 0x48;` will not be merged, no matter how
 many games it fixes. If a derivation fails on some build, the derivation is wrong.
@@ -68,7 +72,7 @@ suffix; that is the only difference between a local build and a released one.
 
 ## Tests
 
-Eight suites, and **none of them may require a game installed.** They run against synthetic
+Nine suites, and **none of them may require a game installed.** They run against synthetic
 memory, hand-built bytecode and checked-in fixtures. Anything that needs a live process is a
 verification run, not a test, and belongs in `docs/UE-Test.md` instead.
 
@@ -92,6 +96,11 @@ fork has extended `UObject`.
 
 Anything under `src/engine/` that decides an offset is load-bearing for every target, so
 "it works on the game I was looking at" is not evidence.
+
+For `src/il2cpp/`, the equivalent is `docs/IL2CPP.md`, and the same rule applies: a
+derivation there needs a positive distinguishing property and an independent anchor. The
+worked example is where a method body lives, told apart from an invoker thunk that passes
+every test a pointer-to-code test can pose.
 
 **Required: an A/B against real games.** Dump the same *live process* twice — once with the
 previous release binary, once with your build — and diff them:
@@ -178,6 +187,7 @@ Some things are excluded on purpose and a PR adding them will be declined:
 |---|---|
 | `src/core/` | memory providers, PE parsing, pattern scanning — no UE knowledge at all |
 | `src/engine/` | every derivation, and the walk that turns a process into the IR |
+| `src/il2cpp/` | the Unity backend. Beside `src/engine/`, not under it: neither needs the other |
 | `src/ir/` | the dump schema, JSON round-trip, and the structural linter |
 | `src/emit/` | one file per output format; they see a `Dump` and nothing else |
 | `src/diff/` | build-to-build comparison |

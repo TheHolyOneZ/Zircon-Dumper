@@ -28,6 +28,16 @@ int CommandLogout();
 
 int CommandPublish(const PublishOptions& options);
 
+// Why Zdex won't take this dump, or empty when it will.
+//
+// Both runtimes publish now. What's left is the guard for a runtime neither side knows,
+// refused here rather than sent to a server that would reject it (or half-accept it).
+// Tested on what the dump says, never the filename.
+std::string PublishRefusal(std::string_view runtime);
+
+// Same question against a file. Reads only the header.
+std::string PublishRefusalForFile(std::string_view path);
+
 // Downloads one artefact of a published dump. `kind` is usmap | sdk | json.
 int CommandFetch(std::int64_t dump_id, std::string_view kind, std::string_view out_path);
 

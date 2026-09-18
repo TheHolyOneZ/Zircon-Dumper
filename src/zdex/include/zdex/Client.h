@@ -97,7 +97,7 @@ private:
     std::string user_agent_;
 };
 
-// "Zircon/0.5.0 (+https://zlogic.eu/zircon/)" — Cloudflare answers a plain-text 403 to
+// "Zircon/0.6.0 (+https://zlogic.eu/zircon/)" — Cloudflare answers a plain-text 403 to
 // generic agents, so this is not cosmetic.
 std::string UserAgent(std::string_view version);
 

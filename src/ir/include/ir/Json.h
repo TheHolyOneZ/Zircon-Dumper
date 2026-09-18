@@ -46,6 +46,12 @@ bool WriteJsonFile(const Dump& dump, std::string_view path, std::string& error,
 JsonExpected<Dump> ParseJson(std::string_view text);
 JsonExpected<Dump> ReadJsonFile(std::string_view path);
 
+// Just the header, off the front of the file. Dumps run to hundreds of MB and the usual
+// questions (which runtime, which tool, is it partial) are answered in the first few KB.
+// Reads a prefix, isolates the header object, hands it to the same parser -- no second
+// reader to drift.
+JsonExpected<Header> ReadJsonHeaderFile(std::string_view path);
+
 // Maximum container nesting the parser will accept. Hostile or corrupt input must fail
 // with an error instead of recursing until the stack runs out.
 inline constexpr int kMaxJsonDepth = 64;

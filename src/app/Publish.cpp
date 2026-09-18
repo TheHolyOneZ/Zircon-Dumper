@@ -1,5 +1,7 @@
 #include "Publish.h"
 
+#include "ir/Json.h"
+
 #include "core/Log.h"
 #include "core/Term.h"
 #include "zdex/Client.h"
@@ -240,6 +242,20 @@ int CommandLogout() {
     return 0;
 }
 
+std::string PublishRefusal(std::string_view runtime) {
+    if (runtime.empty() || runtime == "unreal" || runtime == "il2cpp") return {};
+    return std::format("this dump reports its runtime as '{}', which Zdex does not index",
+                       runtime);
+}
+
+std::string PublishRefusalForFile(std::string_view path) {
+    const auto header = ir::ReadJsonHeaderFile(path);
+    // An unreadable header is not the gate's business. Whatever is wrong with the file, the
+    // upload path reports it better than a refusal phrased as being about runtimes would.
+    if (!header) return {};
+    return PublishRefusal(header.value().runtime);
+}
+
 int CommandPublish(const PublishOptions& options) {
     zdex::Config config = zdex::LoadConfig();
     if (!config.HasKey()) {
@@ -255,6 +271,11 @@ int CommandPublish(const PublishOptions& options) {
     if (options.game.empty() || options.label.empty()) {
         LogError("publish needs --game and --label");
         return 1;
+    }
+
+    if (const auto refusal = PublishRefusalForFile(options.path); !refusal.empty()) {
+        LogError("{}", refusal);
+        return ExitFor(zdex::Outcome::Usage);
     }
 
     // --- the one-time confirmation ---------------------------------------------------
@@ -284,7 +305,6 @@ int CommandPublish(const PublishOptions& options) {
     request.wait  = options.wait;
 
     Progress bar(!options.json_output);
-    bool compressed_shown = false;
 
     zdex::UploadHooks hooks;
     hooks.progress = [&](zdex::UploadPhase phase, std::uint64_t done, std::uint64_t total,
