@@ -15,7 +15,7 @@
 
 namespace zircon::ir {
 
-inline constexpr int kSchemaVersion = 2;
+inline constexpr int kSchemaVersion = 3;
 
 // ---------------------------------------------------------------------------------
 // Types
@@ -268,6 +268,10 @@ struct Struct {
 
     std::uint32_t token{0};        // metadata token, 0 when the source has none
 
+    // Which reading this record came from: "live", "static" or "both". Empty means the dump
+    // predates dual mode, when there was only one answer to give.
+    std::string  source;
+
     std::int32_t size{0};
     std::int32_t alignment{0};
     std::int32_t inherited_size{0};   // where this type's own members start
@@ -343,6 +347,23 @@ struct SourceInfo {
     bool operator==(const SourceInfo&) const = default;
 };
 
+// Where two readings of the same game disagreed.
+//
+// Dual mode asks a running runtime and the metadata file the same questions, and they do not
+// always give the same answer. A packed or obfuscated build is precisely the case where they
+// will not, and there the disagreement *is* the finding. So it is recorded rather than
+// resolved quietly: one side is used, both are written down, and the reader can see which.
+struct Conflict {
+    std::string path;      // the type, assembly-qualified
+    std::string member;    // field or method, empty when the type itself disagreed
+    std::string field;     // which property disagreed: "token", "size", "offset", ...
+    std::string live;      // what the running runtime said
+    std::string other;     // what the metadata said
+    std::string used;      // which one the dump carries
+
+    bool operator==(const Conflict&) const = default;
+};
+
 struct Header {
     std::string   tool_version;
     std::string   created_utc;
@@ -360,6 +381,15 @@ struct Header {
     EngineInfo    engine;
     std::vector<DerivedOffset> offsets;
     std::vector<std::string>   globals;   // "GObjects=0x...", module-relative where known
+
+    // Which readings produced this dump: "live", "static", or both for a dual run. Empty on
+    // everything written before dual mode existed, which reads as "live" -- the only kind
+    // there was.
+    std::vector<std::string> sources;
+
+    // Every disagreement between them, in full. Never pruned: a dump with a thousand of
+    // these is telling you something about the build.
+    std::vector<Conflict> conflicts;
 
     bool operator==(const Header&) const = default;
 };

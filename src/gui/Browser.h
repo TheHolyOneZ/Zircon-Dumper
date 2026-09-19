@@ -11,6 +11,7 @@
 #include "core/MemorySource.h"
 #include "engine/DumpBuilder.h"
 #include "engine/UnrealDetect.h"
+#include "il2cpp/Runtime.h"
 
 #include <atomic>
 #include <cstdint>
@@ -57,7 +58,6 @@ private:
 
     void DrawAttachPanel();
     void DrawUnityNotice();
-    static std::vector<core::ProcessInfo> DetectUnityProcesses();
     static std::string PayloadPath();
     void DrawStatusPanel();
     void DrawObjectList();
@@ -82,7 +82,7 @@ private:
 
     // --- attach state ---
     std::vector<engine::UnrealCandidate> candidates_;
-    std::vector<core::ProcessInfo>       unity_candidates_;
+    std::vector<il2cpp::UnityProcess>    unity_candidates_;
     std::string                          unity_status_;
     bool                                 unity_status_ok_{false};
     double                               candidates_refreshed_at_{-1.0};

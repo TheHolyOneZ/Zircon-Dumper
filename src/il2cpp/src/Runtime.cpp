@@ -1,12 +1,19 @@
 #include "il2cpp/Runtime.h"
 
 #include "core/Log.h"
+#include "core/ProcessList.h"
 
 #include <algorithm>
 #include <format>
 #include <array>
+#include <filesystem>
 #include <cstring>
 #include <unordered_map>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <tlhelp32.h>
 
 namespace zircon::il2cpp {
 namespace {
@@ -14,6 +21,36 @@ namespace {
 using core::Address;
 using core::IsNull;
 using core::Raw;
+
+// Is GameAssembly.dll actually mapped into that process yet? A game that has just been
+// started has the file on disk long before the runtime is up, and the difference is exactly
+// what you wait on before injecting.
+bool RuntimeModuleLoaded(std::uint32_t pid) {
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    // Module file names are ASCII in every build anyone ships; anything else won't match
+    // the names we are looking for anyway.
+    const auto narrow = [](const wchar_t* wide) {
+        std::string out;
+        for (; *wide; ++wide) out.push_back(static_cast<char>(*wide & 0x7F));
+        return out;
+    };
+
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool loaded = false;
+    if (::Module32FirstW(snapshot, &entry)) {
+        do {
+            if (LooksLikeIl2CppModuleName(narrow(entry.szModule))) {
+                loaded = true;
+                break;
+            }
+        } while (::Module32NextW(snapshot, &entry));
+    }
+    ::CloseHandle(snapshot);
+    return loaded;
+}
 
 constexpr std::uint16_t kDosMagic = 0x5A4D;   // MZ
 constexpr std::uint32_t kPeMagic  = 0x00004550;
@@ -38,7 +75,7 @@ struct Binding {
 // `required` splits "can't walk this build" from "can walk it, slightly worse". Everything
 // past the divider was present on all ten builds in the corpus and is still optional -- a
 // name only ever used behind a null check shouldn't be able to refuse a target.
-constexpr std::array<Binding, 74> kBindings{{
+constexpr std::array<Binding, 75> kBindings{{
     {"il2cpp_domain_get",                    &Api::domain_get,                    true},
     {"il2cpp_domain_get_assemblies",         &Api::domain_get_assemblies,         true},
     {"il2cpp_assembly_get_image",            &Api::assembly_get_image,            true},
@@ -100,6 +137,7 @@ constexpr std::array<Binding, 74> kBindings{{
     {"il2cpp_class_get_element_class",       &Api::class_get_element_class,       false},
     {"il2cpp_class_get_static_field_data",   &Api::class_get_static_field_data,   false},
     {"il2cpp_class_get_data_size",           &Api::class_get_data_size,           false},
+    {"il2cpp_class_num_fields",              &Api::class_num_fields,              false},
     {"il2cpp_class_for_each",                &Api::class_for_each,                false},
     {"il2cpp_class_from_type",               &Api::class_from_type,               false},
 
@@ -338,6 +376,31 @@ std::optional<RuntimeInfo> FindRuntime(core::IMemorySource& memory) {
                   best.api.resolved, RequiredEntryPointCount(),
                   best.api.enrichment, OptionalEntryPointCount());
     return best;
+}
+
+std::vector<UnityProcess> DetectUnityProcesses() {
+    std::vector<UnityProcess> found;
+    std::error_code ec;
+
+    // Unity ships its crash handler beside the game, so it passes the folder test. Named,
+    // because nothing about the process itself tells it apart.
+    const auto is_helper = [](std::string_view name) {
+        return name == "UnityCrashHandler64.exe" || name == "UnityCrashHandler32.exe";
+    };
+
+    for (auto& process : core::EnumerateProcesses()) {
+        if (process.path.empty()) continue;      // no access to look, so no claim either way
+        if (is_helper(process.name)) continue;
+
+        const auto folder = std::filesystem::path(process.path).parent_path();
+        if (!std::filesystem::exists(folder / "GameAssembly.dll", ec)) continue;
+
+        UnityProcess entry;
+        entry.runtime_loaded = RuntimeModuleLoaded(process.pid);
+        entry.process        = std::move(process);
+        found.push_back(std::move(entry));
+    }
+    return found;
 }
 
 } // namespace zircon::il2cpp

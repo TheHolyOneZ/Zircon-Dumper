@@ -16,6 +16,7 @@
 
 #include "core/MemorySource.h"
 #include "core/PeImage.h"
+#include "core/ProcessList.h"
 
 #include <cstdint>
 #include <optional>
@@ -97,6 +98,7 @@ struct Api {
     core::Address class_get_element_class{};
     core::Address class_get_static_field_data{};
     core::Address class_get_data_size{};
+    core::Address class_num_fields{};            // bounds the field walk, see below
     core::Address class_for_each{};              // every class, inflated generics included
     core::Address class_from_type{};
 
@@ -183,5 +185,19 @@ std::vector<std::pair<std::string, std::uint32_t>> ResolvedEntryPoints(const Run
 // Locates the IL2CPP module and resolves the API. Nothing when no module exports the entry
 // points -- a Mono or non-Unity game.
 std::optional<RuntimeInfo> FindRuntime(core::IMemorySource& memory);
+
+struct UnityProcess {
+    core::ProcessInfo process;
+
+    // The module is mapped, not merely sitting next to the executable. A game that has just
+    // started passes the first test minutes before the second.
+    bool runtime_loaded{false};
+};
+
+// Running processes with GameAssembly.dll beside them. Folder-based on purpose: it answers
+// before the runtime is up, which is when you want to know. A Unity game with UnityPlayer
+// and no GameAssembly is the Mono backend and is left out, because this backend cannot
+// touch it.
+std::vector<UnityProcess> DetectUnityProcesses();
 
 } // namespace zircon::il2cpp

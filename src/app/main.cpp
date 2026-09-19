@@ -19,6 +19,9 @@
 #include "engine/ValueWriter.h"
 #include "engine/TypeResolver.h"
 #include "engine/UnrealDetect.h"
+#include "il2cpp/Metadata.h"
+#include "il2cpp/Static.h"
+#include "zdex/Gzip.h"
 #include "il2cpp/Runtime.h"
 #include "diff/Diff.h"
 #include "emit/Emitter.h"
@@ -41,6 +44,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -136,7 +140,7 @@ void PrintUsage() {
     std::printf("%sUsage%s  zircon <command> [target] [options]\n\n", b.data(), r.data());
 
     std::printf("%sInspect a target%s\n", b.data(), r.data());
-    std::printf("  %sdetect%s        List running Unreal Engine processes\n", c.data(), r.data());
+    std::printf("  %sdetect%s        List running Unreal Engine and Unity IL2CPP processes\n", c.data(), r.data());
     std::printf("  %sfingerprint%s   Identify the runtime: UE version and layout, or Unity IL2CPP\n", c.data(), r.data());
     std::printf("  %smodules%s       List modules visible in the target\n", c.data(), r.data());
     std::printf("  %snames%s         Dump the FName pool\n", c.data(), r.data());
@@ -149,7 +153,9 @@ void PrintUsage() {
     std::printf("  %swrite%s         Write one property of one object (--set Name=Value)\n", c.data(), r.data());
     std::printf("  %sfind%s          Find objects by what they hold (--where Health<50)\n", c.data(), r.data());
     std::printf("  %sinspect%s       Annotated hexdump of one object (path, #slot or @address)\n", c.data(), r.data());
-    std::printf("  %sscan%s          Pattern-scan the target\n\n", c.data(), r.data());
+    std::printf("  %sscan%s          Pattern-scan the target\n", c.data(), r.data());
+    std::printf("  %sscan-games%s    Find Unreal and Unity games on disk, and write a manifest\n", c.data(), r.data());
+    std::printf("  %smetadata%s      What Zircon works out about a global-metadata.dat\n\n", c.data(), r.data());
 
     std::printf("%sProduce output%s\n", b.data(), r.data());
     std::printf("  %sdump%s          Full reflection dump to IR JSON\n", c.data(), r.data());
@@ -157,7 +163,8 @@ void PrintUsage() {
                 c.data(), r.data());
     std::printf("  %svalidate%s      Parse a dump, round-trip it, and with --strict lint it\n", c.data(), r.data());
     std::printf("  %sxref%s          What references a type, or with --uses what it references\n", c.data(), r.data());
-    std::printf("  %sdiff%s          Compare two dumps and report what broke\n\n", c.data(), r.data());
+    std::printf("  %sdiff%s          Compare two dumps and report what broke\n", c.data(), r.data());
+    std::printf("  %sbatch%s         Dump every game in a manifest, unattended\n\n", c.data(), r.data());
 
     std::printf("%sWork live%s\n", b.data(), r.data());
     std::printf("  %sbrowse%s        Interactive object browser (zircon-gui.exe)\n", c.data(), r.data());
@@ -205,15 +212,40 @@ void PrintUsage() {
                 "      --game <name>  publish: which game this is (guessed from the process)\n"
                 "      --label <s>    publish: which build, e.g. \"1.4.2 (Steam)\"\n"
                 "      --notes <s>    publish: a line of context for whoever reads it\n"
+                "      --dry-run      publish: check everything and send nothing\n"
                 "      --no-wait      publish: return once uploaded, without waiting on indexing\n"
                 "      --usmap        fetch: mappings instead of the dump (--sdk for the SDK zip)\n"
-                "      --json         publish: machine-readable result on stdout\n"
+                "      --json         publish, fingerprint: machine-readable result on stdout\n"
                 "      --open         publish: open the result in a browser when it is ready\n"
+                "      --mode <m>     Unity: live (default), static or dual\n"
+                "      --metadata <p> Unity: read global-metadata.dat, no process needed\n"
+                "      --launch <exe> inject: start the game and wait for its runtime\n"
+                "      --wait         inject: block until the walk is done\n"
+                "      --wait-for-settle [s]  inject: let the class cache stop growing first\n"
+                "      --timeout <s>  inject: ceiling for --launch and --wait (default 900)\n"
+                "      --headless     inject: no console inside the game\n"
+                "      --dll <path>   inject: a payload other than the one next door\n"
                 "  -y, --yes          publish: skip the confirmation\n"
                 "  -v, --verbose      Debug logging (repeat for trace)\n"
                 "      --color/--no-color  Force colour on or off (also honours NO_COLOR)\n"
                 "  -h, --help         Show this help\n"
                 "      --version      Show version\n\n");
+
+    std::printf("%sExit codes%s\n", b.data(), r.data());
+    std::printf("  0  fine\n"
+                "  1  bad arguments\n"
+                "  2  the name given could not be pinned down: no match, or several\n"
+                "  3  what you named was not there: no object, no matches, no scan hits,\n"
+                "     no engine version, or a Unity build with the exports stripped\n"
+                "  4  attached, but the reflection layout would not derive; inject failed\n"
+                "  5  could not open the target, or could not write the output\n"
+                "  6  a dump file would not parse, or the round trip was lossy\n"
+                "  7  an emitter refused\n"
+                "  8  diff found a breaking change\n"
+                "  9  validate --strict found the dump contradicting itself\n\n");
+    std::printf("%sOne wart: an ambiguous --process exits 5 from most commands but 2 from\n"
+                "inject and browse, which resolve the name themselves.%s\n\n",
+                d.data(), r.data());
 
     std::printf("%sExamples%s\n", b.data(), r.data());
     std::printf("  %szircon detect%s\n", d.data(), r.data());
@@ -226,6 +258,253 @@ void PrintUsage() {
     std::printf("  %szircon xref game.json -f CharacterMovementComponent%s\n", d.data(), r.data());
     std::printf("  %szircon browse --pid 1234%s\n", d.data(), r.data());
     std::printf("  %szircon publish game.json --label \"1.4.2 (Steam)\"%s\n", d.data(), r.data());
+}
+
+// Per-command help.
+//
+// `zircon login --help` used to answer "unknown option: --help", which is a bad reply to a
+// reasonable question. One entry per command: how it is called, the flags that apply to it,
+// and what it exits with. Commands not listed here fall back to the full help.
+struct CommandHelp {
+    const char* name;
+    const char* usage;
+    const char* body;
+};
+
+constexpr const char* kTargetHelp =
+    "  --pid <n>          Attach externally to a running process\n"
+    "  --process <name>   Attach externally by executable name\n"
+    "  --dump <path>      Read a full-memory minidump\n"
+    "  --file <path>      Read a PE image on disk (partial)\n"
+    "  --internal         Run in-process (injected builds)\n";
+
+constexpr CommandHelp kCommandHelp[] = {
+{"scan-games", "zircon scan-games [<folder>...] [-o games.toml]",
+ "Finds Unreal and Unity games by what is in the folder rather than by a list of known\n"
+ "titles. With no folders given it sweeps every fixed drive.\n\n"
+ "  -o, --out <path>   Write a manifest for `zircon batch`\n"
+ "      --json         Machine-readable list on stdout\n\n"
+ "Mono-backend Unity games are listed and commented out of the manifest: they have no\n"
+ "GameAssembly.dll, so there is nothing for the IL2CPP path to talk to.\n\n"
+ "Exits 3 when nothing was found.\n"},
+
+{"batch", "zircon batch <manifest.toml> [-o <dir>]",
+ "Dumps every game in a manifest, unattended. One failing does not stop the rest, and a\n"
+ "Unity game whose runtime faults partway through falls back to its metadata, so it\n"
+ "still yields its type system.\n\n"
+ "  -o, --out <dir>    Where the dumps go (default zircon-batch). Each one is .json.gz\n"
+ "      --mode <m>     live (default) or dual, for the Unity ones\n"
+ "      --wait-for-settle [s]  let each runtime's class cache stop growing first\n"
+ "      --timeout <s>  per game (default 900)\n\n"
+ "Write the manifest with `zircon scan-games -o games.toml`.\n\n"
+ "Exits 4 when any game failed.\n"},
+
+{"metadata", "zircon metadata <global-metadata.dat>",
+ "Says what Zircon worked out about a Unity metadata file, and the evidence for each\n"
+ "step: the header layout, which span is which table, the record sizes, and where the\n"
+ "names and tokens sit. No version table is involved; it is all derived from the file.\n\n"
+ "Worth running before dumping a target you cannot run, to find out whether it can be\n"
+ "read at all.\n\n"
+ "Exits 3 when the file cannot be read, naming the constraint that failed.\n"},
+
+{"detect", "zircon detect",
+ "Lists running games worth attaching to. Unreal processes come with a confidence score;\n"
+ "Unity IL2CPP is a yes or no, since either a module exports the embedding API or it does\n"
+ "not.\n\n"
+ "  -v                 Also print the evidence behind each score\n\n"
+ "Exits 0 when something was found, 3 when nothing is running.\n"},
+
+{"fingerprint", "zircon fingerprint <target>",
+ "Says what runtime a target is and how much of it can be read. Unity is checked first\n"
+ "because it is a yes or no; the Unreal fingerprint is a score and will guess low about a\n"
+ "game that is not Unreal at all.\n\n"
+ "  --json             Machine-readable, for scripts that would otherwise scrape this\n\n"
+ "Exits 0 when the runtime is identified, 3 when it is not, or when a Unity build has\n"
+ "stripped exports the walk needs.\n"},
+
+{"modules", "zircon modules <target>",
+ "Every module the target has loaded, with base and size.\n"},
+
+{"names", "zircon names <target>",
+ "The FName pool. Unreal only.\n\n"
+ "  -n, --limit <n>    Stop after n names\n"},
+
+{"objects", "zircon objects <target>",
+ "Every UObject in GObjects by full name. Unreal only.\n\n"
+ "  -f, --filter <s>   Only names containing this substring\n"
+ "  -n, --limit <n>    Stop after n results\n"},
+
+{"classes", "zircon classes <target>",
+ "Classes and structs with their sizes. Unreal only.\n\n"
+ "  -f, --filter <s>   Only names containing this substring\n"
+ "  -n, --limit <n>    Stop after n results\n"},
+
+{"props", "zircon props <target> -f <class>",
+ "Properties of a class or struct, with offsets and sizes. Unreal only.\n\n"
+ "  -f, --filter <s>   Which class to list\n"
+ "  -n, --limit <n>    Stop after n results\n"},
+
+{"functions", "zircon functions <target>",
+ "UFunctions with their signatures and native addresses. Unreal only.\n\n"
+ "  -f, --filter <s>   Only names containing this substring\n"
+ "  -n, --limit <n>    Stop after n results\n"},
+
+{"script", "zircon script <target> -f <class>",
+ "Decompiles Kismet bytecode into pseudo-code. Unreal only.\n\n"
+ "  -f, --filter <s>   Which class or function to decompile\n"
+ "  -n, --limit <n>    Stop after n functions\n"},
+
+{"read", "zircon read <target> -f <object path>",
+ "Live property values of one object. Unreal only, and external is enough.\n\n"
+ "  -f, --filter <s>   The object: full path, #slot or @address\n"},
+
+{"write", "zircon write <target> -f <object> --set Name=Value",
+ "Writes one property of one object. The only command that changes the game.\n\n"
+ "  -f, --filter <s>   The object: full path, #slot or @address\n"
+ "      --set <N=V>    Property and value, e.g. MaxWalkSpeed=1337\n"},
+
+{"find", "zircon find <target> -f <class> --where <cond>",
+ "Finds objects by what they currently hold.\n\n"
+ "  -f, --filter <s>   Which class to search\n"
+ "      --where <c>    Name<op>Value, ops = != < > <= >=\n"
+ "  -n, --limit <n>    Stop after n matches\n"},
+
+{"inspect", "zircon inspect <target> -f <object>",
+ "Annotated hexdump of one object: every byte, labelled with the property that owns it.\n\n"
+ "  -f, --filter <s>   The object: full path, #slot or @address\n"
+ "  -n, --limit <n>    Stop after n bytes\n"},
+
+{"scan", "zircon scan <target> -p <pattern>",
+ "Pattern-scans the target. Modules only unless told otherwise.\n\n"
+ "  -p, --pattern <s>  Byte pattern, ?? for wildcards\n"
+ "  -m, --module <s>   Restrict to one module\n"
+ "      --all-regions  The whole address space, not only modules\n"
+ "  -n, --limit <n>    Stop after n hits\n"},
+
+{"dump", "zircon dump <target> [-o <path>]",
+ "Full reflection dump to IR JSON. Unreal from outside the process; for Unity use inject,\n"
+ "because IL2CPP keeps its field offsets behind a function call.\n\n"
+ "  -o, --out <path>   Where to write it (default dump.json); .json.gz compresses it\n"
+ "      --metadata <p> Unity: read global-metadata.dat instead, with no process at all\n"
+ "      --mode static  the same thing, said the other way round\n"
+ "      --names        Embed the whole FName pool\n"
+ "      --script       Decompile Kismet bytecode into the dump\n"
+ "      --defaults     Read each property's value from its class default object\n"
+ "      --emit <fmts>  Also render it, e.g. cpp_sdk,usmap or all\n"
+ "      --publish      Publish to Zdex once written (see publish --help)\n\n"
+ "Exits 5 when the file could not be written.\n"},
+
+{"emit", "zircon emit <format[,format]> <dump.json> [-o <dir>]",
+ "Renders a dump into one or more output formats. `zircon emit list` prints them.\n\n"
+ "  -o, --out <path>   Output directory\n"
+ "      --allow-partial  Let emitters run on a dump with no object data\n"
+ "      --plugins <d>  Load emitter plugins from a directory (repeatable)\n\n"
+ "Exits 6 when the dump will not parse, 7 when an emitter failed.\n"},
+
+{"validate", "zircon validate <dump.json> [--strict]",
+ "Parses a dump, writes it back out and checks the two match. With --strict it also lints\n"
+ "the contents: offsets past the end of a type, sizes that contradict a base, and so on.\n\n"
+ "      --strict       Also lint the dump against itself\n"
+ "  -n, --limit <n>    Stop printing after n findings\n\n"
+ "Exits 6 when the dump will not parse or the round trip is lossy, 9 when the lint found\n"
+ "something.\n"},
+
+{"xref", "zircon xref <dump.json> -f <type>",
+ "What references a type, or with --uses what that type references.\n\n"
+ "  -f, --filter <s>   The type to look up\n"
+ "      --uses         Invert it: what this type references\n"
+ "  -n, --limit <n>    Stop after n results\n"},
+
+{"diff", "zircon diff <before.json> <after.json>",
+ "Compares two dumps and reports what changed, and what of that breaks existing code.\n\n"
+ "      --breaking     Only changes that break code built against the old dump\n"
+ "      --style <s>    text (default), json, markdown\n"
+ "  -o, --out <path>   Write the report instead of printing it\n\n"
+ "Exits 6 when either dump will not parse, 8 when --breaking found something.\n"},
+
+{"browse", "zircon browse <target>",
+ "Opens the interactive object browser. Hands off to zircon-gui.exe next door.\n"},
+
+{"inject", "zircon inject --pid <n>",
+ "Loads the payload DLL into a running game. The payload dumps on its own and writes into\n"
+ "zircon-out beside the DLL. This is the only way to dump Unity.\n\n"
+ "  --pid <n>          Which process\n"
+ "  --process <name>   By name, when exactly one matches\n"
+ "      --launch <exe> Start the game first and wait for GameAssembly.dll to be mapped,\n"
+ "                     rather than guessing how long that takes\n"
+ "  -o, --out <path>   Write the dump here instead of naming it after the process\n"
+ "      --wait         Block until the walk is done, and exit non-zero if it wasn't.\n"
+ "                     With --launch, the game is closed afterwards\n"
+ "      --wait-for-settle [s]  Let the runtime's class cache stop growing before walking.\n"
+ "                     Two dumps of one build differ otherwise, by how long it sat\n"
+ "      --timeout <s>  Ceiling for --launch and --wait (default 900)\n"
+ "      --headless     No console in the game; it steals focus from a fullscreen one\n"
+ "      --dll <path>   A payload other than the zircon.dll next to this executable\n\n"
+ "So one game, unattended, is:\n\n"
+ "  zircon inject --launch \"D:\\Games\\Thing\\Thing.exe\" --wait --headless -o thing.json\n\n"
+ "Each run gets its own log under zircon-out\\logs. If the runtime faults on one of its\n"
+ "own types the payload records which, and the next run walks past it.\n\n"
+ "Exits 2 when a name matches more than one process, 4 when the load failed, the game\n"
+ "died mid-walk, or the timeout ran out.\n"},
+
+{"publish", "zircon publish <dump.json> --game <name> --label <build>",
+ "Uploads a dump to Zdex and prints where it landed. Off by default everywhere else.\n\n"
+ "      --game <name>  Which game (guessed from the process when dumping)\n"
+ "      --label <s>    Which build, e.g. \"1.4.2 Steam\". The diff's primary key\n"
+ "      --notes <s>    A line of context for whoever reads it\n"
+ "      --dry-run      Check everything and send nothing, before spending minutes\n"
+ "                     compressing several hundred megabytes\n"
+ "      --no-wait      Return once uploaded, without waiting on indexing\n"
+ "      --json         Machine-readable result on stdout\n"
+ "      --open         Open the result in a browser when it is ready\n"
+ "  -y, --yes          Skip the confirmation\n"},
+
+{"fetch", "zircon fetch <id> [-o <path>]",
+ "Downloads a published dump, or its mappings or SDK instead.\n\n"
+ "      --usmap        Mappings rather than the dump\n"
+ "      --sdk          The SDK zip rather than the dump\n"
+ "  -o, --out <path>   Where to write it\n"},
+
+{"login", "zircon login [<key>]",
+ "Stores a Zdex API key so publishing works. The key goes in one file under %APPDATA% and\n"
+ "nowhere else -- not in a dump, not in a log.\n\n"
+ "      --key <s>      The key, if you would rather not have it in shell history\n"},
+
+{"logout", "zircon logout",
+ "Forgets the stored key.\n"},
+
+{"install", "zircon install",
+ "Adds this folder to the per-user PATH. No elevation, nothing outside your own profile.\n"},
+
+{"uninstall", "zircon uninstall",
+ "Takes it off the PATH again.\n"},
+};
+
+// True when the command had its own page. Anything else falls through to the full help.
+bool PrintCommandHelp(std::string_view command) {
+    for (const auto& entry : kCommandHelp) {
+        if (command != entry.name) continue;
+
+        const auto b = term::Bold();
+        const auto d = term::Dim();
+        const auto r = term::Reset();
+
+        std::printf("%sUsage%s  %s\n\n", b.data(), r.data(), entry.usage);
+        std::fputs(entry.body, stdout);
+
+        // Only the commands that take one, and it is the same list every time.
+        const bool needs_target =
+            std::string_view(entry.body).find("<target>") != std::string_view::npos ||
+            std::string_view(entry.usage).find("<target>") != std::string_view::npos;
+        if (needs_target) {
+            std::printf("\n%sTarget%s (exactly one)\n", b.data(), r.data());
+            std::fputs(kTargetHelp, stdout);
+        }
+
+        std::printf("\n%szircon --help lists every command.%s\n", d.data(), r.data());
+        return true;
+    }
+    return false;
 }
 
 // What `dump --publish` carries through to the publish step. A struct because
@@ -265,6 +544,550 @@ Result<std::unique_ptr<IMemorySource>> OpenTarget(const TargetSpec& spec) {
         case TargetSpec::Kind::None:        break;
     }
     return Error{"no target specified; pass one of --pid/--process/--dump/--file/--internal", 1};
+}
+
+// Writes a dump, compressed when the path says so.
+//
+// A path ending .gz that holds plain JSON is worse than no compression at all, so this is the
+// one place either kind gets written. The plain file is streamed through the compressor rather
+// than held twice in memory, and it goes away afterwards.
+bool WriteDumpFile(const zircon::ir::Dump& dump, const std::string& path, std::string& error) {
+    const std::filesystem::path out{path};
+    const bool compress = out.extension() == ".gz";
+    const auto plain = compress ? std::filesystem::path(out).replace_extension() : out;
+
+    if (!zircon::ir::WriteJsonFile(dump, plain.string(), error)) return false;
+    if (!compress) return true;
+
+    zircon::zdex::GzipStats stats;
+    if (!zircon::zdex::GzipFile(plain.string(), out.string(), error, &stats)) return false;
+
+    std::error_code ec;
+    std::filesystem::remove(plain, ec);
+    LogInfo("compressed to {} ({:.0f}x smaller than the {} MiB of JSON)", out.string(),
+            stats.ratio(), static_cast<std::uint64_t>(stats.raw >> 20));
+    return true;
+}
+
+// Reads a file into memory, or says why not. Metadata files are tens of megabytes, which is
+// nothing next to the dump they produce.
+std::optional<std::vector<std::uint8_t>> ReadWholeFile(std::string_view path) {
+    std::ifstream in(std::string(path), std::ios::binary | std::ios::ate);
+    if (!in) return std::nullopt;
+
+    const auto size = static_cast<std::size_t>(in.tellg());
+    in.seekg(0);
+
+    std::vector<std::uint8_t> bytes(size);
+    if (size && !in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
+        return std::nullopt;
+    return bytes;
+}
+
+// JSON strings, the small subset that shows up here: quotes, backslashes and control
+// characters. Paths come through this and Windows paths are full of backslashes.
+std::string JsonQuote(std::string_view text) {
+    std::string out = "\"";
+    for (const char c : text) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                    out += std::format("\\u{:04x}", static_cast<unsigned>(c));
+                else
+                    out += c;
+        }
+    }
+    return out + "\"";
+}
+
+std::string JsonList(const std::vector<std::string>& values) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i) out += ", ";
+        out += JsonQuote(values[i]);
+    }
+    return out + "]";
+}
+
+// Unity puts the metadata at a fixed place inside a game folder. A layout convention, not a
+// version table: if it is not there the caller is told to point at it directly.
+std::filesystem::path MetadataBeside(const std::filesystem::path& game_folder) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(game_folder, ec)) return {};
+
+    for (const auto& entry : std::filesystem::directory_iterator(game_folder, ec)) {
+        if (!entry.is_directory()) continue;
+        const auto candidate = entry.path() / "il2cpp_data" / "Metadata" / "global-metadata.dat";
+        if (std::filesystem::exists(candidate, ec)) return candidate;
+    }
+    return {};
+}
+
+// A dump with no process anywhere in it.
+//
+// This is the half of hybrid mode that reaches targets the injected walk cannot: an APK, a
+// console build, a game with anti-cheat, a game that crashes the moment the walk touches it.
+// It is a true partial answer and says so -- the type set is exact and repeatable, and
+// nothing that lives in the binary rather than the metadata is invented to fill the gaps.
+int CommandStaticDump(std::string_view metadata_path, std::string_view out_path) {
+    auto bytes = ReadWholeFile(metadata_path);
+    if (!bytes) {
+        LogError("cannot read {}", metadata_path);
+        return 5;
+    }
+
+    const auto solved = zircon::il2cpp::SolveMetadataLayout(*bytes);
+    if (!solved) {
+        LogError("{}", solved.error().message);
+        return 3;
+    }
+    const auto& layout = solved.value();
+    LogInfo("metadata version {}, {} spans, type records of {} bytes",
+            layout.version, layout.spans.size(), layout.type_record);
+    for (const auto& line : layout.evidence) LogInfo("  - {}", line);
+
+    zircon::il2cpp::StaticStats stats;
+    auto dump = zircon::il2cpp::ReadStaticDump(*bytes, layout, stats);
+    dump.header.tool_version = kVersion;
+
+    LogInfo("static dump: {} assemblies, {} types, {} fields, {} methods",
+            stats.images, stats.types, stats.fields, stats.methods);
+    if (stats.orphan_types)
+        LogWarn("{} types are not claimed by any assembly, so they are absent from this dump",
+                stats.orphan_types);
+    LogWarn("field types, field offsets and method addresses are not in the metadata; they "
+            "come from the binary, which this mode does not read");
+
+    const std::string path = out_path.empty() ? "dump.json" : std::string(out_path);
+    std::string error;
+    if (!WriteDumpFile(dump, path, error)) {
+        LogError("could not write '{}': {}", path, error);
+        return 5;
+    }
+
+    Heading("Static dump");
+    Field("output", "{}", path);
+    Field("assemblies", "{}", stats.images);
+    Field("types", "{}", stats.types);
+    return 0;
+}
+
+// How the payload gets told anything. It has no command line, so the CLI leaves key=value
+// beside the DLL and the payload reads it once on the way in and deletes it.
+constexpr const char* kPayloadHandoff = "zircon-payload.cfg";
+
+// What `inject --launch` and `--wait` take when nobody says otherwise. Fifteen minutes is
+// past the slowest walk in the corpus by a wide margin.
+constexpr int kDefaultTimeoutSeconds = 900;
+
+struct InjectOptions {
+    std::string out_path;
+    std::string dll_path;
+    std::string launch;        // an executable to start first
+    std::string mode;          // live or dual; empty means live
+    bool  headless{false};
+    bool  wait{false};
+    int   settle{0};
+    int   timeout{kDefaultTimeoutSeconds};
+};
+
+// Defined further down, next to the rest of the injection plumbing.
+int CommandInject(const TargetSpec& spec, const InjectOptions& options);
+
+// --- finding games on disk -----------------------------------------------------------
+
+struct FoundGame {
+    std::string name;        // the folder, which is what a person calls the game
+    std::string exe;
+    std::string runtime;     // "il2cpp", "mono" or "unreal"
+    std::string metadata;    // global-metadata.dat, when there is one
+};
+
+// The executable that belongs to a game folder.
+//
+// Unity writes <Game>_Data beside <Game>.exe, so the data folder names the exe. Unreal ships
+// a launcher next to the real thing and the real thing is the one ending -Shipping.
+// Helpers Unreal ships beside every game. Named, because nothing about them says "not the
+// game" except what they are called, and picking one produces a manifest that launches a
+// crash reporter forty-eight times.
+bool UnrealHelper(std::string_view stem) {
+    for (const char* name : {"CrashReportClient", "CrashReporter", "UnrealCEFSubProcess",
+                             "EpicWebHelper", "UnrealEditor", "ShaderCompileWorker",
+                             "UnrealPak", "BootstrapPackagedGame"})
+        if (stem.find(name) != std::string_view::npos) return true;
+    return false;
+}
+
+std::string ExecutableIn(const std::filesystem::path& folder, std::string_view runtime) {
+    std::error_code ec;
+    std::string fallback;
+
+    for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+        if (!entry.is_regular_file()) continue;
+        const auto path = entry.path();
+        if (path.extension() != ".exe") continue;
+
+        const auto stem = path.stem().string();
+        if (stem.find("UnityCrashHandler") != std::string::npos) continue;
+        if (runtime == "unreal") {
+            if (UnrealHelper(stem)) continue;
+            if (stem.find("-Shipping") != std::string::npos) return path.string();
+        } else {
+            // Unity: the exe whose name matches a _Data folder beside it.
+            std::error_code inner;
+            if (std::filesystem::is_directory(folder / (stem + "_Data"), inner))
+                return path.string();
+        }
+        if (fallback.empty()) fallback = path.string();
+    }
+    return fallback;
+}
+
+// Walks a directory tree looking for game folders.
+//
+// Bounded by depth rather than by a list of launchers, because games end up anywhere: a
+// Steam library, an Epic folder, a drive somebody unzipped things onto. A folder holding
+// GameAssembly.dll is Unity IL2CPP; UnityPlayer.dll without it is the Mono backend, which is
+// a correct no rather than a gap; a Binaries\\Win64 holding -Shipping.exe is Unreal.
+void ScanFolder(const std::filesystem::path& root, int depth, std::vector<FoundGame>& into) {
+    if (depth < 0) return;
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) return;
+
+    const bool il2cpp = std::filesystem::exists(root / "GameAssembly.dll", ec);
+    const bool unity  = il2cpp || std::filesystem::exists(root / "UnityPlayer.dll", ec);
+    if (unity) {
+        FoundGame game;
+        game.name    = root.filename().string();
+        game.runtime = il2cpp ? "il2cpp" : "mono";
+        game.exe     = ExecutableIn(root, game.runtime);
+        if (il2cpp) {
+            const auto found = MetadataBeside(root);
+            game.metadata = found.string();
+        }
+        if (!game.exe.empty()) into.push_back(std::move(game));
+        return;                       // a game folder does not contain another game
+    }
+
+    std::vector<std::filesystem::path> children;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        const auto name = entry.path().filename().string();
+        // Nothing lives in these and they are enormous.
+        if (name == "Windows" || name == "$Recycle.Bin" || name == "System Volume Information")
+            continue;
+        children.push_back(entry.path());
+    }
+
+    // Unreal: a project folder holding Binaries\Win64. `Engine` is the shared engine and
+    // never the game, so it is only looked at when nothing else turned anything up -- taking
+    // whatever sorted first is how a manifest ends up full of crash reporters.
+    std::string found_exe;
+    for (const bool engine_too : {false, true}) {
+        for (const auto& child : children) {
+            const bool is_engine = child.filename() == "Engine";
+            if (is_engine != engine_too) continue;
+
+            const auto binaries = child / "Binaries" / "Win64";
+            if (!std::filesystem::is_directory(binaries, ec)) continue;
+            const auto exe = ExecutableIn(binaries, "unreal");
+            if (!exe.empty()) {
+                found_exe = exe;
+                break;
+            }
+        }
+        if (!found_exe.empty()) break;
+    }
+    if (!found_exe.empty()) {
+        into.push_back(FoundGame{root.filename().string(), found_exe, "unreal", {}});
+        return;
+    }
+
+    for (const auto& child : children) ScanFolder(child, depth - 1, into);
+}
+
+// Every game under the roots given, as a table or as a batch manifest.
+//
+// The point is the manifest: `zircon scan-games ... -o games.toml` then
+// `zircon batch games.toml` dumps all of them without anybody sitting there.
+int CommandScanGames(const std::vector<std::string>& roots, std::string_view out_path,
+                     bool as_json) {
+    std::vector<std::string> search = roots;
+    if (search.empty()) {
+        // Every fixed drive. A sweep with no arguments is the common case and typing out
+        // drive letters is not something anybody should have to do.
+        for (char letter = 'C'; letter <= 'Z'; ++letter) {
+            const std::string drive = std::string(1, letter) + ":\\";
+            if (::GetDriveTypeA(drive.c_str()) == DRIVE_FIXED) search.push_back(drive);
+        }
+    }
+
+    std::vector<FoundGame> found;
+    for (const auto& root : search) {
+        LogInfo("scanning {}", root);
+        ScanFolder(root, 6, found);
+    }
+
+    std::sort(found.begin(), found.end(), [](const FoundGame& a, const FoundGame& b) {
+        return std::tie(a.runtime, a.name) < std::tie(b.runtime, b.name);
+    });
+
+    if (as_json) {
+        std::printf("[");
+        for (std::size_t i = 0; i < found.size(); ++i) {
+            std::printf("%s{\"name\": %s, \"runtime\": %s, \"exe\": %s, \"metadata\": %s}",
+                        i ? ", " : "", JsonQuote(found[i].name).c_str(),
+                        JsonQuote(found[i].runtime).c_str(), JsonQuote(found[i].exe).c_str(),
+                        JsonQuote(found[i].metadata).c_str());
+        }
+        std::printf("]\n");
+    } else {
+        Heading(std::format("{:<10} {:<34} {}", "RUNTIME", "GAME", "EXECUTABLE"));
+        for (const auto& game : found) {
+            const auto colour = game.runtime == "il2cpp" ? Green()
+                              : game.runtime == "unreal" ? Green()
+                                                         : Grey();
+            std::printf("%.*s%-10s%.*s %-34s %s\n",
+                        static_cast<int>(colour.size()), colour.data(), game.runtime.c_str(),
+                        static_cast<int>(Reset().size()), Reset().data(),
+                        game.name.substr(0, 34).c_str(), game.exe.c_str());
+        }
+        std::printf("\n%zu game(s). Mono ones are listed and cannot be dumped: they have no "
+                    "GameAssembly.dll for the IL2CPP path to talk to.\n", found.size());
+    }
+
+    if (!out_path.empty()) {
+        std::ofstream manifest{std::string(out_path), std::ios::trunc};
+        if (!manifest) {
+            LogError("cannot write {}", out_path);
+            return 5;
+        }
+        manifest << "# Written by zircon scan-games. Run it with: zircon batch "
+                 << out_path << "\n";
+        manifest << "# Delete the ones you do not want. Mono entries are commented out "
+                    "because they cannot be dumped.\n\n";
+        for (const auto& game : found) {
+            const bool can = game.runtime == "il2cpp" || game.runtime == "unreal";
+            const char* lead = can ? "" : "# ";
+            manifest << lead << "[[game]]\n";
+            manifest << lead << "name = \"" << game.name << "\"\n";
+            manifest << lead << "runtime = \"" << game.runtime << "\"\n";
+            manifest << lead << "exe = \"" << game.exe << "\"\n";
+            if (!game.metadata.empty())
+                manifest << lead << "metadata = \"" << game.metadata << "\"\n";
+            manifest << "\n";
+        }
+        std::printf("manifest written to %.*s\n", static_cast<int>(out_path.size()),
+                    out_path.data());
+    }
+    return found.empty() ? 3 : 0;
+}
+
+// --- batch ----------------------------------------------------------------------------
+
+struct BatchEntry {
+    std::string name;
+    std::string runtime;
+    std::string exe;
+    std::string metadata;
+};
+
+// A small TOML reader for exactly the shape scan-games writes: [[game]] tables of
+// key = "value". Not a general TOML parser, and it says so rather than pretending -- a
+// manifest is a list this tool wrote, or one somebody typed by copying that.
+std::vector<BatchEntry> ReadManifest(std::string_view path, std::string& error) {
+    std::vector<BatchEntry> entries;
+    std::ifstream in{std::string(path)};
+    if (!in) {
+        error = "cannot open it";
+        return entries;
+    }
+
+    std::string line;
+    int number = 0;
+    while (std::getline(in, line)) {
+        ++number;
+        // Trim, then drop blanks and comments.
+        const auto first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos) continue;
+        line = line.substr(first);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+
+        if (line == "[[game]]") {
+            entries.emplace_back();
+            continue;
+        }
+        const auto equals = line.find('=');
+        if (equals == std::string::npos) continue;
+        if (entries.empty()) continue;         // a key before any [[game]]
+
+        auto key = line.substr(0, equals);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+
+        auto value = line.substr(equals + 1);
+        const auto open = value.find('"');
+        const auto close = value.rfind('"');
+        if (open == std::string::npos || close <= open) continue;
+        value = value.substr(open + 1, close - open - 1);
+
+        auto& entry = entries.back();
+        if (key == "name")          entry.name = value;
+        else if (key == "runtime")  entry.runtime = value;
+        else if (key == "exe")      entry.exe = value;
+        else if (key == "metadata") entry.metadata = value;
+    }
+    return entries;
+}
+
+// Dumps every game in a manifest, unattended.
+//
+// Each one is the same work `inject --launch --wait` does, run in turn, and one failing does
+// not stop the rest -- the point is to come back to a folder of dumps and a list of what did
+// not work, rather than to find it stopped on the second game four hours ago.
+int CommandBatch(std::string_view manifest_path, std::string_view out_dir,
+                 const InjectOptions& base) {
+    std::string error;
+    const auto entries = ReadManifest(manifest_path, error);
+    if (!error.empty()) {
+        LogError("{}: {}", manifest_path, error);
+        return 5;
+    }
+    if (entries.empty()) {
+        LogError("{} has no [[game]] entries", manifest_path);
+        return 1;
+    }
+
+    const std::filesystem::path folder = out_dir.empty() ? std::filesystem::path("zircon-batch")
+                                                         : std::filesystem::path(out_dir);
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+
+    int failed = 0;
+    int done = 0;
+    for (const auto& entry : entries) {
+        if (entry.exe.empty() && entry.metadata.empty()) continue;
+
+        const std::string stem = entry.name.empty() ? std::string("game") : entry.name;
+        const auto out = (folder / (stem + ".json.gz")).string();
+        Heading(std::format("{} ({})", stem, entry.runtime));
+
+        int result = 0;
+        if (entry.runtime == "il2cpp" && !entry.exe.empty()) {
+            InjectOptions options = base;
+            options.launch   = entry.exe;
+            options.out_path = out;
+            options.wait     = true;
+            options.headless = true;
+            TargetSpec spec;
+            result = CommandInject(spec, options);
+
+            // A game whose runtime faults partway through gives nothing. Its metadata still
+            // gives the type system, which is most of what the dump was for, so take that
+            // rather than leaving a hole in the batch.
+            if (result != 0 && !entry.metadata.empty()) {
+                LogWarn("{}: the live walk did not finish, falling back to its metadata",
+                        stem);
+                result = CommandStaticDump(entry.metadata, out);
+            }
+        } else if (!entry.metadata.empty()) {
+            // No executable, or a runtime the injected walk cannot reach. The file still can.
+            result = CommandStaticDump(entry.metadata, out);
+        } else {
+            LogWarn("{}: nothing to do -- {} games are not dumpable by injection and this "
+                    "entry has no metadata file", stem, entry.runtime);
+            continue;
+        }
+
+        if (result == 0) {
+            ++done;
+        } else {
+            ++failed;
+            LogError("{} failed with {}; carrying on", stem, result);
+        }
+    }
+
+    Heading("Batch");
+    Field("dumped", "{}", done);
+    Field("failed", "{}", failed);
+    Field("output", "{}", folder.string());
+    return failed == 0 ? 0 : 4;
+}
+
+// What Zircon works out about a global-metadata.dat without being told its version.
+//
+// A diagnostic rather than a dump: it answers "can this file be read at all", which is the
+// first question for any target that cannot be run -- an APK, a console build, a game with
+// anti-cheat.
+int CommandMetadata(std::string_view path) {
+    if (path.empty()) {
+        LogError("metadata needs a file: zircon metadata <global-metadata.dat>");
+        return 1;
+    }
+
+    std::ifstream in(std::string(path), std::ios::binary | std::ios::ate);
+    if (!in) {
+        LogError("cannot open {}", path);
+        return 5;
+    }
+    const auto size = static_cast<std::size_t>(in.tellg());
+    in.seekg(0);
+
+    std::vector<std::uint8_t> bytes(size);
+    if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size))) {
+        LogError("cannot read {}", path);
+        return 5;
+    }
+
+    const auto solved = zircon::il2cpp::SolveMetadataLayout(bytes);
+    if (!solved) {
+        LogError("{}", solved.error().message);
+        return 3;
+    }
+    const auto& layout = solved.value();
+
+    FieldStrong("metadata version", std::to_string(layout.version));
+    Field("file", "{} ({:.1f} MiB)", path, static_cast<double>(size) / (1024.0 * 1024.0));
+    Field("header", "{} spans, {} int32 each", layout.spans.size(), layout.ints_per_entry);
+
+    const auto rows = [&](std::string_view label, int span, int record) {
+        if (span < 0) {
+            Field(label, "not identified");
+            return;
+        }
+        const auto& s = layout.Span(span);
+        if (record > 0)
+            Field(label, "span {}, {} records of {} bytes", span, s.size / record, record);
+        else
+            Field(label, "span {}, {} bytes", span, s.size);
+    };
+
+    rows("strings",    layout.tables.strings,    0);
+    rows("types",      layout.tables.types,      layout.type_record);
+    rows("images",     layout.tables.images,     layout.image_record);
+    rows("fields",     layout.tables.fields,     layout.field_record);
+    rows("methods",    layout.tables.methods,    layout.method_record);
+    rows("parameters", layout.tables.parameters, layout.parameter_record);
+
+    Evidence(layout.evidence);
+
+    // The first type in any assembly is <Module>. Printing it is the cheapest end-to-end
+    // proof that the string table and the type record agree.
+    if (layout.tables.types >= 0) {
+        const auto& span = layout.Span(layout.tables.types);
+        const auto name = zircon::il2cpp::MetadataString(
+            bytes, layout, *reinterpret_cast<const std::int32_t*>(bytes.data() + span.offset));
+        Field("first type", "{}", name.empty() ? "<unreadable>" : name);
+    }
+    return 0;
 }
 
 int CommandModules(const TargetSpec& spec) {
@@ -338,11 +1161,43 @@ int CommandScan(const TargetSpec& spec, std::string_view pattern_text,
     return 0;
 }
 
+// Unity rows for `detect`. Separate from the Unreal table because there is no score to
+// print: a folder has GameAssembly.dll beside it or it doesn't.
+void PrintUnityProcesses(const std::vector<zircon::il2cpp::UnityProcess>& unity) {
+    if (unity.empty()) return;
+
+    std::printf("\n");
+    Heading(std::format("{:<6} {:<8} {:<40} {}", "READY", "PID", "PROCESS", "RUNTIME"));
+    for (const auto& entry : unity) {
+        const auto colour = entry.runtime_loaded ? Green() : Yellow();
+        std::printf("%.*s%-6s%.*s %.*s%-8u%.*s %-40s %s\n",
+                    static_cast<int>(colour.size()), colour.data(),
+                    entry.runtime_loaded ? "yes" : "not yet",
+                    static_cast<int>(Reset().size()), Reset().data(),
+                    static_cast<int>(Dim().size()), Dim().data(),
+                    entry.process.pid,
+                    static_cast<int>(Reset().size()), Reset().data(),
+                    entry.process.name.c_str(),
+                    entry.runtime_loaded ? "Unity IL2CPP, GameAssembly.dll loaded"
+                                         : "Unity IL2CPP, still starting");
+    }
+    std::printf("%.*sUnity is dumped from inside: zircon inject --pid <n>%.*s\n",
+                static_cast<int>(Dim().size()), Dim().data(),
+                static_cast<int>(Reset().size()), Reset().data());
+}
+
 int CommandDetect() {
     const auto candidates = zircon::engine::DetectUnrealProcesses(0.2f);
-    if (candidates.empty()) {
-        LogWarn("no Unreal Engine processes detected");
+    const auto unity      = zircon::il2cpp::DetectUnityProcesses();
+
+    if (candidates.empty() && unity.empty()) {
+        LogWarn("no Unreal Engine or Unity IL2CPP processes detected");
         return 3;
+    }
+
+    if (candidates.empty()) {
+        PrintUnityProcesses(unity);
+        return 0;
     }
 
     Heading(std::format("{:<6} {:<8} {:<40} {}", "SCORE", "PID", "PROCESS", "PROJECT"));
@@ -368,22 +1223,53 @@ int CommandDetect() {
                             static_cast<int>(Reset().size()), Reset().data());
         }
     }
+
+    PrintUnityProcesses(unity);
     return 0;
 }
 
-int CommandFingerprint(const TargetSpec& spec) {
+int CommandFingerprint(const TargetSpec& spec, bool as_json) {
+    // Machine-readable means only the object on stdout. The runtime search logs a line of
+    // its own on the way past and a parser has no way to know it isn't part of the answer.
+    if (as_json) SetLogLevel(LogLevel::Error);
+
     auto source = OpenTarget(spec);
     if (!source) {
-        LogError("{}", source.error().message);
+        // Even a failure is JSON when JSON was asked for. A script that has to tell an
+        // error apart by whether the output parses is a script that will get it wrong.
+        if (as_json)
+            std::printf("{\"ok\": false, \"error\": %s}\n",
+                        JsonQuote(source.error().message).c_str());
+        else
+            LogError("{}", source.error().message);
         return source.error().code;
     }
 
     auto mem = MakeCached(std::move(source.value()));
-    LogInfo("target: {}", mem->Describe());
+    if (!as_json) LogInfo("target: {}", mem->Describe());
 
     // Unity first. IL2CPP is a yes/no (a module exports the API or it doesn't), the Unreal
     // fingerprint is a score that will happily guess low about a non-Unreal game.
     if (const auto unity = zircon::il2cpp::FindRuntime(*mem)) {
+        if (as_json) {
+            std::printf("{\"ok\": true, \"runtime\": \"il2cpp\", \"module\": %s, "
+                        "\"module_base\": %llu, \"entry_points_resolved\": %d, "
+                        "\"entry_points_required\": %d, \"entry_points_optional\": %d, "
+                        "\"optional_resolved\": %d, \"complete\": %s, "
+                        "\"confidence\": %.2f, \"missing\": %s, \"evidence\": %s}\n",
+                        JsonQuote(unity->module_name).c_str(),
+                        static_cast<unsigned long long>(Raw(unity->module_base)),
+                        unity->api.resolved,
+                        zircon::il2cpp::RequiredEntryPointCount(),
+                        zircon::il2cpp::OptionalEntryPointCount(),
+                        unity->api.enrichment,
+                        unity->api.Complete() ? "true" : "false",
+                        unity->confidence,
+                        JsonList(unity->api.missing).c_str(),
+                        JsonList(unity->evidence).c_str());
+            return unity->api.Complete() ? 0 : 3;
+        }
+
         FieldStrong("runtime", "Unity IL2CPP");
         Field("module", "{} at {:#x}", unity->module_name, Raw(unity->module_base));
         Field("api", "{}/{} entry points resolved", unity->api.resolved,
@@ -400,6 +1286,21 @@ int CommandFingerprint(const TargetSpec& spec) {
     }
 
     const auto profile = zircon::engine::FingerprintEngine(*mem);
+
+    if (as_json) {
+        std::printf("{\"ok\": true, \"runtime\": \"unreal\", \"version\": %s, "
+                    "\"known\": %s, \"confidence\": %.2f, \"fproperty\": %s, "
+                    "\"chunked_name_pool\": %s, \"chunked_gobjects\": %s, "
+                    "\"evidence\": %s}\n",
+                    JsonQuote(profile.VersionString()).c_str(),
+                    profile.Known() ? "true" : "false",
+                    profile.confidence,
+                    profile.uses_fproperty ? "true" : "false",
+                    profile.chunked_name_pool ? "true" : "false",
+                    profile.chunked_gobjects ? "true" : "false",
+                    JsonList(profile.evidence).c_str());
+        return profile.Known() ? 0 : 3;
+    }
 
     FieldStrong("engine version", profile.VersionString());
     Field("confidence", "{:.0f}%", profile.confidence * 100.0);
@@ -640,10 +1541,124 @@ int CommandInstall(bool remove) {
 
 // The one operation that needs a pid specifically. A name is ambiguous, and a dump or a PE
 // on disk has no process to load anything into.
-int CommandInject(const TargetSpec& spec, std::string_view dll_path) {
+bool ProcessAlive(std::uint32_t pid) {
+    HANDLE handle = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!handle) return false;
+
+    DWORD code = 0;
+    const bool running = ::GetExitCodeProcess(handle, &code) && code == STILL_ACTIVE;
+    ::CloseHandle(handle);
+    return running;
+}
+
+// Starts a game and waits for its IL2CPP runtime to come up.
+//
+// The tester's point, and he is right: the runtime already says when it is ready. Polling
+// for GameAssembly.dll plus the entry points beats guessing a sleep per game, which is
+// "always wrong twice" -- too short on a cold disk, wasted on a warm one.
+std::uint32_t LaunchAndWait(const std::string& exe, int timeout_seconds) {
+    const std::filesystem::path path{exe};
+
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        LogError("no such executable: {}", exe);
+        return 0;
+    }
+
+    STARTUPINFOW        startup{};
+    PROCESS_INFORMATION process{};
+    startup.cb = sizeof(startup);
+
+    // Its own directory, because a game started from somewhere else looks for its data
+    // beside the working directory and usually just exits.
+    const auto folder  = path.parent_path().wstring();
+    auto       command = L"\"" + path.wstring() + L"\"";
+
+    if (!::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                          folder.empty() ? nullptr : folder.c_str(), &startup, &process)) {
+        LogError("could not start {} (error {})", exe, ::GetLastError());
+        return 0;
+    }
+    ::CloseHandle(process.hThread);
+    ::CloseHandle(process.hProcess);
+
+    const std::uint32_t pid = process.dwProcessId;
+    LogInfo("started {} as pid {}", path.filename().string(), pid);
+
+    for (int elapsed = 0; elapsed < timeout_seconds; ++elapsed) {
+        if (!ProcessAlive(pid)) {
+            // Launchers do this: the exe you start hands off to another process and exits.
+            for (const auto& other : zircon::il2cpp::DetectUnityProcesses()) {
+                if (!other.runtime_loaded) continue;
+                LogInfo("{} handed off to {} (pid {})", path.filename().string(),
+                        other.process.name, other.process.pid);
+                return other.process.pid;
+            }
+            LogError("{} exited before its runtime came up", path.filename().string());
+            return 0;
+        }
+
+        for (const auto& candidate : zircon::il2cpp::DetectUnityProcesses()) {
+            if (candidate.process.pid != pid || !candidate.runtime_loaded) continue;
+            LogInfo("GameAssembly.dll mapped after {}s", elapsed);
+            return pid;
+        }
+        ::Sleep(1000);
+    }
+
+    LogError("{} did not map GameAssembly.dll within {}s", path.filename().string(),
+             timeout_seconds);
+    return 0;
+}
+
+// Blocks until the payload says it is done, the game dies, or the clock runs out. The
+// signal is a file the payload writes once at the end -- waiting on the dump file instead
+// means racing a 600 MB write, which is non-empty long before it is finished.
+int WaitForPayload(std::uint32_t pid, const std::filesystem::path& status, int timeout_seconds) {
+    LogInfo("waiting for the walk to finish (up to {}s)", timeout_seconds);
+
+    for (int elapsed = 0; elapsed < timeout_seconds; ++elapsed) {
+        std::ifstream in(status);
+        if (in) {
+            std::string outcome, detail;
+            std::getline(in, outcome);
+            std::getline(in, detail);
+            in.close();
+
+            std::error_code ec;
+            std::filesystem::remove(status, ec);
+
+            if (outcome == "ok") {
+                std::printf("done in %ds: %s\n", elapsed, detail.c_str());
+                return 0;
+            }
+            LogError("the payload gave up: {}", detail);
+            return 4;
+        }
+
+        if (!ProcessAlive(pid)) {
+            LogError("pid {} died after {}s without finishing; the log under zircon-out "
+                     "says what it was reading", pid, elapsed);
+            return 4;
+        }
+        ::Sleep(1000);
+    }
+
+    LogError("still walking after {}s; raise --timeout if this game is just slow", timeout_seconds);
+    return 4;
+}
+
+int CommandInject(const TargetSpec& spec, const InjectOptions& options) {
+    const std::string_view out_path = options.out_path;
+    const std::string_view dll_path = options.dll_path;
+    const bool             headless = options.headless;
+
     std::uint32_t pid = spec.pid;
 
-    if (spec.kind == TargetSpec::Kind::ProcessName) {
+    if (!options.launch.empty()) {
+        pid = LaunchAndWait(options.launch, options.timeout);
+        if (pid == 0) return 4;
+    } else if (spec.kind == TargetSpec::Kind::ProcessName) {
         std::vector<std::uint32_t> matches;
         for (const auto& process : zircon::core::EnumerateProcesses())
             if (process.name.find(spec.value) != std::string::npos)
@@ -670,16 +1685,70 @@ int CommandInject(const TargetSpec& spec, std::string_view dll_path) {
         payload = std::filesystem::path(self).parent_path() / "zircon.dll";
     }
 
+    // Where the payload will say how it went. Named after the pid so two injections at
+    // once do not read each other's.
+    std::error_code ec;
+    const auto status = std::filesystem::temp_directory_path(ec) /
+                        std::format("zircon-{}.status", pid);
+    std::filesystem::remove(status, ec);
+
+    // Written before the load. Paths go in absolute, because the payload resolves them
+    // inside the game's working directory and that is rarely this one.
+    const auto handoff = payload.parent_path() / kPayloadHandoff;
+    const bool anything_to_say = !out_path.empty() || headless || options.wait ||
+                                 options.settle > 0 || !options.mode.empty();
+    if (!anything_to_say) {
+        std::filesystem::remove(handoff, ec);
+    } else {
+        std::ofstream note(handoff, std::ios::trunc);
+        if (!note) {
+            LogError("cannot write {}, so the payload would not see these options",
+                     handoff.string());
+            return 5;
+        }
+        if (!out_path.empty()) {
+            const auto absolute = std::filesystem::absolute(out_path, ec);
+            note << "out=" << (ec ? std::filesystem::path(out_path) : absolute).string()
+                 << "\n";
+        }
+        if (headless)              note << "headless=1\n";
+        if (options.wait)          note << "status=" << status.string() << "\n";
+        if (options.settle > 0)    note << "settle=" << options.settle << "\n";
+        if (!options.mode.empty()) note << "mode=" << options.mode << "\n";
+    }
+
     LogInfo("injecting {} into pid {}", payload.string(), pid);
     if (const auto result = zircon::core::Inject(pid, payload.string()); !result) {
         LogError("{}", result.error().message);
+        std::filesystem::remove(handoff, ec);
         return 4;
     }
 
     std::printf("payload loaded into pid %u\n", pid);
-    std::printf("it opens its own console and window inside the game; output goes to %s\n",
-                (payload.parent_path() / "zircon-out").string().c_str());
-    return 0;
+    if (!out_path.empty())
+        std::printf("the dump will be written to %s\n",
+                    std::filesystem::absolute(out_path, ec).string().c_str());
+    if (!headless)
+        std::printf("it opens its own console and window inside the game; output goes to %s\n",
+                    (payload.parent_path() / "zircon-out").string().c_str());
+    else
+        std::printf("no console, as asked; the log is in %s\n",
+                    (payload.parent_path() / "zircon-out" / "logs").string().c_str());
+
+    if (!options.wait) return 0;
+
+    const int result = WaitForPayload(pid, status, options.timeout);
+
+    // Started by us, so it is ours to close. A game left running after a batch of these is
+    // a machine with twelve games on it.
+    if (result == 0 && !options.launch.empty()) {
+        if (HANDLE handle = ::OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
+            ::TerminateProcess(handle, 0);
+            ::CloseHandle(handle);
+            LogInfo("closed pid {}", pid);
+        }
+    }
+    return result;
 }
 
 // Hands off to zircon-gui.exe next door. The browser is a separate binary since it drags
@@ -1467,7 +2536,7 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
 
     const std::string path{out_path.empty() ? "dump.json" : out_path};
     std::string error;
-    if (!zircon::ir::WriteJsonFile(dump, path, error)) {
+    if (!WriteDumpFile(dump, path, error)) {
         LogError("could not write '{}': {}", path, error);
         return 5;
     }
@@ -2197,6 +3266,14 @@ int main(int argc, char** argv) {
 
     std::string_view command = args.front();
     if (command == "-h" || command == "--help") { PrintUsage(); return 0; }
+
+    // Asked before the options are parsed, because half the point is that a command with a
+    // flag you got wrong still explains itself instead of complaining about the flag.
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (args[i] != "-h" && args[i] != "--help") continue;
+        if (!PrintCommandHelp(command)) PrintUsage();
+        return 0;
+    }
     if (command == "--version") { std::printf("zircon %s\n", kVersion); return 0; }
 
     TargetSpec  spec;
@@ -2207,6 +3284,15 @@ int main(int argc, char** argv) {
     std::string assignment;
     std::string predicate;
     std::string out_path;
+    std::string dll_path;
+    bool        headless = false;
+    std::string metadata_path;
+    std::string walk_mode;
+    std::vector<std::string> scan_roots;
+    std::string launch_exe;
+    bool        wait_for_payload = false;
+    int         settle_seconds = 0;
+    int         timeout_seconds = kDefaultTimeoutSeconds;
     std::string validate_path;
     std::string emit_format;
     std::string diff_before, diff_after;
@@ -2217,6 +3303,7 @@ int main(int argc, char** argv) {
     bool        uses = false;
     bool        publish_after = false;
     bool        no_wait = false;
+    bool        dry_run = false;
     bool        json_output = false;
     bool        assume_yes = false;
     bool        open_browser = false;
@@ -2304,6 +3391,43 @@ int main(int argc, char** argv) {
             const auto value = next(arg);
             if (!value) return 1;
             out_path = *value;
+        } else if (arg == "--metadata") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            metadata_path = *value;
+        } else if (arg == "--mode") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            if (*value != "live" && *value != "static" && *value != "dual") {
+                LogError("unknown mode '{}'; it is live, static or dual", *value);
+                return 1;
+            }
+            walk_mode = *value;
+        } else if (arg == "--headless") {
+            headless = true;
+        } else if (arg == "--wait") {
+            wait_for_payload = true;
+        } else if (arg == "--launch") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            launch_exe = *value;
+        } else if (arg == "--timeout") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            const auto parsed = ParseU32(*value);
+            if (!parsed || *parsed == 0) { LogError("invalid timeout: {}", *value); return 1; }
+            timeout_seconds = static_cast<int>(*parsed);
+        } else if (arg == "--wait-for-settle") {
+            // Optional value: bare means "use a sensible ceiling".
+            settle_seconds = 60;
+            if (i + 1 < args.size() && IsPositional(args[i + 1])) {
+                const auto parsed = ParseU32(args[i + 1]);
+                if (parsed && *parsed > 0) { settle_seconds = static_cast<int>(*parsed); ++i; }
+            }
+        } else if (arg == "--dll") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            dll_path = *value;
         } else if (arg == "--plugins") {
             const auto value = next(arg);
             if (!value) return 1;
@@ -2328,6 +3452,8 @@ int main(int argc, char** argv) {
             uses = true;
         } else if (arg == "--publish") {
             publish_after = true;
+        } else if (arg == "--dry-run") {
+            dry_run = true;
         } else if (arg == "--no-wait") {
             no_wait = true;
         } else if (arg == "--json") {
@@ -2354,7 +3480,10 @@ int main(int argc, char** argv) {
             const auto value = next(arg);
             if (!value) return 1;
             zdex_notes = *value;
-        } else if ((command == "validate" || command == "xref") &&
+        } else if (command == "scan-games" && IsPositional(arg)) {
+            scan_roots.emplace_back(arg);
+        } else if ((command == "validate" || command == "xref" || command == "metadata" ||
+                    command == "batch") &&
                    validate_path.empty() && IsPositional(arg)) {
             validate_path = arg;
         } else if ((command == "publish" || command == "fetch" || command == "login") &&
@@ -2400,8 +3529,23 @@ int main(int argc, char** argv) {
     if (command == "detect")      return CommandDetect();
     if (command == "install")     return CommandInstall(false);
     if (command == "uninstall")   return CommandInstall(true);
-    if (command == "inject")      return CommandInject(spec, out_path);
-    if (command == "fingerprint") return CommandFingerprint(spec);
+    if (command == "inject") {
+        InjectOptions inject;
+        inject.out_path = out_path;
+        inject.dll_path = dll_path;
+        inject.launch   = launch_exe;
+        inject.headless = headless;
+        inject.wait     = wait_for_payload;
+        inject.settle   = settle_seconds;
+        inject.timeout  = timeout_seconds;
+        if (walk_mode == "static") {
+            LogError("static mode needs no process: zircon dump --metadata <file>");
+            return 1;
+        }
+        inject.mode = walk_mode;
+        return CommandInject(spec, inject);
+    }
+    if (command == "fingerprint") return CommandFingerprint(spec, json_output);
     if (command == "objects")     return CommandObjects(spec, name_filter, limit);
     if (command == "names")       return CommandNames(spec, limit);
     if (command == "classes")     return CommandClasses(spec, name_filter, limit);
@@ -2412,6 +3556,16 @@ int main(int argc, char** argv) {
     if (command == "write")       return CommandWrite(spec, name_filter, assignment);
     if (command == "find")        return CommandFind(spec, name_filter, predicate, limit);
     if (command == "dump") {
+        // No process needed, and none asked for: read the file and stop.
+        if (!metadata_path.empty() || walk_mode == "static") {
+            if (metadata_path.empty()) {
+                LogError("--mode static needs the metadata file: "
+                         "--metadata <global-metadata.dat>");
+                return 1;
+            }
+            return CommandStaticDump(metadata_path, out_path);
+        }
+
         PublishAfterDump publish;
         publish.requested    = publish_after;
         publish.game         = zdex_game;
@@ -2443,6 +3597,7 @@ int main(int argc, char** argv) {
         publish.json_output  = json_output;
         publish.assume_yes   = assume_yes;
         publish.open_browser = open_browser;
+        publish.dry_run      = dry_run;
         return zircon::app::CommandPublish(publish);
     }
     if (command == "emit")        return CommandEmit(emit_format, validate_path, out_path,
@@ -2453,6 +3608,16 @@ int main(int argc, char** argv) {
     if (command == "inspect")     return CommandInspect(spec, name_filter, limit);
     if (command == "browse")  return CommandBrowse(spec);
     if (command == "modules") return CommandModules(spec);
+    if (command == "metadata") return CommandMetadata(validate_path);
+    if (command == "scan-games") return CommandScanGames(scan_roots, out_path, json_output);
+    if (command == "batch") {
+        InjectOptions base;
+        base.dll_path = dll_path;
+        base.mode     = walk_mode == "static" ? std::string{} : walk_mode;
+        base.settle   = settle_seconds;
+        base.timeout  = timeout_seconds;
+        return CommandBatch(validate_path, out_path, base);
+    }
     if (command == "scan")    return CommandScan(spec, pattern_text, scan_module, all_regions);
 
     LogError("unknown command: {}", command);

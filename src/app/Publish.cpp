@@ -278,6 +278,21 @@ int CommandPublish(const PublishOptions& options) {
         return ExitFor(zdex::Outcome::Usage);
     }
 
+    // --- everything that can be checked without sending anything ---------------------
+    if (options.dry_run) {
+        const auto size = std::filesystem::file_size(options.path, ec);
+        FieldStrong("dry run", "nothing will be sent");
+        Field("file", options.path);
+        Field("size", ec ? std::string("unknown") : Human(size));
+        Field("game", options.game);
+        Field("label", options.label);
+        if (!options.notes.empty()) Field("notes", options.notes);
+        Field("server", config.base_url);
+        Field("key", config.KeyHint());
+        std::printf("\nIt would be accepted. Drop --dry-run to send it.\n");
+        return 0;
+    }
+
     // --- the one-time confirmation ---------------------------------------------------
     if (!options.assume_yes && config.terms_accepted_for != config.KeyHint()) {
         std::printf(

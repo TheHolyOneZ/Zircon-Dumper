@@ -229,13 +229,15 @@ void Browser::DrawUnityNotice() {
     std::error_code ec;
     const bool have_payload = !payload.empty() && std::filesystem::exists(payload, ec);
 
-    if (ImGui::BeginTable("unity", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+    if (ImGui::BeginTable("unity", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
         ImGui::TableSetupColumn("PID",     ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Runtime", ImGuiTableColumnFlags_WidthFixed, 110.0f);
         ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 150.0f);
         ImGui::TableHeadersRow();
 
-        for (const auto& process : unity_candidates_) {
+        for (const auto& entry : unity_candidates_) {
+            const auto& process = entry.process;
             ImGui::TableNextRow();
             ImGui::PushID(static_cast<int>(process.pid));
 
@@ -245,7 +247,15 @@ void Browser::DrawUnityNotice() {
             ImGui::TextUnformatted(process.name.c_str());
             ImGui::TableNextColumn();
 
-            ImGui::BeginDisabled(!have_payload);
+            // A game that has just been started has GameAssembly.dll on disk minutes before
+            // it is mapped, and injecting into that gap gets you nothing.
+            if (entry.runtime_loaded)
+                ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.45f, 1.0f), "loaded");
+            else
+                ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.40f, 1.0f), "starting");
+            ImGui::TableNextColumn();
+
+            ImGui::BeginDisabled(!have_payload || !entry.runtime_loaded);
             if (ImGui::Button("Inject and dump", ImVec2(-FLT_MIN, 0.0f))) {
                 if (const auto result = core::Inject(process.pid, payload)) {
                     unity_status_ = "payload loaded into pid " + std::to_string(process.pid) +
@@ -279,39 +289,6 @@ void Browser::DrawUnityNotice() {
                         "json it wrote.");
 }
 
-// Unity games the picker should mention but can't browse.
-//
-// Found by looking for GameAssembly.dll beside the exe, not by reading the process -- this
-// runs while the picker is on screen and opening every process on the machine for a
-// question nobody asked yet isn't worth it. A hint; what a target actually is still comes
-// from its export table.
-std::vector<core::ProcessInfo> Browser::DetectUnityProcesses() {
-    std::vector<core::ProcessInfo> found;
-    std::error_code ec;
-
-    // Unity's crash handler sits beside the game and passes the folder test. Named rather
-    // than inferred; nothing about the process distinguishes it.
-    const auto is_unity_helper = [](std::string_view name) {
-        return name == "UnityCrashHandler64.exe" || name == "UnityCrashHandler32.exe";
-    };
-
-    for (auto& process : core::EnumerateProcesses()) {
-        if (process.path.empty()) continue;   // no access to look, so no claim either way
-        if (is_unity_helper(process.name)) continue;
-
-        const auto folder = std::filesystem::path(process.path).parent_path();
-        for (const char* runtime : {"GameAssembly.dll", "UnityPlayer.dll"}) {
-            if (!std::filesystem::exists(folder / runtime, ec)) continue;
-            if (std::string(runtime) == "UnityPlayer.dll" &&
-                !std::filesystem::exists(folder / "GameAssembly.dll", ec))
-                break;                        // Unity, but the Mono backend
-            found.push_back(std::move(process));
-            break;
-        }
-    }
-    return found;
-}
-
 void Browser::DrawAttachPanel() {
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.89f, 0.90f, 0.93f, 1.0f));
@@ -326,7 +303,7 @@ void Browser::DrawAttachPanel() {
     const double now = ImGui::GetTime();
     if (candidates_refreshed_at_ < 0.0 || now - candidates_refreshed_at_ > 2.0) {
         candidates_ = engine::DetectUnrealProcesses(0.2f);
-        unity_candidates_ = DetectUnityProcesses();
+        unity_candidates_ = il2cpp::DetectUnityProcesses();
         candidates_refreshed_at_ = now;
     }
 

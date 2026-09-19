@@ -113,7 +113,11 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
   owns outright are writable: numbers, bools and enums. Containers, strings and structs
   are refused, since their memory carries allocator state that a plain byte write
   corrupts without any immediate symptom.
-- **Non-UE engines.**
+- **Engines whose type system is not there to be read.** Unreal and Unity IL2CPP both keep a
+  full description of their own types, which is what makes this work at all — one as data in
+  memory, the other behind an exported C API. An engine that ships no reflection is a
+  decompilation problem, not this one. Unity's Mono backend is a correct "no" for a different
+  reason: no `GameAssembly.dll`, so the IL2CPP path has nothing to talk to.
 - **Overlaying the game's own rendering.** The injected payload opens its own window
   rather than hooking the swap chain's `Present`. A Present hook means writing a
   trampoline over code the game owns, which is the rule above; a separate window is the

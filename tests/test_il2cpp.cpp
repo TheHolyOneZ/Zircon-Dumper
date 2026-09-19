@@ -3,6 +3,8 @@
 
 #include "core/MemorySource.h"
 #include "il2cpp/Bridge.h"
+#include "il2cpp/Metadata.h"
+#include "il2cpp/Static.h"
 #include "il2cpp/MethodLayout.h"
 #include "il2cpp/Runtime.h"
 #include "il2cpp/Walker.h"
@@ -11,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -138,6 +141,312 @@ void TestModuleNames() {
     CHECK(LooksLikeIl2CppModuleName("UnityFramework"));
     CHECK(!LooksLikeIl2CppModuleName("UnityPlayer.dll"));   // Unity, but not the runtime
     CHECK(!LooksLikeIl2CppModuleName("mono-2.0-bdwgc.dll"));// Mono backend, not IL2CPP
+}
+
+// ---------------------------------------------------------------------------------
+// The metadata constraint solver
+// ---------------------------------------------------------------------------------
+
+// A global-metadata.dat built byte by byte, so the solver can be tested on a file whose
+// right answer is known and whose layout is deliberately *not* one a real Unity ever
+// shipped: spans in an odd order, a record size nothing uses, the name in a slot that is
+// not the first. Anything the solver gets right here, it got right by constraint.
+struct SyntheticMetadata {
+    std::vector<std::uint8_t> bytes;
+
+    // What it was built to contain, for the test to compare against.
+    int type_span{0};
+    int field_span{0};
+    int string_span{0};
+    int type_record{0};
+    std::uint32_t type_count{0};
+    std::uint32_t field_count{0};
+};
+
+SyntheticMetadata BuildMetadata(std::int32_t version, int spans_total, int type_span,
+                                int field_span, int string_span, int type_record,
+                                int name_slot, int ints_per_entry) {
+    SyntheticMetadata out;
+    out.type_span = type_span;
+    out.field_span = field_span;
+    out.string_span = string_span;
+    out.type_record = type_record;
+
+    // Names first: every record has to point at one of these. One per type and one per
+    // field, all distinct, because real types have distinct paths and a merge keyed on the
+    // path behaves differently when they do not.
+    std::vector<std::uint32_t> at;
+    std::vector<std::uint8_t> blob;
+    const auto add_name = [&](const std::string& name) {
+        at.push_back(static_cast<std::uint32_t>(blob.size()));
+        blob.insert(blob.end(), name.begin(), name.end());
+        blob.push_back(0);
+    };
+    add_name("<Module>");
+    add_name("Game");
+    for (int i = 0; i < 256; ++i) add_name("Type" + std::to_string(i));
+    for (int i = 0; i < 512; ++i) add_name("field" + std::to_string(i));
+    while (blob.size() < 4096) add_name("Filler" + std::to_string(blob.size()));
+
+    constexpr std::size_t kFirstType  = 2;
+    constexpr std::size_t kFirstField = kFirstType + 256;
+
+    // 64 types, each with a name, a namespace and a run of fields. The runs are shuffled
+    // so they partition the field table without being in type order, which is what a real
+    // one does and what an earlier version of the solver could not cope with.
+    constexpr std::uint32_t kTypes = 64;
+    constexpr std::uint16_t kFieldsEach = 3;
+    out.type_count = kTypes;
+    out.field_count = kTypes * kFieldsEach;
+
+    std::vector<std::uint32_t> order(kTypes);
+    for (std::uint32_t i = 0; i < kTypes; ++i) order[i] = i;
+    for (std::uint32_t i = 0; i + 1 < kTypes; i += 2) std::swap(order[i], order[i + 1]);
+
+    const int slots = type_record / 4;
+    std::vector<std::uint8_t> types(static_cast<std::size_t>(kTypes) * type_record, 0);
+    const int start_slot = slots - 3;
+    const int count_slot = (slots - 2) * 2;         // uint16 half of the last-but-one int32
+    for (std::uint32_t i = 0; i < kTypes; ++i) {
+        auto* record = types.data() + static_cast<std::size_t>(i) * type_record;
+        const std::uint32_t name = at[kFirstType + i];
+        const std::uint32_t space = at[1];            // one namespace for all of them
+        std::memcpy(record + static_cast<std::size_t>(name_slot) * 4, &name, 4);
+        std::memcpy(record + static_cast<std::size_t>(name_slot + 1) * 4, &space, 4);
+
+        const std::int32_t field_start = static_cast<std::int32_t>(order[i] * kFieldsEach);
+        std::memcpy(record + static_cast<std::size_t>(start_slot) * 4, &field_start, 4);
+        const std::uint16_t many = kFieldsEach;
+        std::memcpy(record + static_cast<std::size_t>(count_slot) * 2, &many, 2);
+
+        // A metadata token, table id in the top byte, the way ECMA-335 defines one.
+        const std::uint32_t token = 0x02000001u + i;
+        std::memcpy(record + static_cast<std::size_t>(slots - 1) * 4, &token, 4);
+    }
+
+    // Fields: a name and two numbers, the shape a real field record has.
+    constexpr int kFieldRecord = 12;
+    std::vector<std::uint8_t> fields(static_cast<std::size_t>(out.field_count) * kFieldRecord, 0);
+    for (std::uint32_t i = 0; i < out.field_count; ++i) {
+        const std::uint32_t name = at[kFirstField + (i % 512)];
+        std::memcpy(fields.data() + static_cast<std::size_t>(i) * kFieldRecord, &name, 4);
+        const std::uint32_t token = 0x04000001u + i;
+        std::memcpy(fields.data() + static_cast<std::size_t>(i) * kFieldRecord + 8, &token, 4);
+    }
+
+    // Lay the spans out in the order asked for, tiling from the end of the header.
+    const std::size_t header = 8 + static_cast<std::size_t>(spans_total) * ints_per_entry * 4;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>*>> content(
+        static_cast<std::size_t>(spans_total), {0, nullptr});
+    content[static_cast<std::size_t>(string_span)].second = &blob;
+    content[static_cast<std::size_t>(type_span)].second   = &types;
+    content[static_cast<std::size_t>(field_span)].second  = &fields;
+
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> table(
+        static_cast<std::size_t>(spans_total), {0, 0});
+    std::vector<std::uint8_t> body;
+    std::uint32_t cursor = static_cast<std::uint32_t>(header);
+    for (int i = 0; i < spans_total; ++i) {
+        auto* data = content[static_cast<std::size_t>(i)].second;
+        const std::uint32_t size = data ? static_cast<std::uint32_t>(data->size()) : 0;
+        table[static_cast<std::size_t>(i)] = {cursor, size};
+        if (data) body.insert(body.end(), data->begin(), data->end());
+        cursor += size;
+    }
+
+    out.bytes.resize(header);
+    const std::uint32_t sanity = 0xFAB11BAF;
+    std::memcpy(out.bytes.data(), &sanity, 4);
+    std::memcpy(out.bytes.data() + 4, &version, 4);
+    for (int i = 0; i < spans_total; ++i) {
+        const std::size_t entry = 8 + static_cast<std::size_t>(i) * ints_per_entry * 4;
+        std::memcpy(out.bytes.data() + entry, &table[static_cast<std::size_t>(i)].first, 4);
+        std::memcpy(out.bytes.data() + entry + 4, &table[static_cast<std::size_t>(i)].second, 4);
+    }
+    out.bytes.insert(out.bytes.end(), body.begin(), body.end());
+    return out;
+}
+
+void TestMetadataSolver() {
+    using zircon::il2cpp::SolveMetadataLayout;
+
+    // Two shapes that no Unity ships: a 92-byte type record with the name in slot 0 and
+    // two-int32 header entries, and a 68-byte record with the name in slot 1 and
+    // three-int32 entries. Getting both right cannot be a lookup.
+    struct Case {
+        std::int32_t version;
+        int spans, type_span, field_span, string_span, record, name_slot, ints;
+    };
+    const Case cases[] = {
+        {27, 12, 7, 9, 3, 92, 0, 2},
+        {39, 16, 11, 4, 6, 68, 1, 3},
+    };
+
+    for (const auto& c : cases) {
+        const auto built = BuildMetadata(c.version, c.spans, c.type_span, c.field_span,
+                                         c.string_span, c.record, c.name_slot, c.ints);
+        const auto solved = SolveMetadataLayout(built.bytes);
+        CHECK(solved.ok());
+        if (!solved.ok()) {
+            std::fprintf(stderr, "      %s\n", solved.error().message.c_str());
+            continue;
+        }
+        const auto& layout = solved.value();
+        CHECK(layout.version == c.version);
+        CHECK(layout.ints_per_entry == c.ints);
+        CHECK(layout.tables.strings == c.string_span);
+        CHECK(layout.tables.types == c.type_span);
+        CHECK(layout.type_record == c.record);
+        CHECK(layout.name_slot == c.name_slot);
+
+        // The field range has to have been found, and to point at the field span.
+        const auto* range = layout.RangeTo(c.field_span);
+        CHECK(range != nullptr);
+        if (range) CHECK(range->total == built.field_count);
+
+        // And the names have to come back out.
+        const auto& span = layout.Span(layout.tables.types);
+        std::int32_t first = 0;
+        std::memcpy(&first, built.bytes.data() + span.offset +
+                                static_cast<std::size_t>(layout.name_slot) * 4, 4);
+        CHECK(zircon::il2cpp::MetadataString(built.bytes, layout, first) == "Type0");
+    }
+
+    // Refusals. A file that is not metadata, and one whose spans do not tile.
+    std::vector<std::uint8_t> junk(8192, 0xCC);
+    CHECK(!SolveMetadataLayout(junk).ok());
+
+    auto broken = BuildMetadata(31, 12, 7, 9, 3, 92, 0, 2);
+    const std::uint32_t nonsense = 0x7FFFFFFF;           // a span running off the end
+    std::memcpy(broken.bytes.data() + 8 + 7 * 8 + 4, &nonsense, 4);
+    CHECK(!SolveMetadataLayout(broken.bytes).ok());
+}
+
+// Reading a synthetic metadata file into an ir::Dump, and merging that with a live one.
+void TestStaticAndMerge() {
+    const auto built = BuildMetadata(31, 12, 7, 9, 3, 92, 0, 2);
+    const auto solved = zircon::il2cpp::SolveMetadataLayout(built.bytes);
+    CHECK(solved.ok());
+    if (!solved.ok()) return;
+
+    zircon::il2cpp::StaticStats stats;
+    const auto from_file = zircon::il2cpp::ReadStaticDump(built.bytes, solved.value(), stats);
+
+    // Every type the file declares, and every field, with nothing invented for the numbers
+    // that are not in the file.
+    CHECK(stats.types == built.type_count);
+    CHECK(stats.fields == built.field_count);
+    CHECK(from_file.header.runtime == "il2cpp");
+    CHECK(from_file.header.source.kind == "static");
+    CHECK(from_file.header.partial);
+
+    const zircon::ir::Struct* any = nullptr;
+    for (const auto& package : from_file.packages)
+        for (const auto& record : package.classes)
+            if (!record.properties.empty()) { any = &record; break; }
+    CHECK(any != nullptr);
+    if (any) {
+        CHECK(any->token != 0);
+        // A static read knows the name and refuses the offset, because the offset is not in
+        // the file. Claiming zero would be a number, and a wrong one.
+        CHECK(any->properties.front().offset_unresolved);
+    }
+
+    // Merge against a live dump that shares one type and has one of its own.
+    zircon::ir::Dump live;
+    live.header.runtime = "il2cpp";
+    live.packages.push_back(zircon::ir::Package{"Assembly-CSharp.dll", {}, {}, {}});
+
+    const std::string shared = from_file.packages.front().classes.front().path;
+    zircon::ir::Struct in_both;
+    in_both.name  = "Shared";
+    in_both.path  = shared;
+    in_both.size  = 0x20;
+    in_both.token = 0xDEAD;                       // deliberately not the file's token
+    live.packages.front().classes.push_back(in_both);
+
+    zircon::ir::Struct only_live;
+    only_live.name = "Instantiation";
+    only_live.path = "Game.List<int>, Assembly-CSharp";
+    live.packages.front().classes.push_back(only_live);
+
+    // An enum on a path the metadata also carries. Enums are not ir::Structs, so a merge that
+    // only looks at classes and structs adds the metadata's copy alongside and puts two
+    // records on one path -- which the linter rejects and which Zdex, whose path column is
+    // unique, resolves by dropping one of them.
+    const std::string enum_path = from_file.packages.front().classes[1].path;
+    zircon::ir::Enum live_enum;
+    live_enum.name = "Mode";
+    live_enum.path = enum_path;
+    live_enum.values.push_back(zircon::ir::EnumValue{"On", 1});
+    live.packages.front().enums.push_back(live_enum);
+
+    zircon::il2cpp::MergeStats merged;
+    const auto dual = zircon::il2cpp::MergeDumps(live, from_file, merged);
+
+    CHECK(merged.in_both == 1);
+    CHECK(merged.live_only == 1);
+    CHECK(merged.static_only == built.type_count - 2);   // the shared one, and the enum's
+
+    // Exactly one record per path, still. Nothing was added on top of the enum.
+    std::unordered_map<std::string, int> seen_paths;
+    for (const auto& package : dual.packages) {
+        for (const auto& record : package.classes) ++seen_paths[record.path];
+        for (const auto& record : package.structs) ++seen_paths[record.path];
+        for (const auto& record : package.enums)   ++seen_paths[record.path];
+    }
+    int duplicated = 0;
+    for (const auto& [path, count] : seen_paths)
+        if (count > 1) ++duplicated;
+    CHECK(duplicated == 0);
+    CHECK(seen_paths.count(enum_path) == 1);
+    CHECK(dual.header.sources.size() == 2);
+
+    // The token disagreement is recorded rather than quietly resolved, and the live value is
+    // the one kept.
+    CHECK(merged.conflicts >= 1);
+    bool found_token_conflict = false;
+    for (const auto& conflict : dual.header.conflicts)
+        if (conflict.field == "token" && conflict.path == shared) {
+            found_token_conflict = true;
+            CHECK(conflict.used == "live");
+        }
+    CHECK(found_token_conflict);
+
+    // Provenance on every record, so a reader can tell which half an answer came from.
+    std::size_t both = 0, live_side = 0, static_side = 0;
+    for (const auto& package : dual.packages)
+        for (const auto& record : package.classes) {
+            if (record.source == "both")        ++both;
+            else if (record.source == "live")   ++live_side;
+            else if (record.source == "static") ++static_side;
+        }
+    CHECK(both == 1);
+    CHECK(live_side == 1);
+    CHECK(static_side == built.type_count - 2);
+}
+
+// The field iteration bound. Road 96 and Road 96 Mile 0 both die on the call that ends the
+// iteration, so where the runtime reports a count we have to stop one call short of it.
+void TestFieldIterationLimit() {
+    using zircon::il2cpp::FieldIterationLimit;
+    using zircon::il2cpp::kFieldCountUnknown;
+    constexpr std::size_t ceiling = 65536;
+
+    // The whole point: a class the runtime says has 2 fields gets exactly 2 calls.
+    CHECK(FieldIterationLimit(2, ceiling) == 2);
+
+    // Zero fields means don't call the iterator at all. That call would be the terminating
+    // one on the first try.
+    CHECK(FieldIterationLimit(0, ceiling) == 0);
+
+    // No count available -- most of the corpus before this, and any stripped build. Falls
+    // back to the old behaviour of iterating until null.
+    CHECK(FieldIterationLimit(kFieldCountUnknown, ceiling) == ceiling);
+
+    // A count we don't believe never widens the walk.
+    CHECK(FieldIterationLimit(1'000'000, ceiling) == ceiling);
+    CHECK(FieldIterationLimit(-7, ceiling) == ceiling);
 }
 
 void TestExportReading() {
@@ -769,6 +1078,25 @@ private:
             AddType("Game.Box`1<System.Int32>", ElementType::GenericInst, boxed_handle);
         AddField(boxed_handle, "item", t_int, 0x10, 0x0006);
         inflated_.push_back(boxed_handle);
+
+        // A type whose base the runtime says is bigger than the type itself. IL2CPP's own
+        // __Il2CppFullySharedGenericType placeholder does this on a real game: 8 bytes,
+        // deriving from a 16-byte Object.
+        ClassFacts object;
+        object.name          = "Object";
+        object.name_space    = "System";
+        object.instance_size = 0x10;
+        const Address object_handle = AddClass(object);
+        order_.pop_back();   // it is only here to be somebody's parent
+
+        ClassFacts shared;
+        shared.name          = "Shared";
+        shared.name_space    = "Game";
+        shared.instance_size = 0x8;
+        shared.parent        = object_handle;
+        const Address shared_handle = AddClass(shared);
+        types_for_class_[Raw(shared_handle)] =
+            AddType("Game.Shared", ElementType::Class, shared_handle);
     }
 
     std::map<std::uint64_t, Entry>         classes_;
@@ -823,7 +1151,7 @@ void TestWalk() {
 
     const auto& package = dump.packages.front();
     CHECK(package.name == "Assembly-CSharp.dll");
-    CHECK(package.classes.size() == 4);   // Player, System.ValueType, open Box`1, instantiation
+    CHECK(package.classes.size() == 5);   // Player, System.ValueType, open Box`1, instantiation, Shared
     CHECK(package.structs.size() == 2);   // Vec2 and the union; enums go to enums
     CHECK(package.enums.size()   == 2);
 
@@ -955,6 +1283,16 @@ void TestWalk() {
     // begins sixteen bytes into itself.
     if (vec) CHECK(vec->inherited_size == 0);
 
+    // And a base the runtime reports as bigger than the type deriving from it. That number
+    // is a contradiction however it is written down, so it is left out and counted.
+    const auto* shared = FindRecord(package.classes, "Game.Shared, Assembly-CSharp");
+    CHECK(shared != nullptr);
+    if (shared) {
+        CHECK(shared->size == 0x8);
+        CHECK(shared->inherited_size == 0);
+    }
+    CHECK(stats.contradictory_bases == 1);
+
     const zircon::ir::Enum* mode = nullptr;
     const zircon::ir::Enum* direction = nullptr;
     for (const auto& e : package.enums) {
@@ -1008,7 +1346,7 @@ void TestWalk() {
             CHECK(overlapped->properties[0].offset == overlapped->properties[1].offset);
     }
 
-    CHECK(stats.classes == 6);
+    CHECK(stats.classes == 7);
     CHECK(stats.enums   == 2);
     CHECK(stats.shared_bodies == 2);
     CHECK(stats.open_generics == 1);
@@ -1018,6 +1356,9 @@ void TestWalk() {
 
 int main() {
     TestModuleNames();
+    TestMetadataSolver();
+    TestStaticAndMerge();
+    TestFieldIterationLimit();
     TestExportReading();
     TestFindRuntime();
     TestMethodLayout();

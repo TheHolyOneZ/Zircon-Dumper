@@ -68,11 +68,11 @@ extern "C" {
  * A plugin built against 1.0 therefore runs on a 1.7 host, and one built against 1.7
  * declines a 1.0 host instead of calling through a vtable slot that is not there. */
 #define ZN_ABI_MAJOR 1
-#define ZN_ABI_MINOR 2
+#define ZN_ABI_MINOR 3
 
 /* The IR schema the host is serving. Independent of the ABI: the ABI is how you ask, the
  * schema is what there is to ask about. */
-#define ZN_SCHEMA_VERSION 2
+#define ZN_SCHEMA_VERSION 3
 
 /* ------------------------------------------------------------------ status codes */
 

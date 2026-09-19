@@ -14,7 +14,10 @@
 #include "ir/Model.h"
 
 #include <cstddef>
+#include <functional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace zircon::il2cpp {
 
@@ -30,6 +33,16 @@ struct WalkOptions {
     // Ask the runtime for const values. Whether it answers depends on the build; the enums
     // record which they got.
     bool resolve_enum_values{true};
+
+    // Called with what the walk is about to touch, before it touches it. The walk doesn't
+    // care where that goes -- the payload puts it in a mapped page so a crash names the
+    // type. Empty is fine and costs one branch per class.
+    std::function<void(std::string_view)> breadcrumb;
+
+    // Types to walk past without reading. For a build with a class that faults, this is how
+    // you get the rest of the dump. Exact path match, not a substring: skipping more than
+    // you meant to is a dump that quietly lost things.
+    std::vector<std::string> skip;
 };
 
 struct WalkStats {
@@ -51,6 +64,11 @@ struct WalkStats {
     std::size_t shared_bodies{0};        // methods sharing an address with another method
     std::size_t bodies{0};               // methods that got one at all
     std::size_t enums_without_values{0};
+    std::size_t skipped{0};              // types the caller asked us to walk past
+
+    // Types whose base the runtime reports as larger than they are. Their inherited
+    // size is left out rather than written down as a contradiction.
+    std::size_t contradictory_bases{0};
 };
 
 ir::Dump Walk(IBridge& bridge, const WalkOptions& options, WalkStats& stats);

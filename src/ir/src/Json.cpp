@@ -270,6 +270,7 @@ void WriteStruct(Writer& writer, const Struct& record) {
     if (record.is_generic)   { writer.Key("is_generic");   writer.Bool(true); }
     if (record.explicit_layout) { writer.Key("explicit_layout"); writer.Bool(true); }
     if (record.token != defaults.token) { writer.Key("token"); writer.UInt(record.token); }
+    if (!record.source.empty()) { writer.Key("source"); writer.String(record.source); }
 
     if (record.size           != defaults.size)           { writer.Key("size");           writer.Int(record.size); }
     if (record.alignment      != defaults.alignment)      { writer.Key("alignment");      writer.Int(record.alignment); }
@@ -387,6 +388,24 @@ void WriteHeader(Writer& writer, const Header& header) {
         writer.EndArray();
     }
     WriteStringArray(writer, "globals", header.globals);
+    WriteStringArray(writer, "sources", header.sources);
+
+    // Written in full, never truncated. On a packed build the disagreements are the finding.
+    if (!header.conflicts.empty()) {
+        writer.Key("conflicts");
+        writer.BeginArray();
+        for (const auto& conflict : header.conflicts) {
+            writer.BeginObject();
+            writer.Key("path");  writer.String(conflict.path);
+            if (!conflict.member.empty()) { writer.Key("member"); writer.String(conflict.member); }
+            writer.Key("field"); writer.String(conflict.field);
+            writer.Key("live");  writer.String(conflict.live);
+            writer.Key("other"); writer.String(conflict.other);
+            writer.Key("used");  writer.String(conflict.used);
+            writer.EndObject();
+        }
+        writer.EndArray();
+    }
     writer.EndObject();
 }
 
@@ -877,6 +896,7 @@ private:
         if (!prefix.empty()) out.cpp_prefix = prefix[0];
 
         if (!ReadString(value, "namespace", out.name_space)) return false;
+        if (!ReadString(value, "source", out.source)) return false;
         if (!ReadBool(value, "is_interface", out.is_interface)) return false;
         if (!ReadBool(value, "is_abstract",  out.is_abstract))  return false;
         if (!ReadBool(value, "is_valuetype", out.is_valuetype)) return false;
@@ -990,6 +1010,24 @@ private:
             }
         }
         if (!ReadStringArray(value, "globals", out.globals)) return false;
+        if (!ReadStringArray(value, "sources", out.sources)) return false;
+
+        if (const auto* conflicts = value.Find("conflicts")) {
+            if (conflicts->type != Value::Type::Array)
+                return Fail(*conflicts, "conflicts must be an array");
+            for (const auto& item : conflicts->items) {
+                if (item.type != Value::Type::Object)
+                    return Fail(item, "a conflict must be an object");
+                Conflict conflict;
+                if (!ReadString(item, "path",   conflict.path))   return false;
+                if (!ReadString(item, "member", conflict.member)) return false;
+                if (!ReadString(item, "field",  conflict.field))  return false;
+                if (!ReadString(item, "live",   conflict.live))   return false;
+                if (!ReadString(item, "other",  conflict.other))  return false;
+                if (!ReadString(item, "used",   conflict.used))   return false;
+                out.conflicts.push_back(std::move(conflict));
+            }
+        }
         return true;
     }
 

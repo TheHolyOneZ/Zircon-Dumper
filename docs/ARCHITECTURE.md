@@ -91,6 +91,12 @@ tiny reads, which is tolerable in-process and ruinous across a process boundary.
 a mapped module and a file on disk. `PatternScanner` searches a module or the whole
 address space. `Injector` loads the payload, and refuses when anti-cheat is present.
 
+`CrashBreadcrumb` is a line of text in a memory-mapped page, for the case where the process
+is about to stop existing. Writing one is a `memcpy` — no syscall, no flush, no lock — so a
+walk can afford to update it per type, and Windows writes the dirty page back even when the
+process is torn down. That is what lets the next run say which type killed the last one. It
+allocates nothing, so an exception handler can append to it.
+
 ## engine/
 
 This is where all the Unreal knowledge lives, and all of it is derived at runtime.

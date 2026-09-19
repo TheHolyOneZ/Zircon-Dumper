@@ -48,7 +48,7 @@ by name rather than guessed around.
 
 Ten installed games, oldest Unity to newest:
 
-| game | GameAssembly | exports | `il2cpp_*` | required (39) | optional (35) |
+| game | GameAssembly | exports | `il2cpp_*` | required (39) | optional (36) |
 |---|---|---|---|---|---|
 | Schedule I | 65.9 MB | 386 | 241 | all | all |
 | Sons Of The Forest | 100.4 MB | 383 | 238 | all | all |
@@ -64,16 +64,112 @@ Ten installed games, oldest Unity to newest:
 Road 96 is a much older Unity with roughly a third of the total exports, and it is still
 complete. That is the point of the approach.
 
-The 35 optional entry points are present everywhere and are **still optional**: the moment one
+The 36 optional entry points are present everywhere and are **still optional**: the moment one
 of them is required, a stripped build the walk could have handled gets refused for the sake of
 a nicety. Every one of them is guarded at the point of use.
 
 ---
 
-## Why this one has to inject
+## Two readings, and why both
 
-The Unreal path is external and read-only and never touches the game. The IL2CPP path injects,
-and the difference is not a preference:
+There are two places a Unity game keeps its type system, and they hold different halves of it.
+
+| | live (inject) | static (`global-metadata.dat`) |
+|---|---|---|
+| type set | grows while the game runs | **exact and repeatable** |
+| concrete generics | **the only place they exist** | absent |
+| field offsets | **truth at execution** | absent: they are in the binary |
+| method addresses | derived from `MethodInfo` | absent: they are in the binary |
+| field and method names | yes | yes |
+| metadata tokens | yes | yes |
+| needs the game to run | **yes** | no |
+| APK, console, anti-cheat | impossible | **fine** |
+| encrypted metadata | irrelevant, it is already decrypted | defeated |
+
+`--mode dual` runs both and merges them. The metadata is the spine, because its type set does
+not move between two reads; the runtime is the truth about execution, because offsets and
+concrete generics only exist once something has run. Every record says which side it came
+from, and **every disagreement goes in `header.conflicts` rather than being resolved quietly**
+-- on a packed build the disagreement is the finding.
+
+Measured on Cave Crawlers: 12,318 types both sides had, 36,244 the runtime had and the file
+could not contain (instantiations), 841 the file declared and the runtime never built. Each
+reading alone was missing a large piece of the other's answer.
+
+---
+
+## Reading the metadata without a version table
+
+Every other IL2CPP dumper parses `global-metadata.dat` with a table of struct layouts per
+metadata version, and breaks on each Unity release until somebody hand-adds the new one. That
+is the same dependency this project refuses everywhere else, so the layout is worked out
+instead, from four things the file cannot satisfy by accident.
+
+**1. The spans tile the file.** The header is a run of `(offset, size)` entries, and they
+cover the file from the end of the header to EOF in order, with only alignment padding and
+never an overlap. The first entry's offset is the header's own length, which gives the entry
+count once the stride is known -- and the stride is whatever divides the header exactly *and*
+tiles. Older metadata writes `offset, size`; newer writes `offset, size, count`. Which one
+falls out of this rather than being known.
+
+**2. The identifier blob** is the span made of NUL-terminated names: 80%+ identifier bytes,
+one terminator every twenty or so, ending terminated.
+
+**3. A record table** is a span whose leading int32s land on the start of one of those names,
+for every record probed. Probes are consecutive, because a stride that divides the real record
+size survives sampling whenever every probe happens to land on a real boundary -- an early
+version sampled evenly, the step shared a factor with the record, and a 16-byte stride
+"validated" a table whose records are 88 bytes. A column that never changes is rejected too:
+zero is a valid string index, so a run of zeroes otherwise reads as a table of names that are
+all the first name.
+
+**4. A `(start, count)` pair inside a record partitions the table it indexes.** The ranges
+cover `[0, N)` exactly once, no gap and no overlap, and which `N` they reach is what says which
+table the pair points at. Note *partitions*, not *tiles*: fields and methods are **not** laid
+out in type order, and the first version of this required they were and found nothing at all.
+
+Two more facts come free from ECMA-335 rather than from Unity, so they do not move: a metadata
+token carries its table in the top byte (`0x02` type, `0x04` field, `0x06` method), which makes
+the token column unmistakable and makes the token a join key between the two readings; and the
+first type of every assembly is `<Module>`, which is the cheapest end-to-end check there is.
+
+### Measured
+
+| game | metadata | header | type record | result |
+|---|---|---|---|---|
+| Job Simulator | v24 | 2 int32 | 100 B | solved |
+| Road 96 | v27 | 2 int32 | 88 B | solved |
+| Road 96 Mile 0 | v29 | 2 int32 | 88 B | solved |
+| Sons Of The Forest | v29 | 2 int32 | 88 B | solved |
+| Cave Crawlers, Schedule I, PvZ, GORN 2, Roadside Research | v31 | 2 int32 | 88 B | solved |
+| IRON NEST | v39 | **3 int32** | **76 B** | solved |
+| Forensics Demo | v39 | 3 int32 | — | **refused** |
+
+Ten of eleven, Unity 2019 through Unity 6, with no version knowledge anywhere. The refusal is
+the interesting one: its header reads cleanly and its identifier blob is there, but no span
+declares ranges that partition anything, and its type span is not even four-byte aligned. That
+file's tables have been scrambled. Guessing past it would produce a dump that is quietly wrong
+rather than one that is honestly absent.
+
+### What it cannot do
+
+A field's type, a method's address and a field's offset are **not in the metadata**. They live
+in arrays in `GameAssembly.dll` that the metadata only holds indices into. So a static dump
+carries names, namespaces, tokens, assemblies and structure, and marks the rest unresolved.
+
+Nor is *what kind of type* it is. Struct and enum come from a type's parent, and the parent is
+another index into the binary, so a static dump files every type as a class and says so in its
+header. A dump reporting no enums at all would otherwise read as a game that has none. A dual
+run takes that from the runtime.
+
+That is a real limit, and the reason `--mode dual` exists rather than static replacing live.
+
+---
+
+## Why the live half has to inject
+
+The Unreal path is external and read-only and never touches the game. The IL2CPP live path
+injects, and the difference is not a preference:
 
 > `il2cpp_field_get_offset` is a **function**. Reading memory will not make it run.
 
@@ -221,6 +317,48 @@ lie. A build that does not survive being asked can be told not to be, with a
 
 ---
 
+## When the runtime faults
+
+Some builds strip a type's metadata and leave its class record in the image. Asking that class
+for its fields or its interfaces makes the runtime dereference a pointer into nothing. There is
+no way to ask that works, and no way to know in advance without reading `Il2CppClass` by hand,
+which is the version-table trap.
+
+Three pieces, none of which catch the fault:
+
+**The breadcrumb.** Before touching anything, the walk writes what it is about to touch into a
+memory-mapped page: the type's assembly-qualified path on the first line, which member list on
+the second. A `memcpy` and nothing else, so it stays on for every dump. Windows writes the
+dirty page back even when the process is torn down, so the file survives the crash.
+
+Before the first class is fetched it is the slot instead — `mscorlib.dll#412` — because naming
+a class means asking the runtime for it, and a build that faults on *that* never gets far
+enough to have a name.
+
+**The fault watcher.** `AddVectoredExceptionHandler`, first in line, for access violations and
+the other machine-level faults on the walking thread. Not for the C++ and CLR exceptions a
+game raises all day, and not for other threads: a handler registered process-wide sees every
+thread, and a game taking a first-chance fault of its own would otherwise get whatever type
+the walk happened to be on written down as unreadable. It
+appends the exception code, the faulting address, what was being read, and whether the address
+falls inside `GameAssembly.dll` — then returns `EXCEPTION_CONTINUE_SEARCH`. It handles nothing.
+See "A guard that was worse than the fault" above; that argument applies here and is the reason
+this observes rather than intervenes. It allocates nothing and takes no lock, because it runs
+on a thread that has just faulted and the heap lock may be that thread's.
+
+**Auto-resume.** On the next injection the payload reads the breadcrumb. If a fault was
+recorded *inside the runtime*, the type goes in `zircon-out\logs\<Game>.unreadable` and the
+walk goes around it. If the fault was anywhere else it is Zircon's own bug and nothing is
+skipped — it keeps crashing until somebody looks at it. That is what separates this from a
+`--best-effort` flag that papers over a defect.
+
+Every skipped type is named in `header.engine.evidence`, so a dump that lost something says so
+in the dump, on the website, and in the log. `zircon-il2cpp-skip.txt` beside the DLL is the
+hand-written list for anything else; it takes the breadcrumb's first line verbatim, matched
+exactly, never as a prefix.
+
+---
+
 ## Publishing
 
 Unity dumps publish to Zdex. Zdex reads `header.runtime` and treats the dump as what it is:
@@ -243,12 +381,31 @@ and diffed **identical** by Zdex's own diff.
 What "tested" means here matches `docs/UE-Test.md`: L0 is the export table read from the file,
 L3 is a complete dump, L4 is a dump that passes `validate --strict`.
 
+**The counts below are one run, not a property of the build.** The runtime's class cache grows
+while a game is running, and the inflated-generic sweep reads that cache, so *when* you inject
+changes how many types you get. Two dumps of the same Cave Crawlers build, minutes apart, gave
+42,528 and 42,610 classes. Image enumeration is stable; the sweep is not. Two consequences
+worth stating plainly: a build-to-build diff currently contains some noise about how long each
+game sat at its menu, and a count that differs from the table is not evidence the build moved.
+
 | game | Unity | result |
 |---|---|---|
-| Cave Crawlers | modern | **L4.** 42,605 classes, 6,967 structs, 1,641 enums, 91,698 fields, 491,938 methods, 83,564 properties. 365,202 method bodies. `validate --strict`: **0 errors**, 35,110 warnings |
+| Cave Crawlers | modern | **L4.** 42,601 classes, 6,967 structs, 1,641 enums, 91,698 fields, 491,926 methods, 83,564 properties. 364,976 method bodies. `validate --strict`: **0 errors**, 35,111 warnings |
+| PvZ Replanted | modern | **L4.** 44,810 classes, 9,101 structs, 1,946 enums, 104,257 fields, 516,258 methods, 88,165 properties. 445,628 method bodies. **0 errors**, 19,067 warnings |
+| IRON NEST | modern | **L4.** 36,895 classes, 8,796 structs, 2,654 enums, 107,603 fields, 518,194 methods, 76,495 properties. 456,444 method bodies. **0 errors**, 31,519 warnings |
 | Schedule I | modern | **L3.** 44,741 classes, 6,759 structs, 2,448 enums, 104,865 fields, 521,224 methods. 448,166 method bodies |
-| Road 96 | older | **L0.** Resolves 39/39 entry points and derives the two-pointer `MethodInfo` correctly, then the walk takes the game down. See below |
-| the other seven | — | **L0.** Export table and API resolution verified from the file; not yet walked live |
+| Road 96 | older | **L0.** Resolves 39/39 entry points and derives the two-pointer `MethodInfo` correctly, then its runtime faults on its own stripped types. See below |
+| Road 96 Mile 0 | older | **L0.** Same, with a three-slot `MethodInfo` rather than two |
+| the other five | — | **L0.** Export table and API resolution verified from the file; not yet walked live |
+
+The first three were dumped back to back in 85 seconds, unattended, one command each:
+
+```
+zircon inject --launch "<exe>" --wait --headless --wait-for-settle 25 -o <game>.json
+```
+
+Road 96 as the fourth exited **4** without writing a dump, which is the `--wait` contract
+working in the direction that matters.
 
 ### Cross-checked against facts, not against itself
 
@@ -308,19 +465,35 @@ contain it. The reference keeps the exact C# name in `raw`; only the link is dan
 Resolving them would mean calling `il2cpp_class_from_type` on each, which makes the runtime
 build the class — changing the game to describe it. That is the wrong trade.
 
-### Road 96 — a known-failing target
+### Road 96 — a runtime that faults on its own types
 
-Road 96 (Unity 2019-era, cracked, MelonLoader present) resolves everything and then dies part
-way into `mscorlib`, reproducibly, on the third call to `il2cpp_class_get_fields` for
-`Mono.Xml.SmallXmlParser.AttrListImpl`. Its `mscorlib` has 1,709 types against Cave Crawlers'
-30,581, so it is heavily managed-stripped.
+Road 96 and Road 96 Mile 0 (both Unity 2019-era) resolve everything, derive `MethodInfo`
+correctly — and derive *different* layouts, two slots against three, which is what exonerated
+the derivation — and then take the game down part way into `mscorlib`. Both have a heavily
+managed-stripped `mscorlib`: 1,709 and 1,790 types against Cave Crawlers' 30,581.
 
-Ruled out by direct experiment: the const read (it dies with `zircon-il2cpp-no-consts` set),
-returning strings to `il2cpp_free`, the thread attach (which succeeds and is now checked), and
-describing generic parameters or pointer types as types — all of which were separate real bugs
-found while narrowing this one, and all of which are fixed.
+What it actually is, from the fault watcher:
 
-The remaining hypothesis is that stripping has left a class whose field array does not match
-its declared count, or that the game's own threads are still initialising the type while the
-walk reads it. Neither is actionable from outside the runtime. Recorded rather than papered
-over.
+```
+Mono.Globalization.Unicode.ContractionComparer, mscorlib
+interfaces
+faulted inside the runtime: code 0xc0000005 at 0x7ffbeb257d68 (+0x307d68)
+                            reading 0x2aae30dd9a0
+```
+
+An access violation inside `GameAssembly.dll`, dereferencing a pointer into nothing. Stripping
+removed the type's metadata and left its class record in the image's table. Ask that class for
+its fields or its interfaces and the runtime walks into the hole. It is not one bad class
+either — walk past `AttrListImpl` and the next one along fails the same way in a different
+member list.
+
+There is no way to ask differently. What there is, is a way to not ask: the walk records the
+type and goes around it next time. See "When the runtime faults" above. Every type walked past
+is named in the dump header.
+
+Ruled out by direct experiment, so nobody retests them: the const read (it dies with
+`zircon-il2cpp-no-consts` set), returning strings to `il2cpp_free`, the thread attach (which
+succeeds and is now checked), describing generic parameters or pointer types as types, the
+terminating `il2cpp_class_get_fields` call (bounded by `il2cpp_class_num_fields` now, and it
+still dies), and MelonLoader — three games that dump cleanly have it installed and Mile 0,
+which fails, does not.

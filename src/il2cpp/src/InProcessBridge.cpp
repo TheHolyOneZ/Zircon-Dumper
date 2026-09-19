@@ -112,6 +112,13 @@ public:
                 "object header is {} bytes, from the runtime rather than assumed", header_size_));
         }
 
+        if (!IsNull(runtime_.api.class_num_fields))
+            evidence_.emplace_back("field iteration is bounded by il2cpp_class_num_fields, so "
+                                   "the call that terminates it is never made");
+        else
+            evidence_.emplace_back("this build does not export il2cpp_class_num_fields, so the "
+                                   "field walk iterates until the runtime returns null");
+
         for (const auto& [name, rva] : ResolvedEntryPoints(runtime_))
             entry_points_.push_back(std::format("{}=0x{:x}", name, rva));
 
@@ -207,7 +214,8 @@ public:
     }
 
     std::vector<Address> Fields(Address klass) override {
-        return Iterate(runtime_.api.class_get_fields, klass);
+        return Iterate(runtime_.api.class_get_fields, klass,
+                       FieldIterationLimit(ReportedFieldCount(klass), kMaxMembers));
     }
     std::vector<Address> Methods(Address klass) override {
         return Iterate(runtime_.api.class_get_methods, klass);
@@ -412,15 +420,27 @@ private:
         return At<FnPtrToU32>(entry)(AsPtr(argument));
     }
 
-    std::vector<Address> Iterate(Address entry, Address klass) {
+    // What the runtime says a class's field count is. Optional entry point, so plenty of
+    // builds won't answer; FieldIterationLimit handles that.
+    std::int64_t ReportedFieldCount(Address klass) {
+        if (IsNull(runtime_.api.class_num_fields) || IsNull(klass)) return kFieldCountUnknown;
+        return static_cast<std::int64_t>(
+            At<FnPtrToSize>(runtime_.api.class_num_fields)(AsPtr(klass)));
+    }
+
+    // limit is a ceiling, not a promise. A null still ends the loop, so a wrong count can
+    // only make us stop early, never read past the end.
+    std::vector<Address> Iterate(Address entry, Address klass, std::size_t limit = kMaxMembers) {
         std::vector<Address> out;
-        if (IsNull(entry) || IsNull(klass)) return out;
+        if (IsNull(entry) || IsNull(klass) || limit == 0) return out;
+        if (limit > kMaxMembers) limit = kMaxMembers;
 
         auto fn = At<FnIterate>(entry);
         void* iter = nullptr;
-        while (void* item = fn(AsPtr(klass), &iter)) {
+        while (out.size() < limit) {
+            void* item = fn(AsPtr(klass), &iter);
+            if (!item) break;
             out.push_back(AsAddress(item));
-            if (out.size() >= kMaxMembers) break;
         }
         return out;
     }

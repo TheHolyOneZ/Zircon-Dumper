@@ -155,7 +155,9 @@ std::string Utc() {
 class Walker {
 public:
     Walker(IBridge& bridge, const WalkOptions& options, WalkStats& stats)
-        : bridge_(bridge), options_(options), stats_(stats) {}
+        : bridge_(bridge), options_(options), stats_(stats),
+          skip_(options.skip.begin(), options.skip.end()),
+          tracking_(options.breadcrumb != nullptr || !options.skip.empty()) {}
 
     ir::Dump Run() {
         ir::Dump dump;
@@ -175,6 +177,15 @@ public:
         // IR's three lists. Logged as we go, log flushed per line -- if the walk takes the
         // game down we at least know what it was reading.
         const auto assemblies = bridge_.Assemblies();
+
+        // Counted up front so progress has a denominator. One extra call per image, against
+        // a walk that makes millions.
+        for (const Address assembly : assemblies) {
+            const Address image = bridge_.AssemblyImage(assembly);
+            if (!IsNull(image)) expected_ += bridge_.ImageClassCount(image);
+        }
+        core::LogInfo("{} assemblies, {} types declared", assemblies.size(), expected_);
+
         for (const Address assembly : assemblies) {
             ++stats_.assemblies;
             const Address image = bridge_.AssemblyImage(assembly);
@@ -186,8 +197,18 @@ public:
             core::LogDebug("assembly {}/{}: {}, {} types", stats_.assemblies,
                            assemblies.size(), package, count);
 
-            for (std::size_t i = 0; i < count; ++i)
+            for (std::size_t i = 0; i < count; ++i) {
+                // Noted before the class is even fetched. If the runtime faults on the way
+                // in we still know which slot of which image did it, and that string is
+                // what a skip list takes. Only built when somebody is listening, since
+                // this runs once per type.
+                if (tracking_) {
+                    const std::string slot = std::format("{}#{}", package, i);
+                    Note(slot);
+                    if (Skipped(slot)) continue;
+                }
                 Visit(bridge_.ImageClass(image, i), package);
+            }
         }
 
         // A generic definition has no real field offsets; its instantiations do, and they
@@ -196,8 +217,19 @@ public:
             core::LogDebug("sweeping the runtime class cache for generic instantiations");
             const auto cached = bridge_.AllClasses();
             core::LogDebug("{} classes in the cache", cached.size());
+
+            // The declared-type count stops meaning anything here: instantiations are not
+            // in it, so progress would count past its own total.
+            expected_ = 0;
+            std::size_t index = 0;
             for (const Address klass : cached) {
+                const std::size_t slot_index = index++;
                 if (seen_.count(Raw(klass))) continue;
+                if (tracking_) {
+                    const std::string slot = std::format("class cache#{}", slot_index);
+                    Note(slot);
+                    if (Skipped(slot)) continue;
+                }
                 const auto facts = bridge_.Class(klass);
                 if (!facts.is_inflated) continue;
                 ++stats_.inflated;
@@ -359,10 +391,17 @@ private:
     void Visit(Address klass, const std::string& package) {
         if (IsNull(klass) || !seen_.insert(Raw(klass)).second) return;
 
-        const auto facts = bridge_.Class(klass);
         const std::string path = PathOf(klass);
         if (path.empty()) return;
         if (!options_.filter.empty() && path.find(options_.filter) == std::string::npos) return;
+
+        // Named breadcrumb, now that we have one. Naming the class means asking the runtime
+        // for it, so a build that faults on that never reaches here -- the slot form above
+        // is what covers that case.
+        Note(path);
+        if (Skipped(path)) { ++stats_.skipped; return; }
+
+        const auto facts = bridge_.Class(klass);
 
         // Some instantiations are over another generic's parameter -- IEnumerable<T> where T
         // is still T. Distinct classes to the runtime, identical names to us. Keep one,
@@ -396,6 +435,7 @@ private:
             if (mapped.size > 0) width = mapped.size;
         }
 
+        Phase("enum values");
         for (const Address field : bridge_.Fields(klass)) {
             const auto info = bridge_.Field(field);
             // One instance field (value__) plus the consts, which are the members.
@@ -446,13 +486,24 @@ private:
         // size is the boxed header, and a type never laid out reports 0, which isn't a size.
         if (!IsNull(facts.parent) && !facts.is_valuetype) {
             const auto parent_size = bridge_.Class(facts.parent).instance_size;
-            if (parent_size > 0) record.inherited_size = parent_size;
+
+            // A base bigger than the type deriving from it is the runtime contradicting
+            // itself. IL2CPP's own __Il2CppFullySharedGenericType placeholder does exactly
+            // that -- 8 bytes, deriving from a 16-byte Object. Record nothing rather than a
+            // number that makes the type impossible; the linter is right to reject it and
+            // an SDK built from it would not compile.
+            if (parent_size > 0 && record.size > 0 && parent_size > record.size)
+                ++stats_.contradictory_bases;
+            else if (parent_size > 0)
+                record.inherited_size = parent_size;
         }
 
+        Phase("interfaces");
         for (const Address iface : bridge_.Interfaces(klass))
             record.interfaces.push_back(PathOf(iface));
 
         const std::int32_t header = bridge_.ObjectHeaderSize();
+        Phase("fields");
         for (const Address field : bridge_.Fields(klass)) {
             const auto info = bridge_.Field(field);
 
@@ -501,6 +552,7 @@ private:
         }
 
         std::unordered_set<std::string> accessor_methods;
+        Phase("properties");
         for (const Address property : bridge_.Properties(klass)) {
             const auto info = bridge_.Property(property);
             if (info.name.empty()) continue;
@@ -527,6 +579,7 @@ private:
             record.accessors.push_back(std::move(accessor));
         }
 
+        Phase("methods");
         for (const Address method : bridge_.Methods(klass)) {
             const auto info = bridge_.Method(method);
 
@@ -574,8 +627,13 @@ private:
         ++stats_.classes;
 
         // Every so often. Enough to place a crash, not enough to make the log the slow part.
-        if ((stats_.classes % 1000) == 0)
-            core::LogDebug("{} types in, currently at {}", stats_.classes, path);
+        if ((stats_.classes % 1000) == 0) {
+            if (expected_ > 0)
+                core::LogDebug("{}/{} types in, currently at {}", stats_.classes, expected_,
+                               path);
+            else
+                core::LogDebug("{} types in, currently at {}", stats_.classes, path);
+        }
 
         auto& into = PackageFor(package);
         (facts.is_valuetype ? into.structs : into.classes).push_back(std::move(record));
@@ -613,10 +671,31 @@ private:
         dump.packages = std::move(packages_out_);
     }
 
+    void Note(std::string_view key) {
+        if (!options_.breadcrumb) return;
+        here_.assign(key);
+        options_.breadcrumb(here_);
+    }
+
+    // Same type, further in. The key stays on the first line so a skip list still gets a
+    // clean one out of whatever the crash left behind.
+    void Phase(std::string_view what) {
+        if (!options_.breadcrumb) return;
+        options_.breadcrumb(std::format("{}\n{}", here_, what));
+    }
+
+    bool Skipped(const std::string& what) const {
+        return !skip_.empty() && skip_.count(what) != 0;
+    }
+
     IBridge&           bridge_;
     const WalkOptions& options_;
     WalkStats&         stats_;
 
+    std::unordered_set<std::string>                skip_;
+    std::string                                    here_;   // current breadcrumb key
+    const bool                                     tracking_;
+    std::size_t                                    expected_{0};
     std::unordered_set<std::uint64_t>              seen_;
     std::unordered_set<std::string>                taken_;
     std::unordered_map<std::uint64_t, std::string> names_;

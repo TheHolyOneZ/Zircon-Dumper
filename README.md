@@ -79,6 +79,9 @@ SCORE  PID      PROCESS                          PROJECT
   20%  7248     crashpad_handler.exe             crashpad_handler
   20%  8368     crashpad_handler.exe             crashpad_handler
 
+READY  PID      PROCESS                          RUNTIME
+yes    22512    Road 96.exe                      Unity IL2CPP, GameAssembly.dll loaded
+
 > zircon fingerprint --pid 25244
 engine version    5.6
 confidence        60%
@@ -819,6 +822,78 @@ evidence
   - every entry point resolved by name, so no metadata version is involved
 ```
 
+### Two ways to read a Unity game, and a third that is both
+
+A Unity game keeps its type system in two places, and each holds a half the other doesn't.
+
+| | `--mode live` | `--mode static` | `--mode dual` |
+|---|---|---|---|
+| needs the game running | yes | **no** | yes |
+| type set | grows as the game runs | **exact, repeatable** | metadata's |
+| field offsets | **yes** | no | live's |
+| method addresses | **yes** | no | live's |
+| concrete generics (`List<int>`) | **yes** | no | live's |
+| names, namespaces, tokens | yes | yes | both, cross-checked |
+| APK, console, anti-cheat, a game that crashes | no | **yes** | static half |
+
+**Live** is the default and needs injection — see below. **Static** reads
+`global-metadata.dat` off disk and needs no process at all:
+
+```
+zircon dump --metadata "D:\Games\Thing\Thing_Data\il2cpp_data\Metadata\global-metadata.dat" -o thing.json
+```
+
+That works on games this machine cannot run, on targets with anti-cheat, and on Road 96 —
+which has never once completed a live walk and dumps this way in seconds: 191 assemblies,
+18,277 types, 118,319 methods. It is an honest partial answer and says so: field types,
+offsets and method addresses are not in the metadata, they are in the binary, so they come
+back unresolved rather than invented.
+
+**Dual** runs both and merges them:
+
+```
+zircon inject --launch "D:\Games\Thing\Thing.exe" --wait --headless --mode dual -o thing.json.gz
+```
+
+```
+merged: 12318 types in both, 36244 only the runtime had, 841 only the metadata declared
+```
+
+Every record says which side it came from, and every disagreement between them goes in the
+dump header rather than being resolved quietly — on a packed build the disagreement is the
+point.
+
+**No version table anywhere in this.** Every other IL2CPP dumper parses that metadata file
+with a per-version table of struct layouts and breaks on each Unity release. Zircon works the
+layout out from constraints the file cannot satisfy by accident — the spans tile the file, the
+identifier blob is the one made of names, a record table's leading int32s all land on one, and
+a `(start, count)` pair partitions the table it indexes. Measured across metadata versions 24,
+27, 29, 31 and 39: ten of eleven installed games solve, and the eleventh refuses with its
+reason rather than guessing. `docs/IL2CPP.md` has the whole argument.
+
+```
+zircon metadata <global-metadata.dat>      what Zircon worked out, and the evidence for it
+```
+
+### Dumping every game on the machine
+
+```
+zircon scan-games -o games.toml       sweep the drives, write a manifest
+zircon batch games.toml -o dumps      dump all of them, unattended
+```
+
+`scan-games` finds Unreal and Unity games by what is in the folder rather than by a list of
+known titles, and skips the crash reporters and web helpers Unreal ships beside every game.
+Mono-backend Unity games are listed and commented out: they have no `GameAssembly.dll`, so the
+IL2CPP path has nothing to talk to, and that is a correct no rather than a gap.
+
+`batch` runs each one in turn. One failing does not stop the rest, and **a game whose runtime
+faults partway through falls back to its metadata**, so it still yields its type system
+instead of a hole in the batch.
+
+An output path ending `.json.gz` is written compressed. A Unity dump is around 600 MB of JSON
+and 20 of gzip, which is the difference between 2.5 GB and a hundred for four games.
+
 ### Unity dumps need injection. Unreal ones don't.
 
 This is the one real difference, and it's worth understanding before you reach for it.
@@ -834,6 +909,38 @@ zircon inject --pid 12345
 
 The payload walks the runtime and writes `zircon-out\json\<Game>.json` next to
 `zircon.dll`. Press END in the game to unload it.
+
+```
+zircon inject --pid 12345 -o dumps\road96.json   put it somewhere a script can find
+zircon inject --pid 12345 --headless             no console; it steals focus from a game
+```
+
+**One command, unattended** — which is how you dump twelve games in an evening rather than in
+twelve evenings:
+
+```
+zircon inject --launch "D:\Games\Thing\Thing.exe" --wait --headless -o thing.json
+```
+
+`--launch` starts the game and waits for `GameAssembly.dll` to actually be mapped; the runtime
+already knows when it is ready and a sleep only guesses at it. `--wait` blocks until the walk
+finishes, exits non-zero if the game died partway or the timeout ran out, and then closes the
+game. Add `--wait-for-settle` to let the runtime's class cache stop growing first, which is
+what makes two dumps of the same build comparable.
+
+Each run gets its own log at `zircon-out\logs\<Game>-<timestamp>.log`, so dumping four games
+in an evening does not interleave them in one file.
+
+**If the runtime faults on one of its own types**, the payload says which one and walks past
+it on the next run. Some builds strip a type's metadata and leave its class record in the
+image; asking that class for its fields dereferences a pointer that goes nowhere, and no way
+of asking differently fixes it. The walk writes what it is touching into a mapped page as it
+goes, so a crash names the type instead of a thousand-type window, and a vectored handler
+records whether the fault was inside `GameAssembly.dll` — it only ever skips when the runtime
+faulted in its own code, because a fault anywhere else is Zircon's bug and should keep
+crashing until somebody looks at it.
+
+Every type walked past is named in the dump header. A dump that lost something says so.
 
 The browser will do it for you: open `zircon-gui.exe` with a Unity game running and it
 lists what it found with an **Inject and dump** button beside each one. It cannot browse a
@@ -1332,9 +1439,12 @@ And the options, in full:
     --allow-partial  let emitters run on a partial dump
 -v, --verbose      debug logging; repeat for trace
     --color / --no-color   force colour on or off
--h, --help         the command list
+-h, --help         the command list, or that command's own page
     --version      the version
 ```
+
+Every subcommand takes `--help` and prints its own usage, options and exit codes:
+`zircon inject --help`, `zircon validate --help`, `zircon login --help`.
 
 `--plugins` is the only way plugins load — nothing is picked up just for sitting next to
 the executable. `ZIRCON_PLUGINS` does the same for a shell that sets it once.
@@ -1344,7 +1454,7 @@ accepted too.
 
 ### Exit codes
 
-Worth knowing if you script any of this:
+Worth knowing if you script any of this. `zircon --help` prints the same table.
 
 | Code | Means |
 |---|---|
@@ -1500,7 +1610,7 @@ ctest --test-dir build -C Release
 A build reports its version as `0.6.0-dev`. Add `-DZIRCON_RELEASE=ON` to drop the suffix;
 that is the only difference between a local build and a released one.
 
-Nine test suites, 1947 checks, none of which need a game installed. They run against
+Nine test suites, 2013 checks, none of which need a game installed. They run against
 synthetic memory, hand-built bytecode and checked-in fixtures.
 
 > If Strawberry Perl or MinGW is on PATH, CMake may pick up its GCC. Pass the Visual

@@ -1151,3 +1151,89 @@ Nothing in the walk could have found that. Only reading the finished output back
 it against itself could, which is the whole argument for having the linter at all.
 
 Zero errors now, on a 49,572-type dump.
+
+## 0.7.0 — asking the runtime what it broke
+
+### The crash that would not name itself
+
+Road 96 and Road 96 Mile 0 both took the game down partway through `mscorlib`. The log said
+"assembly 1/191" and then stopped, because it only prints every thousandth type. Somewhere in
+the first thousand types of `mscorlib` is not a place to start looking.
+
+The fix was not cleverness, it was instrumentation, and the constraint shaped it: a walk that
+is about to be killed cannot write a log line, because the process stops existing before the
+buffer is flushed. So the current type goes in a memory-mapped page instead. Writing one is a
+`memcpy` — no syscall, no lock, cheap enough to do per type — and Windows writes a dirty
+file-backed page back even when the process is torn down.
+
+First run with it:
+
+```
+Mono.Xml.SmallXmlParser.AttrListImpl, mscorlib
+fields
+```
+
+Which had been the theory for weeks, now measured in one run.
+
+### Watching a fault without handling it
+
+Knowing the type was not the same as knowing why. `docs/IL2CPP.md` already argues that a
+`__try`/`__except` around a call into someone else's runtime is worse than the fault it
+catches — the lock stays held and the process dies later somewhere unrelated. That argument
+rules out *handling* the fault. It does not rule out looking at it.
+
+A vectored exception handler that records and returns `EXCEPTION_CONTINUE_SEARCH` changes
+nothing about what happens next. It runs on a thread that has just faulted, so it allocates
+nothing and takes no lock: hex into a stack buffer, `memcpy` into the page already mapped.
+
+```
+faulted inside the runtime: code 0xc0000005 at 0x7ffbeb257d68 (+0x307d68)
+                            reading 0x2aae30dd9a0
+```
+
+An access violation inside `GameAssembly.dll`, dereferencing a pointer into nothing. Unity's
+managed stripper had removed the type and left its class record in the image's table. There is
+no way to ask that works.
+
+Two details turned out to matter more than they looked:
+
+**Whose thread.** A vectored handler is registered process-wide and sees every thread. A game
+taking a first-chance fault of its own during the walk would have had whatever type the walk
+happened to be on written down as unreadable. Filtering to the walking thread is one line and
+without it the feature is a random-defect generator.
+
+**Whose code.** Recording *whether the faulting address is inside the runtime* is what makes
+the recovery legitimate. Inside means the type is broken and skipping it is the right answer.
+Outside means Zircon is broken, and then nothing is skipped and it keeps crashing until
+somebody looks at it. Without that distinction this is a `--best-effort` flag that hides our
+own defects, which is the one thing the project has said all along it will not ship.
+
+The same distinction handles a case nobody designed for: a game killed from Task Manager
+leaves a breadcrumb with no fault line, so nothing is skipped. Being terminated is not the
+same as faulting, and the record already knew the difference.
+
+Road 96 walks one more type per run now. Twenty-one in, still going, all of them stripped
+`mscorlib` internals — `Span<T>`, every `ValueTuple` arity, eventually `System.Boolean`. That
+build's `mscorlib` is too far gone to finish this way. The mechanism is still right, and it is
+general: any future crasher names itself on the first run instead of on the fifth evening.
+
+### A base bigger than the thing deriving from it
+
+`validate --strict` on IRON NEST, a game that dumps cleanly, reported one error:
+
+```
+inherited-exceeds-size   Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType, __Generated
+                         inherited region is 16 bytes of a 8-byte type
+```
+
+IL2CPP's own placeholder for a fully-shared generic. The runtime reports 8 for the type and 16
+for its base, and means both.
+
+The temptation is to call this the linter being pedantic about a type nobody asked for. It is
+not. An SDK generated from that record would not compile, and a dump is a contract: it should
+not contain a type that cannot exist. So the inherited size is left out when the base does not
+fit, and the count is reported at the end of the walk.
+
+Which is the same move as `offset_unresolved`, `values_resolved: false` and `shared_body`, and
+the same move the linter was built to force: when two numbers from the same source contradict
+each other, say so and write down neither.

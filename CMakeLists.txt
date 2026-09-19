@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.6.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.7.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,6 +78,7 @@ set(ZIRCON_PLUGIN_OUT ${ZIRCON_OUT}/$<CONFIG>/plugins)
 add_library(zircon_core STATIC
   src/core/src/MemorySource.cpp
   src/core/src/Log.cpp
+  src/core/src/Breadcrumb.cpp
   src/core/src/Term.cpp
   src/core/src/PeImage.cpp
   src/core/src/PatternScanner.cpp
@@ -160,6 +161,8 @@ set_target_properties(zircon_emit PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # under it -- neither one needs the other.
 add_library(zircon_il2cpp STATIC
   src/il2cpp/src/Runtime.cpp
+  src/il2cpp/src/Metadata.cpp
+  src/il2cpp/src/Static.cpp
   src/il2cpp/src/MethodLayout.cpp
   src/il2cpp/src/InProcessBridge.cpp
   src/il2cpp/src/Walker.cpp
@@ -325,7 +328,7 @@ endif()
 # both dumps and opens the live UI, and neither half is worth duplicating.
 if(ZIRCON_BUILD_DLL)
   add_library(zircon_payload SHARED src/dll/dllmain.cpp ${ZIRCON_RC_DLL})
-  target_link_libraries(zircon_payload PRIVATE zircon_engine zircon_emit zircon_ir zircon_il2cpp)
+  target_link_libraries(zircon_payload PRIVATE zircon_engine zircon_emit zircon_ir zircon_il2cpp zircon_zdex)
   if(ZIRCON_BUILD_GUI)
     target_link_libraries(zircon_payload PRIVATE zircon_gui_lib)
     target_compile_definitions(zircon_payload PRIVATE ZIRCON_WITH_GUI=1)

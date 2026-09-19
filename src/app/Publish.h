@@ -18,6 +18,10 @@ struct PublishOptions {
     bool json_output{false};
     bool assume_yes{false};  // skip the one-time terms prompt
     bool open_browser{false};
+
+    // Check everything and send nothing. Answers "would this be accepted, and as what"
+    // before spending minutes compressing several hundred megabytes.
+    bool dry_run{false};
 };
 
 // `login` only ever stores an API key. There is no account, no password and no browser

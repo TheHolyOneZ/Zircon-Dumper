@@ -2,6 +2,233 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.7.0 — 2026-09-19
+
+### Hybrid mode: the metadata and the runtime, together
+
+Until now a Unity dump meant running the game and asking its runtime. That answers some
+questions perfectly and others not at all, and it cannot answer anything for a target that
+will not run on this machine.
+
+`global-metadata.dat` answers the other half. So Zircon now reads it too, and `--mode dual`
+takes both.
+
+**Reading it without a version table.** Every other IL2CPP dumper parses that file with a
+table of struct layouts per metadata version, breaks on each Unity release until somebody
+hand-adds the new one, and carries that table forever. Zircon works the layout out instead,
+from four things the file cannot satisfy by accident:
+
+- the header's spans **tile the file**, from the end of the header to EOF, with only
+  alignment padding and never an overlap — which gives the span list and, from the first
+  span's offset, the header's own length and the entry stride (older metadata writes
+  `offset, size`, newer writes `offset, size, count`, and which one falls out rather than
+  being known);
+- the **identifier blob** is the span made of NUL-terminated names;
+- a **record table** is a span whose leading int32s land on the start of one of those names
+  for every record, which also settles the record size;
+- a **(start, count) pair inside a record partitions** the table it indexes — the ranges
+  cover `[0, N)` exactly once — and which `N` it reaches is what says which table it points
+  at.
+
+A wrong reading fails one of those within a few records. Measured on eleven installed games
+spanning metadata versions **24, 27, 29, 31 and 39**, Unity 2019 through Unity 6: ten solve
+completely, and the eleventh refuses with its reason rather than guessing, because its tables
+are scrambled beyond the header.
+
+Two of those constraints were wrong on the first attempt and the corpus said so. Fields and
+methods are *not* laid out in type order, so the pairs partition rather than tile; and one
+build's type span divides evenly by no plausible record size at all, so which size is right
+has to be settled by the partition rather than assumed before it.
+
+**`zircon dump --metadata <global-metadata.dat>`** needs no process at all. Road 96 — which
+has never once completed a live walk — dumps this way: 191 assemblies, 18,277 types, 87,979
+fields, 118,319 methods, with `UnityEngine.Vector3` carrying exactly `x`, `y`, `z` and the
+rest. So do APKs, console builds and anti-cheat titles, which is most of the IL2CPP games in
+the world and none of which the injected walk can reach.
+
+It is a genuine partial answer and says so. Field types, field offsets and method addresses
+are not in the metadata — they live in the binary — so they come back unresolved with
+nothing invented to fill them.
+
+**`zircon inject --mode dual`** runs both and merges:
+
+```
+merged: 12318 types in both, 36244 only the runtime had, 841 only the metadata declared
+```
+
+Neither side wins outright, because they are good at different things. The metadata is the
+spine: its type set is what the build declares and does not move between two reads, where the
+runtime's grows while a game runs. The runtime is the truth about execution: offsets, method
+addresses and concrete generics only exist once something has run. Both are kept, each record
+says which side it came from, and **every disagreement is written into the header rather than
+resolved quietly** — on a packed build the disagreement is the finding.
+
+Those 841 are types the live walk was losing: declared by the build, never touched by the
+game, so never in the class cache. The 36,244 are concrete generics the metadata cannot
+contain. Each mode was missing a large piece of the other's answer.
+
+IR schema is now **3**: `header.sources`, `header.conflicts` and a `source` on every type.
+
+### A walk that survives a broken type
+
+Two games in the corpus, Road 96 and Road 96 Mile 0, took the game process down partway
+through the walk and gave nothing back. The log said which assembly it was on and nothing
+more, because it only prints every thousandth type, so the answer was "somewhere in the first
+thousand types of mscorlib".
+
+Three things changed that.
+
+**A breadcrumb.** The walk writes what it is about to touch into a memory-mapped page before
+touching it — the type's path, then which member list it is reading. A memcpy, no syscall, so
+it stays on for every dump. When the process dies Windows still writes the dirty page back,
+and the next run opens with *a previous walk stopped at
+`Mono.Xml.SmallXmlParser.AttrListImpl, mscorlib`, reading its fields*. The first line is also
+exactly what a skip list takes, so there is nothing to transcribe.
+
+**A fault watcher.** A vectored handler that records the exception code, the faulting address,
+what was being read, and, the part that matters most, whether the address is inside
+`GameAssembly.dll`. It handles nothing and returns `EXCEPTION_CONTINUE_SEARCH`. Catching the
+fault would leave the runtime's locks held and take the game down later somewhere unrelated,
+which is worse than the fault and much harder to read. It only observes.
+
+That produced the actual answer on Road 96: an access violation *inside the runtime*, reading
+a pointer that goes nowhere. The type's metadata has been stripped and its class record left
+behind. No way of asking differently fixes that.
+
+**Auto-resume.** So the payload now records the type and walks around it next time — but only
+when the fault was inside the runtime's own code. A fault anywhere else is Zircon's bug and
+gets to keep crashing until somebody looks at it. That distinction is what makes this a
+recovery and not a `--best-effort` flag that papers over a defect.
+
+Every type walked past is named in the dump header, so a dump that lost something says so.
+The list lives in `zircon-out\logs\<Game>.unreadable`; `zircon-il2cpp-skip.txt` beside the DLL
+is the hand-written equivalent for anything else.
+
+### `il2cpp_class_num_fields`
+
+Bound as an optional entry point (36 optional now, still zero required). Where a build exports
+it, the field iteration stops at the reported count instead of calling the iterator one last
+time to be told there is nothing left. Present on every game in the corpus. It did not save
+Road 96 on its own — the fault watcher is what explained why — but calling into a foreign
+runtime one fewer time per class is worth having regardless.
+
+### One command per game
+
+Dumping a Unity game was a four-step manual job: start it, guess how long it needs, find the
+pid, inject, then watch a file to work out when the walk was done. The tester's report put it
+plainly -- he had to guess a sleep per game and it "was always wrong twice", and he ended up
+polling the JSON's size and calling "unchanged twice" finished, which is racy and which
+everyone who scripts this would reinvent badly.
+
+```
+zircon inject --launch "D:\Games\Thing\Thing.exe" --wait --headless -o thing.json
+```
+
+**`--launch <exe>`** starts the game and waits for `GameAssembly.dll` to actually be mapped,
+which the runtime already knows and a sleep only guesses at. It handles a launcher exe that
+starts the real game and exits.
+
+**`--wait`** blocks until the payload says it finished, and exits non-zero when the game died
+mid-walk or the timeout ran out. The signal is a status file the payload writes once at the
+end, not the dump file appearing -- a 600 MB write is non-empty long before it is done. With
+`--launch`, the game is closed afterwards.
+
+**`--wait-for-settle [s]`** polls the runtime's class cache until it stops growing. Two dumps
+of the same build differ today by how long the game sat at its menu — 42,528 against 42,610
+classes, minutes apart — which is noise in a build-to-build diff. This is not a sleep: the
+count is the thing being asked about, and a cache that settles in ten seconds is not waited
+on for the rest.
+
+**`--timeout <s>`** caps both, at 900 seconds by default.
+
+### Two records on one path, found by publishing it
+
+The first merged dump that went up to Zdex came back showing **10 enums** where the live half
+had 1,641. The merge asks "does the live side already have this path" before adding a type the
+metadata declares, and it was asking a map built from classes and structs. Enums are not
+`ir::Struct`, so every enum path looked unused, and the metadata's copy of it landed alongside
+as a class.
+
+Two records on one path is a contradiction. `validate --strict` rejects it, and Zdex — whose
+types table has a unique path — resolves it by silently keeping whichever it inserted first,
+which is where the missing enums went.
+
+Fixed, and the merge test now counts records per path and fails if any path carries two. The
+lesson is not subtle: the dual merge had passed its own tests and a live run, and the thing
+that caught it was putting it on the website and reading the numbers back.
+
+### A base bigger than the type deriving from it
+
+`zircon validate --strict` on IRON NEST reported one error:
+`Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType` had a 16-byte inherited region inside
+an 8-byte type. That is IL2CPP's own placeholder for a fully-shared generic, and the runtime
+genuinely reports both numbers.
+
+The linter was right. The walk was wrong to write it down: an SDK generated from that type
+would not compile, and a dump should not contain a type that cannot exist. So the inherited
+size is left out when the base does not fit, the count is reported at the end of the walk,
+and nothing is invented to fill the gap. Same rule as `offset_unresolved`.
+
+### Every game on the machine, in two commands
+
+```
+zircon scan-games -o games.toml      sweep the drives, write a manifest
+zircon batch games.toml -o dumps     dump all of them, unattended
+```
+
+`scan-games` finds games by what is in the folder rather than by a list of known titles, and
+knows the difference between a game and the crash reporter Unreal ships beside it — the first
+version of this produced a manifest that would have launched `CrashReportClient.exe` forty
+times, because `Engine` sorts before the project folder. Mono-backend Unity games are listed
+and commented out: no `GameAssembly.dll`, so there is nothing for the IL2CPP path to talk to,
+which is a correct no rather than a gap.
+
+`batch` runs each in turn. One failing does not stop the rest, and **a Unity game whose runtime
+faults partway through falls back to its metadata**, so it still yields its type system instead
+of a hole in the batch. That is hybrid mode paying for itself: on a two-game test Cave Crawlers
+came back as a merged dual dump and Road 96, which has never survived a live walk, came back
+from its metadata — 2 dumped, 0 failed, without anybody sitting there.
+
+### Written compressed
+
+An output path ending `.json.gz` is written compressed, in the payload as well as the CLI. A
+Unity dump is around 600 MB of JSON and 20 of gzip. Four games is the difference between 2.5 GB
+and a hundred, and it is not slower — these writes are I/O-bound.
+
+### `publish --dry-run`
+
+Checks the key, the file, the runtime gate and what it would be filed under, and sends nothing.
+Worth having before spending minutes compressing several hundred megabytes to find out the
+label was wrong.
+
+### Smaller things, all of them from a real batch-dumping session
+
+- `zircon detect` lists Unity IL2CPP processes as well as Unreal ones, with a column for
+  whether `GameAssembly.dll` is mapped yet. The GUI picker and the CLI now share one
+  implementation instead of the GUI keeping its own, and the picker grew the same column —
+  **Inject and dump** is disabled until the runtime is actually up, because a game that has
+  just been started has `GameAssembly.dll` on disk minutes before it is mapped.
+- `zircon inject -o <path>` writes the dump where you say. The payload used to name the file
+  after the process, which a script cannot predict.
+- `zircon inject --headless` skips the payload's console, which steals focus from a fullscreen
+  game.
+- `zircon inject --dll <path>` for a payload other than the one next door. `-o` used to mean
+  that, which was confusing in a tool where `-o` means the output everywhere else.
+- Every subcommand takes `--help` and prints its own page. `zircon login --help` used to
+  answer "unknown option: --help".
+- `zircon fingerprint --json`, with nothing else on stdout to trip a parser.
+- Exit codes are documented in `zircon --help` and consistent across commands.
+- One log per injection, at `zircon-out\logs\<Game>-<timestamp>.log`. Four games dumped in an
+  evening used to interleave in one file.
+- Walk progress has a denominator: `12000/42605 types in`.
+- The payload waits for the runtime to be *ready* rather than merely mapped. `--launch`
+  injects about a second into a cold start, and at that point `il2cpp_domain_get` already
+  returns a domain with no assemblies in it; walking that took the game down with no
+  breadcrumb, because the walk never got far enough to write one. It polls for the assembly
+  count to settle instead — asking the runtime, not sleeping.
+- Plugin ABI is 1.3 and advertises schema 3. The ABI test caught the drift: the number a
+  plugin checks has to be the number the IR actually uses.
+
 ## 0.6.0 — 2026-09-18
 
 ### Unity

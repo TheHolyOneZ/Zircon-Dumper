@@ -13,6 +13,7 @@
 #include "core/MemorySource.h"
 #include "il2cpp/Runtime.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -58,6 +59,21 @@ std::string_view ToString(ElementType type);
 // worth recording (the open-generic trap).
 constexpr bool IsGenericParameter(ElementType type) {
     return type == ElementType::Var || type == ElementType::MVar;
+}
+
+// What a build that doesn't export il2cpp_class_num_fields reports.
+constexpr std::int64_t kFieldCountUnknown = -1;
+
+// How many times the field iterator may be called for one class.
+//
+// Two games in the corpus die on the call that ends the iteration -- the one that returns
+// null -- so where the runtime will tell us the count up front we stop before it. The count
+// only ever narrows the walk: unknown or nonsense falls back to iterating until null, and a
+// count that's too small just means we read fewer fields, never past the end.
+constexpr std::size_t FieldIterationLimit(std::int64_t reported, std::size_t ceiling) {
+    if (reported < 0) return ceiling;
+    const auto count = static_cast<std::uint64_t>(reported);
+    return count > ceiling ? ceiling : static_cast<std::size_t>(count);
 }
 
 // Element types that stand for a class the runtime already has.

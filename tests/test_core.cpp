@@ -1,6 +1,7 @@
 // Dependency-free test runner. CI must never need a game installed, so everything here
 // runs against a synthetic in-memory source or a file the test itself writes.
 
+#include "core/Breadcrumb.h"
 #include "core/Log.h"
 #include "core/MemorySource.h"
 #include "core/PatternScanner.h"
@@ -23,6 +24,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -619,8 +621,8 @@ void TestNamePool() {
 
 // A miniature UE object graph: an unchunked FUObjectArray of classes, each with a class
 // default object, laid out at the offsets the derivation is supposed to discover. Enough
-// to exercise DeriveClassLayout without a game, which is the point — every test here has
-// to run on a machine with nothing installed.
+// to exercise DeriveClassLayout without a game. Every test here has to run on a machine
+// with nothing installed.
 struct SyntheticWorld {
     std::vector<std::uint8_t> bytes;
     Address                   base{};
@@ -1408,6 +1410,60 @@ void TestGlobalResolver() {
     SetGlobalResolver(nullptr);
 }
 
+// The crash breadcrumb. What matters is that the file on disk is readable while the writer
+// is still holding it open -- that is the whole case it exists for, since the writer is a
+// process that is about to die.
+void TestBreadcrumb() {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "zircon_breadcrumb_test" / "walk.breadcrumb";
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    {
+        CrashBreadcrumb crumb;
+        CHECK(crumb.Open(path));
+        CHECK(crumb.IsOpen());
+
+        crumb.Note("UnityEngine.Vector3, UnityEngine.CoreModule");
+        const auto first = ReadBreadcrumb(path);
+        CHECK(first.has_value());
+        if (first) CHECK(*first == "UnityEngine.Vector3, UnityEngine.CoreModule");
+
+        // A later note replaces the earlier one rather than piling up.
+        crumb.Note("System.String, mscorlib");
+        crumb.Append("fields");
+        crumb.Append("faulted inside the runtime: code 0xc0000005");
+
+        const auto second = ReadBreadcrumb(path);
+        CHECK(second.has_value());
+        if (second) {
+            CHECK(BreadcrumbKey(*second) == "System.String, mscorlib");
+            CHECK(BreadcrumbPhase(*second) ==
+                  "fields\nfaulted inside the runtime: code 0xc0000005");
+        }
+
+        // No newline means no phase, and the key is still the whole thing.
+        CHECK(BreadcrumbKey("only a key") == "only a key");
+        CHECK(BreadcrumbPhase("only a key").empty());
+
+        // Longer than the page: truncated, never overrun.
+        crumb.Note(std::string(kBreadcrumbSize * 2, 'x'));
+        const auto long_one = ReadBreadcrumb(path);
+        CHECK(long_one.has_value());
+        if (long_one) CHECK(long_one->size() == kBreadcrumbSize - 1);
+
+        crumb.Finish();
+        CHECK(!crumb.IsOpen());
+    }
+
+    // Finish means the walk got through, so the file goes. One left behind is the signal.
+    CHECK(!std::filesystem::exists(path, ec));
+    CHECK(!ReadBreadcrumb(path).has_value());
+
+    std::filesystem::remove_all(path.parent_path(), ec);
+}
+
 } // namespace
 
 int main() {
@@ -1434,6 +1490,7 @@ int main() {
     TestPoolStrideIsDerived();
     TestNameEntryDecoder();
     TestGlobalResolver();
+    TestBreadcrumb();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
