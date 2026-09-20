@@ -34,6 +34,11 @@ public:
     // long after attach -- or it keeps handing back the bytes from first touch.
     virtual void Invalidate() {}
 
+    // Enumerate modules again. A payload that lands during startup sees the module list as
+    // it was at open time, and the runtime DLL it is looking for may load a moment later.
+    // Without this the retry would re-read the same stale list forever.
+    virtual void RescanModules() {}
+
     virtual std::span<const ModuleInfo> Modules() const = 0;
     virtual std::span<const RegionInfo> Regions() const = 0;
     virtual Capabilities                Caps()    const = 0;

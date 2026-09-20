@@ -84,9 +84,12 @@ void CloseConsole() {
 // mappings without asking. The rest are one CLI command away from the resulting dump.json.
 constexpr const char* kDefaultEmitters[] = {"cpp_sdk", "usmap", "json"};
 
-// What a Unity target gets. json only for now -- the other emitters are Unreal-shaped and
-// printing a C# type as a UClass is worse than not offering it.
-constexpr const char* kIl2CppEmitters[] = {"json"};
+// What a Unity target gets. The comment here used to say json only, because the rest were
+// Unreal-shaped and printing a C# type as a UClass is worse than not offering it. That is
+// still true of cpp_sdk and usmap, which now refuse an il2cpp dump outright. csharp is the
+// one that was missing: someone who injected into a Unity game wants the source tree without
+// having to run a second command for it.
+constexpr const char* kIl2CppEmitters[] = {"csharp", "json"};
 
 void WriteDump(const ir::Dump& dump, const std::filesystem::path& out,
                std::span<const char* const> emitters) {
@@ -129,9 +132,21 @@ std::string SafeStem(std::string_view name) {
     return out.empty() ? "game" : out;
 }
 
+// Local time, because everything you would compare this against is local: the file's own
+// mtime, the console output, and what the clock said when you ran it. 0.7.0 named these in
+// UTC, so finding the log for a run meant doing timezone arithmetic first.
+//
+// created_utc in the dump header stays UTC. That one gets read by other machines.
 std::string Stamp() {
-    const auto now = std::chrono::system_clock::now();
-    return std::format("{:%Y%m%d-%H%M%S}", std::chrono::floor<std::chrono::seconds>(now));
+    const auto now = std::chrono::floor<std::chrono::seconds>(
+        std::chrono::system_clock::now());
+    try {
+        return std::format("{:%Y%m%d-%H%M%S}",
+                           std::chrono::zoned_time{std::chrono::current_zone(), now});
+    } catch (const std::exception&) {
+        // No timezone database. A UTC name beats no log.
+        return std::format("{:%Y%m%d-%H%M%S}Z", now);
+    }
 }
 
 // One log per injection rather than one file everybody appends to. Four games dumped in an
@@ -201,7 +216,7 @@ Handoff TakeHandoff(const std::filesystem::path& path) {
 // How the caller finds out it is over. Written last, once, and the CLI waits on it existing
 // rather than on a file growing -- a 600 MB write is non-empty long before it is finished.
 void ReportStatus(std::string_view outcome, std::string_view detail) {
-    if (g_handoff.status.empty()) return;
+    if (g_handoff.status.empty() || outcome.empty()) return;
 
     std::error_code ignored;
     std::filesystem::create_directories(g_handoff.status.parent_path(), ignored);
@@ -495,9 +510,58 @@ LONG CALLBACK FaultWatch(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Wait until the process has a module list worth reading.
+//
+// Injecting a second into a cold start lands in the middle of the loader, and 0.7.0 took
+// whatever it saw at that moment as the truth. A tester's run enumerated nothing at all, so
+// GameAssembly.dll was not there to find, IL2CPP detection said no, and a Unity game was
+// reported as a failed Unreal one. The log was called game-<time>.log for the same reason.
+//
+// The main module resolving is the signal, and it is engine-agnostic: a process that cannot
+// name its own executable is still loading, whatever it was built with. A game that has been
+// up for a while passes on the first check and waits for nothing.
+void SettleModules(core::IMemorySource& memory, int seconds) {
+    if (memory.MainModule()) return;
+
+    core::LogInfo("modules are not enumerable yet; waiting for the process to load");
+    for (int waited = 0; waited < seconds * 10; ++waited) {
+        ::Sleep(100);
+        memory.RescanModules();
+        if (memory.MainModule()) {
+            core::LogInfo("modules settled after {}ms", (waited + 1) * 100);
+            return;
+        }
+    }
+    core::LogWarn("still cannot enumerate modules after {}s; going on with what is visible",
+                  seconds);
+}
+
 // False when this isn't a Unity game: carry on into the Unreal path.
 bool RunIl2CppDump(core::IMemorySource& memory, const std::filesystem::path& out) {
-    const auto runtime = il2cpp::FindRuntime(memory);
+    auto runtime = il2cpp::FindRuntime(memory);
+
+    // The exe can be loaded while GameAssembly.dll still is not, and then the question gets
+    // answered a moment too early. global-metadata.dat on disk settles what the game is
+    // without needing any module to be loaded, so when it is there, a missing runtime means
+    // not yet rather than no, and falling through to Unreal would be wrong.
+    if (!runtime) {
+        const auto* exe = memory.MainModule();
+        if (exe && !MetadataBeside(exe->path).empty()) {
+            core::LogInfo("global-metadata.dat is on disk, so this is a Unity game whose "
+                          "runtime has not loaded yet; waiting");
+            for (int waited = 0; waited < 300 && !runtime; ++waited) {
+                ::Sleep(100);
+                memory.RescanModules();
+                runtime = il2cpp::FindRuntime(memory);
+            }
+            if (!runtime) {
+                core::LogError("global-metadata.dat is beside the game but its IL2CPP runtime "
+                               "never loaded");
+                ReportStatus("failed", "Unity game whose IL2CPP runtime never loaded");
+                return true;   // handled: it is Unity, and the answer is no
+            }
+        }
+    }
     if (!runtime) return false;
 
     core::LogInfo("Unity IL2CPP: {} at {:#x}", runtime->module_name,
@@ -543,6 +607,9 @@ bool RunIl2CppDump(core::IMemorySource& memory, const std::filesystem::path& out
     const auto resume_path = ResumeFile(out, game);
 
     if (const auto last = core::ReadBreadcrumb(crumb_path)) {
+        // Now that it has been read, make it a file a person can open.
+        core::TrimBreadcrumbFile(crumb_path, *last);
+
         const auto key = core::BreadcrumbKey(*last);
         core::LogWarn("a previous walk stopped at {}", key);
 
@@ -615,6 +682,10 @@ bool RunIl2CppDump(core::IMemorySource& memory, const std::filesystem::path& out
     dump.header.tool_version  = ZIRCON_VERSION;
     dump.header.source.kind    = "internal";
     dump.header.source.process = memory.MainModule() ? memory.MainModule()->name : "";
+
+    // The same number fingerprint prints. Nothing filled this in on the Unity path, so a
+    // healthy dump validated as "engine (0%)" and read like a failed detection.
+    dump.header.engine.confidence = runtime->confidence;
 
     core::LogInfo("dump: {} assemblies, {} classes, {} structs, {} enums, {} fields, "
                   "{} methods, {} properties",
@@ -695,6 +766,27 @@ void RunDump(const engine::Reflection& reflection, const std::filesystem::path& 
     WriteDump(dump, out, kDefaultEmitters);
 }
 
+// Ends the payload, having said how it went.
+//
+// Every exit goes through here. 0.7.0 wrote the status file only on success, so a payload that
+// gave up in the first second left `--wait` with nothing to hear and it burned the whole 900s
+// timeout before the fallback ran.
+//
+// Headless never waits for a keypress either: there is no console to press it in, so the wait
+// was just the timeout by another name.
+[[noreturn]] void FinishPayload(std::string_view outcome, std::string_view detail) {
+    ReportStatus(outcome, detail);
+
+    if (!g_handoff.headless) {
+        core::LogInfo("press END to unload");
+        while ((::GetAsyncKeyState(VK_END) & 1) == 0) ::Sleep(50);
+    }
+    core::LogInfo("unloading");
+    core::CloseLogFile();
+    CloseConsole();
+    ::FreeLibraryAndExitThread(g_self, 0);
+}
+
 // Held for the lifetime of the payload: a generated SDK may call in at any point while
 // the browser is open.
 std::unique_ptr<core::IMemorySource> g_memory;
@@ -711,11 +803,13 @@ DWORD WINAPI PayloadThread(LPVOID) {
     auto source = core::OpenInternal();
     if (!source) {
         core::LogError("{}", source.error().message);
-        return 1;
+        FinishPayload("failed", source.error().message);
     }
 
     auto memory = core::MakeCached(std::move(source.value()));
     core::LogInfo("target: {}", memory->Describe());
+
+    SettleModules(*memory, 30);
 
     const auto* main_module = memory->MainModule();
     if (main_module) {
@@ -731,11 +825,9 @@ DWORD WINAPI PayloadThread(LPVOID) {
 
         if (RunIl2CppDump(*memory, out)) {
             core::LogInfo("output directory: {}", out.string());
-            core::LogInfo("press END to unload");
-            while ((::GetAsyncKeyState(VK_END) & 1) == 0) ::Sleep(50);
-            core::CloseLogFile();
-            CloseConsole();
-            ::FreeLibraryAndExitThread(g_self, 0);
+
+            // RunIl2CppDump has already reported its own outcome, good or bad.
+            FinishPayload({}, {});
         }
     }
 
@@ -755,10 +847,8 @@ DWORD WINAPI PayloadThread(LPVOID) {
     auto reflection = engine::Reflect(*memory);
     if (!reflection.Valid()) {
         core::LogError("could not derive the reflection layout; nothing to do");
-        core::LogInfo("press END to unload");
-        while ((::GetAsyncKeyState(VK_END) & 1) == 0) ::Sleep(50);
-        CloseConsole();
-        ::FreeLibraryAndExitThread(g_self, 0);
+        FinishPayload("failed", "could not derive the reflection layout: this is neither a "
+                                "Unity IL2CPP game nor an Unreal one the walk could read");
     }
 
     const auto out = OutputDirectory();
@@ -788,6 +878,7 @@ DWORD WINAPI PayloadThread(LPVOID) {
     }
 
     RunDump(reflection, out);
+    ReportStatus("ok", out.string());
 
     // Published before the browser opens, so an SDK compiled from this dump can bind as
     // soon as the payload is in.
@@ -799,18 +890,15 @@ DWORD WINAPI PayloadThread(LPVOID) {
 
 
 #if ZIRCON_WITH_GUI
-    // Browser takes over from here, in its own window.
-    core::LogInfo("opening the live browser; close its window to unload");
-    gui::RunBrowserWindow(std::move(g_memory), g_reflection);
-#else
-    core::LogInfo("press END in the game window to unload");
-    while ((::GetAsyncKeyState(VK_END) & 1) == 0) ::Sleep(50);
+    // Browser takes over from here, in its own window. Not when headless: nobody asked for a
+    // window, and an unattended run would sit on it forever.
+    if (!g_handoff.headless) {
+        core::LogInfo("opening the live browser; close its window to unload");
+        gui::RunBrowserWindow(std::move(g_memory), g_reflection);
+    }
 #endif
 
-    core::LogInfo("unloading");
-    core::CloseLogFile();
-    CloseConsole();
-    ::FreeLibraryAndExitThread(g_self, 0);
+    FinishPayload({}, {});
 }
 
 } // namespace

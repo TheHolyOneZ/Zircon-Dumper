@@ -43,6 +43,13 @@ using FnDomainAssemblies = void** (*)(void*, std::size_t*);
 using FnPtrToPtr       = void* (*)(void*);
 using FnPtrToStr       = const char* (*)(void*);
 using FnPtrToInt       = int (*)(void*);
+
+// The il2cpp_class_is_* calls return bool, not int, and on x64 a bool return only commits
+// the low byte of the register. The rest is whatever the callee left there. Called through
+// an int signature they read as true roughly whenever that garbage is non-zero, which is why
+// UnityEngine.Vector3 came out of the walk marked interface AND abstract AND valuetype at
+// once. Nothing downstream could have caught that: all three are legal on their own.
+using FnPtrToBool      = bool (*)(void*);
 using FnPtrToU32       = std::uint32_t (*)(void*);
 using FnPtrToSize      = std::size_t (*)(void*);
 using FnPtrIndex       = void* (*)(void*, std::size_t);
@@ -194,8 +201,8 @@ public:
             At<FnPtrToInt>(runtime_.api.class_get_flags)(k));
         facts.instance_size = static_cast<std::int32_t>(
             At<FnPtrToU32>(runtime_.api.class_instance_size)(k));
-        facts.is_valuetype  = At<FnPtrToInt>(runtime_.api.class_is_valuetype)(k) != 0;
-        facts.is_enum       = At<FnPtrToInt>(runtime_.api.class_is_enum)(k) != 0;
+        facts.is_valuetype  = At<FnPtrToBool>(runtime_.api.class_is_valuetype)(k);
+        facts.is_enum       = At<FnPtrToBool>(runtime_.api.class_is_enum)(k);
 
         facts.image       = Call(runtime_.api.class_get_image, klass);
         facts.token       = Number(runtime_.api.class_get_type_token, klass);
@@ -412,7 +419,7 @@ private:
     // the neutral value, never a stand-in that reads as real.
     bool Flag(Address entry, Address argument) {
         if (IsNull(entry) || IsNull(argument)) return false;
-        return At<FnPtrToInt>(entry)(AsPtr(argument)) != 0;
+        return At<FnPtrToBool>(entry)(AsPtr(argument));
     }
 
     std::uint32_t Number(Address entry, Address argument) {

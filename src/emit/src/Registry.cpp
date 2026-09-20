@@ -17,6 +17,7 @@ std::vector<Emitter>& Registry() {
         // out, and the CLI holds one across a whole emit.
         built_in.reserve(256);
         built_in.push_back({"cpp_sdk", "C++ SDK headers with static_assert offset checks", true, &EmitCppSdk});
+        built_in.push_back({"csharp", "C# source tree: one folder per assembly, one file per type", true, &EmitCSharp});
         built_in.push_back({"usmap", "UE4SS / FModel .usmap mappings", true, &EmitUsmap});
         built_in.push_back({"ida", "IDA Pro Python script importing types", true, &EmitIda});
         built_in.push_back({"ghidra", "Ghidra Python script importing types", true, &EmitGhidra});

@@ -958,6 +958,263 @@ void TestPythonStubsEmit() {
     CHECK(offsets_at != std::string::npos);
 }
 
+// ---------------------------------------------------------------------------------
+// The C# source tree
+// ---------------------------------------------------------------------------------
+
+// A Unity-shaped dump. MakeDump() is Unreal, and the C# emitter refuses those on purpose,
+// so this builds the other kind: assembly-qualified paths, namespaces, a nested type, a
+// generic definition, a value type and an enum.
+ir::Dump MakeUnityDump() {
+    ir::Dump dump;
+    dump.schema_version = ir::kSchemaVersion;
+    dump.header.runtime = "il2cpp";
+    dump.header.tool_version = "test";
+    dump.header.source.kind = "internal";
+    dump.header.sources = {"live"};
+
+    ir::Package package;
+    package.name = "Assembly-CSharp.dll";
+
+    ir::Struct player;
+    player.path = "Game.Actors.Player, Assembly-CSharp";
+    player.name = "Player";
+    player.name_space = "Game.Actors";
+    player.super = "UnityEngine.MonoBehaviour, UnityEngine.CoreModule";
+    player.interfaces = {"System.IEquatable<Game.Actors.Player>, mscorlib"};
+    player.is_class = true;
+    player.token = 0x02000042;
+    player.size = 0x40;
+    player.source = "both";
+
+    ir::Property health;
+    health.name = "health";
+    health.type.kind = ir::TypeKind::Int32;
+    health.offset = 0x18;
+    player.properties.push_back(health);
+
+    ir::Property gravity;
+    gravity.name = "gravity";
+    gravity.type.kind = ir::TypeKind::Float;
+    gravity.is_static = true;
+    player.properties.push_back(gravity);
+
+    // A keyword as a field name. Obfuscated assemblies are full of these.
+    ir::Property keyword;
+    keyword.name = "class";
+    keyword.type.kind = ir::TypeKind::Bool;
+    keyword.offset = 0x1C;
+    player.properties.push_back(keyword);
+
+    ir::Function ctor;
+    ctor.name = ".ctor";
+    ctor.native_rva = 0x1234;
+    player.functions.push_back(ctor);
+
+    ir::Function take;
+    take.name = "TakeDamage";
+    take.native_rva = 0x5678;
+    ir::FunctionParam amount;
+    amount.name = "amount";
+    amount.type.kind = ir::TypeKind::Int32;
+    take.params.push_back(amount);
+    ir::FunctionParam returns;
+    returns.is_return = true;
+    returns.type.kind = ir::TypeKind::Unknown;
+    returns.type.raw = "System.Void";
+    take.params.push_back(returns);
+    player.functions.push_back(take);
+
+    ir::Accessor hp;
+    hp.name = "Health";
+    hp.type.kind = ir::TypeKind::Int32;
+    hp.getter = "get_Health";
+    player.accessors.push_back(hp);
+
+    package.classes.push_back(player);
+
+    // Nested inside Player, which is what the dot after Player means here.
+    ir::Struct nested;
+    nested.path = "Game.Actors.Player.State, Assembly-CSharp";
+    nested.name = "State";
+    nested.name_space = "Game.Actors";
+    nested.is_class = true;
+    package.classes.push_back(nested);
+
+    // Generic definition. The backtick is the runtime's spelling, not C#'s.
+    ir::Struct generic;
+    generic.path = "Game.Box`1, Assembly-CSharp";
+    generic.name = "Box`1";
+    generic.name_space = "Game";
+    generic.is_class = true;
+    generic.is_generic = true;
+    package.classes.push_back(generic);
+
+    // The flags Vector3 came out of a real walk with: all three at once.
+    ir::Struct value;
+    value.path = "Game.Point, Assembly-CSharp";
+    value.name = "Point";
+    value.name_space = "Game";
+    value.is_valuetype = true;
+    value.is_interface = true;
+    value.is_abstract  = true;
+    package.structs.push_back(value);
+
+    ir::Enum mode;
+    mode.path = "Game.Mode, Assembly-CSharp";
+    mode.name = "Mode";
+    mode.underlying = "int32";
+    mode.values = {{"Idle", 0}, {"Running", 1}};
+    package.enums.push_back(mode);
+
+    dump.packages.push_back(package);
+    return dump;
+}
+
+std::string FindEmitted(const emit::EmitResult& result, std::string_view needle) {
+    for (const auto& file : result.files)
+        if (file.find(needle) != std::string::npos) return ReadWholeFile(file);
+    return {};
+}
+
+void TestCSharpEmit() {
+    const ir::Dump dump = MakeUnityDump();
+
+    emit::EmitOptions options;
+    options.out_dir = (TempDir() / "cs").string();
+
+    const auto* emitter = emit::FindEmitter("csharp");
+    CHECK(emitter != nullptr);
+    if (!emitter) return;
+
+    const auto result = emitter->emit(dump, options);
+    CHECK(result.ok());
+    if (!result.ok()) {
+        std::fprintf(stderr, "      csharp: %s\n", result.error.c_str());
+        return;
+    }
+
+    // One file per top-level type. The nested one is not top-level.
+    CHECK(result.files.size() == 4);
+
+    const std::string player = FindEmitted(result, "Player.cs");
+    CHECK(!player.empty());
+    if (player.empty()) return;
+
+    // The folder is the assembly, and the namespace below it.
+    bool placed = false;
+    for (const auto& file : result.files)
+        if (file.find("Player.cs") != std::string::npos)
+            placed = file.find("Assembly-CSharp") != std::string::npos &&
+                     file.find("Game") != std::string::npos &&
+                     file.find("Actors") != std::string::npos;
+    CHECK(placed);
+
+    CHECK(player.find("namespace Game.Actors") != std::string::npos);
+    CHECK(player.find("public class Player : MonoBehaviour, IEquatable<Player>") !=
+          std::string::npos);
+    CHECK(player.find("Token: 0x02000042") != std::string::npos);
+
+    CHECK(player.find("public int health; // 0x18") != std::string::npos);
+    CHECK(player.find("public static float gravity; // static field") != std::string::npos);
+
+    // A keyword field has to come out as something C# can read.
+    CHECK(player.find("public bool @class;") != std::string::npos);
+
+    CHECK(player.find("public int Health { get; }") != std::string::npos);
+
+    // .ctor is written the way C# writes it, with no return type.
+    CHECK(player.find("public Player(){ } // RVA: 0x1234") != std::string::npos);
+    CHECK(player.find("_ctor") == std::string::npos);
+
+    // System.Void is void.
+    CHECK(player.find("public void TakeDamage(int amount){ } // RVA: 0x5678") !=
+          std::string::npos);
+    CHECK(player.find("System_Void") == std::string::npos);
+
+    // The nested type is inside its outer type's file, indented, not in one of its own.
+    CHECK(player.find("        public class State") != std::string::npos);
+    CHECK(FindEmitted(result, "State.cs").empty());
+
+    // `1 is <T>.
+    const std::string box = FindEmitted(result, "Box_T.cs");   // <T> is not a file name
+    CHECK(!box.empty());
+    CHECK(box.find("public class Box<T>") != std::string::npos);
+    CHECK(box.find("`") == std::string::npos);
+
+    // A value type wins over the interface flag, and is never abstract.
+    const std::string point = FindEmitted(result, "Point.cs");
+    CHECK(!point.empty());
+    CHECK(point.find("public struct Point") != std::string::npos);
+    CHECK(point.find("ValueType") == std::string::npos);
+    CHECK(point.find("interface") == std::string::npos);
+    CHECK(point.find("abstract") == std::string::npos);
+
+    // Enums keep their values, with a C# underlying type.
+    const std::string mode = FindEmitted(result, "Mode.cs");
+    CHECK(!mode.empty());
+    CHECK(mode.find("public enum Mode : int") != std::string::npos);
+    CHECK(mode.find("Idle = 0,") != std::string::npos);
+    CHECK(mode.find("int32") == std::string::npos);
+
+    // Every file says what it is and is not.
+    CHECK(player.find("Method") != std::string::npos);
+    CHECK(player.find("bodies are empty") != std::string::npos);
+}
+
+// A metadata-only dump has no offsets at all. Printing 0 would read as the first field.
+void TestCSharpStaticSaysSo() {
+    ir::Dump dump = MakeUnityDump();
+    dump.header.source.kind = "static";
+    dump.header.sources = {"static"};
+    dump.header.partial = true;
+    for (auto& package : dump.packages)
+        for (auto& record : package.classes)
+            for (auto& field : record.properties) field.offset_unresolved = true;
+
+    emit::EmitOptions options;
+    options.out_dir = (TempDir() / "cs-static").string();
+    options.allow_partial = true;
+
+    const auto* emitter = emit::FindEmitter("csharp");
+    CHECK(emitter != nullptr);
+    if (!emitter) return;
+
+    const auto result = emitter->emit(dump, options);
+    CHECK(result.ok());
+    if (!result.ok()) return;
+
+    const std::string player = FindEmitted(result, "Player.cs");
+    CHECK(!player.empty());
+    CHECK(player.find("in the binary, not in the metadata") != std::string::npos);
+    CHECK(player.find("// 0x18") == std::string::npos);
+    CHECK(!result.warnings.empty());
+}
+
+// Each emitter refuses the other's runtime, rather than producing something shaped right
+// and wrong. cpp_sdk on a Unity dump used to emit `struct UList_AchievementMono___mscorlib`.
+void TestRuntimeRefusals() {
+    emit::EmitOptions options;
+    options.out_dir = TempDir().string();
+    options.allow_partial = true;
+
+    const auto* cpp = emit::FindEmitter("cpp_sdk");
+    const auto* cs  = emit::FindEmitter("csharp");
+    CHECK(cpp != nullptr);
+    CHECK(cs != nullptr);
+    if (!cpp || !cs) return;
+
+    const auto wrong_way = cpp->emit(MakeUnityDump(), options);
+    CHECK(!wrong_way.ok());
+    CHECK(wrong_way.error.find("C#") != std::string::npos);
+    CHECK(wrong_way.files.empty());
+
+    const auto other_way = cs->emit(MakeDump(), options);
+    CHECK(!other_way.ok());
+    CHECK(other_way.error.find("Unreal") != std::string::npos);
+    CHECK(other_way.files.empty());
+}
+
 } // namespace
 
 int main() {
@@ -1004,6 +1261,10 @@ int main() {
     TestBinjaEmits();
     TestFridaEmits();
     TestPythonStubsEmit();
+
+    TestCSharpEmit();
+    TestCSharpStaticSaysSo();
+    TestRuntimeRefusals();
 
     std::filesystem::remove_all(TempDir(), ec);
 

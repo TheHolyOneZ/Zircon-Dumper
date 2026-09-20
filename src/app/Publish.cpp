@@ -7,6 +7,7 @@
 #include "zdex/Client.h"
 #include "zdex/Config.h"
 #include "zdex/Gzip.h"
+#include "zdex/Sha256.h"
 #include "zdex/Upload.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +24,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <thread>
 
 using namespace zircon::core;
@@ -248,12 +250,208 @@ std::string PublishRefusal(std::string_view runtime) {
                        runtime);
 }
 
+// The bytes of a dump, inflated if they arrived compressed.
+std::string DumpBytes(std::string_view path) {
+    std::ifstream in{std::string(path), std::ios::binary};
+    if (!in) return {};
+    const std::string bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    if (!zdex::LooksGzipped(bytes)) return bytes;
+
+    std::string error;
+    std::string plain = zdex::GzipDecompress(bytes, error);
+    return error.empty() ? plain : std::string{};
+}
+
+// A dump's header, whichever container it is in.
+//
+// ReadJsonHeaderFile scans the first megabyte for the header key, which on a .json.gz is a
+// megabyte of deflate. It failed, and the refusal below treats a failure as "not my
+// business" -- so the runtime gate quietly stopped applying the moment dumps started being
+// written compressed.
+std::optional<ir::Header> HeaderOf(std::string_view path) {
+    if (auto direct = ir::ReadJsonHeaderFile(path)) return direct.value();
+
+    const std::string plain = DumpBytes(path);
+    if (plain.empty()) return std::nullopt;
+
+    auto parsed = ir::ParseJsonHeader(
+        std::string_view(plain).substr(0, std::min<std::size_t>(plain.size(), 1024 * 1024)));
+    if (!parsed) return std::nullopt;
+    return parsed.value();
+}
+
 std::string PublishRefusalForFile(std::string_view path) {
-    const auto header = ir::ReadJsonHeaderFile(path);
+    const auto header = HeaderOf(path);
     // An unreadable header is not the gate's business. Whatever is wrong with the file, the
     // upload path reports it better than a refusal phrased as being about runtimes would.
     if (!header) return {};
-    return PublishRefusal(header.value().runtime);
+    return PublishRefusal(header->runtime);
+}
+
+// --- what the server will accept, checked here -------------------------------------
+//
+// These mirror zdex's own rules. Duplicating a rule is usually a bad trade, but --dry-run
+// exists to answer "would this be accepted" without sending anything, and 0.7.0 answered
+// yes to labels the upload then refused. A check that skips the cheapest way to fail is
+// not much of a check.
+//
+// Non-ASCII bytes are taken as letters. The server tests \p{L} and \p{N}, which needs a
+// Unicode table to do properly; passing them through means an accented title goes to the
+// server to be judged there, rather than being refused here over a rule this cannot read.
+
+// One space between words, none at the ends -- the server does this before measuring, so
+// measuring anything else would disagree with it about the length.
+std::string Collapse(std::string_view text) {
+    std::string out;
+    bool pending = false;
+    for (const char c : text) {
+        const auto raw = static_cast<unsigned char>(c);
+        if (raw < 0x80 && std::isspace(raw)) {
+            pending = !out.empty();
+            continue;
+        }
+        if (pending) out.push_back(' ');
+        pending = false;
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Characters, not bytes. A continuation byte is not a character of its own.
+std::size_t CodePoints(std::string_view text) {
+    std::size_t count = 0;
+    for (const char c : text)
+        if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) ++count;
+    return count;
+}
+
+bool LooksLetterOrNumber(unsigned char raw) {
+    return raw >= 0x80 || std::isalnum(raw);
+}
+
+// Empty when it would be accepted. Names the offending character, which the server's own
+// message does not -- it lists what is allowed and leaves you to find which one you used.
+std::string CharacterProblem(std::string_view value, std::string_view allowed,
+                             std::string_view what) {
+    if (!LooksLetterOrNumber(static_cast<unsigned char>(value.front())))
+        return std::format("{} has to start with a letter or a number, not '{}'", what,
+                           value.front());
+
+    for (const char c : value) {
+        const auto raw = static_cast<unsigned char>(c);
+        if (LooksLetterOrNumber(raw)) continue;
+        if (allowed.find(c) != std::string_view::npos) continue;
+        if (raw < 0x20 || raw == 0x7F)
+            return std::format("{} has a control character in it", what);
+        return std::format("{} cannot contain '{}'", what, c);
+    }
+    return {};
+}
+
+std::string LabelProblem(std::string_view label) {
+    const auto value = Collapse(label);
+    const auto length = CodePoints(value);
+    if (length < 1 || length > 80)
+        return std::format("a build label has to be 1 to 80 characters, and this one is {}",
+                           length);
+    return CharacterProblem(value, " ._-+#()/", "a build label");
+}
+
+std::string GameProblem(std::string_view game) {
+    const auto value = Collapse(game);
+    const auto length = CodePoints(value);
+    if (length < 2 || length > 120)
+        return std::format("a game name has to be 2 to 120 characters, and this one is {}",
+                           length);
+    return CharacterProblem(value, " '&:.,!?()-/+", "a game name");
+}
+
+// What this machine has already published, by the hash of the dump's JSON.
+//
+// Zdex keys a dump on the sha256 of the uncompressed JSON and refuses a repeat -- but only
+// at the end, once the whole file is up. Re-running a batch over a dozen games meant
+// compressing and sending hundreds of megabytes to be told each one was already there.
+//
+// This only knows about uploads from this machine, which is the case it is for. Anything it
+// has not seen is sent, and the server still has the last word.
+std::filesystem::path PublishedLogPath() {
+    return std::filesystem::path(zdex::ConfigPath()).parent_path() / "published.txt";
+}
+
+// One record per line: the hash, a space, the url. Plain text rather than JSON, so a
+// half-written line costs one entry instead of the file.
+std::string PreviouslyPublished(const std::string& hash) {
+    if (hash.empty()) return {};
+    std::ifstream in(PublishedLogPath());
+    if (!in) return {};
+
+    std::string line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.size() <= 65 || line[64] != ' ') continue;
+        if (line.compare(0, 64, hash) == 0) return line.substr(65);
+    }
+    return {};
+}
+
+void RememberPublished(const std::string& hash, const std::string& url) {
+    if (hash.empty() || url.empty()) return;
+
+    std::error_code ec;
+    std::filesystem::create_directories(PublishedLogPath().parent_path(), ec);
+
+    std::ofstream out(PublishedLogPath(), std::ios::app);
+    if (!out) return;
+    out << hash << ' ' << url << '\n';
+}
+
+// The hash the server will compute: of the JSON, not of the container it came in.
+std::string DumpHash(std::string_view path) {
+    const std::string plain = DumpBytes(path);
+    return plain.empty() ? std::string{} : zdex::Sha256Hex(plain);
+}
+
+// The game a dump says it came from. For --all, where typing a name per file is the thing
+// being removed. The header knows; the filename is the fallback.
+std::string GameNameFor(std::string_view path) {
+    if (const auto header = HeaderOf(path); header && !header->source.process.empty()) {
+        std::string name = header->source.process;
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".exe") == 0)
+            name.resize(name.size() - 4);
+        if (!name.empty()) return name;
+    }
+
+    std::string stem = std::filesystem::path(path).filename().string();
+    for (const std::string_view tail : {".json.gz", ".json", ".zip", ".gz"}) {
+        if (stem.size() > tail.size() &&
+            stem.compare(stem.size() - tail.size(), tail.size(), tail) == 0) {
+            stem.resize(stem.size() - tail.size());
+            break;
+        }
+    }
+    std::replace(stem.begin(), stem.end(), '_', ' ');
+    return stem;
+}
+
+// --label auto: a label taken from the dump rather than from whoever is typing.
+//
+// Labels are what a diff matches on, and typed by hand they end up as "v1", "test2" and
+// "final". The image size of the module a dump was read from changes whenever the game is
+// rebuilt and is identical across two runs of the same build, which is the property a build
+// label needs.
+//
+// Empty when the dump carries nothing that qualifies. Refusing beats inventing: a made-up
+// label that collides with another build is worse than being asked to type one.
+std::string AutoLabel(std::string_view path) {
+    const auto header = HeaderOf(path);
+    if (!header || header->source.image_size == 0) return {};
+
+    std::string module = header->source.main_module;
+    if (module.size() > 4 && module.compare(module.size() - 4, 4, ".dll") == 0)
+        module.resize(module.size() - 4);
+    if (module.empty()) module = "image";
+    return std::format("{} {:#x}", module, header->source.image_size);
 }
 
 int CommandPublish(const PublishOptions& options) {
@@ -273,20 +471,52 @@ int CommandPublish(const PublishOptions& options) {
         return 1;
     }
 
-    if (const auto refusal = PublishRefusalForFile(options.path); !refusal.empty()) {
+    // Resolved once, here, so everything below sees a real label.
+    PublishOptions resolved = options;
+    if (resolved.label == "auto") {
+        resolved.label = AutoLabel(resolved.path);
+        if (resolved.label.empty()) {
+            LogError("--label auto needs something in the dump that identifies the build, "
+                     "and this one has no loaded image size to go on");
+            LogInfo("a dump read from metadata alone never has one; pass a label");
+            return ExitFor(zdex::Outcome::Usage);
+        }
+        Field("label", std::format("{} (from the dump)", resolved.label));
+    }
+
+    if (const auto refusal = PublishRefusalForFile(resolved.path); !refusal.empty()) {
         LogError("{}", refusal);
         return ExitFor(zdex::Outcome::Usage);
     }
 
+    if (const auto problem = GameProblem(resolved.game); !problem.empty()) {
+        LogError("{}", problem);
+        return ExitFor(zdex::Outcome::Usage);
+    }
+    if (const auto problem = LabelProblem(resolved.label); !problem.empty()) {
+        LogError("{}", problem);
+        LogInfo("letters, numbers, spaces and . _ - + # ( ) / are allowed");
+        return ExitFor(zdex::Outcome::Usage);
+    }
+
+    // Before the upload, not after it.
+    const std::string hash = resolved.force ? std::string{} : DumpHash(resolved.path);
+    if (const auto already = PreviouslyPublished(hash); !already.empty()) {
+        FieldStrong("already published", already);
+        Field("note", "this exact dump went up from this machine before; --force sends it "
+                      "again");
+        return 0;
+    }
+
     // --- everything that can be checked without sending anything ---------------------
-    if (options.dry_run) {
-        const auto size = std::filesystem::file_size(options.path, ec);
+    if (resolved.dry_run) {
+        const auto size = std::filesystem::file_size(resolved.path, ec);
         FieldStrong("dry run", "nothing will be sent");
-        Field("file", options.path);
+        Field("file", resolved.path);
         Field("size", ec ? std::string("unknown") : Human(size));
-        Field("game", options.game);
-        Field("label", options.label);
-        if (!options.notes.empty()) Field("notes", options.notes);
+        Field("game", Collapse(resolved.game));
+        Field("label", Collapse(resolved.label));
+        if (!resolved.notes.empty()) Field("notes", resolved.notes);
         Field("server", config.base_url);
         Field("key", config.KeyHint());
         std::printf("\nIt would be accepted. Drop --dry-run to send it.\n");
@@ -294,7 +524,7 @@ int CommandPublish(const PublishOptions& options) {
     }
 
     // --- the one-time confirmation ---------------------------------------------------
-    if (!options.assume_yes && config.terms_accepted_for != config.KeyHint()) {
+    if (!resolved.assume_yes && config.terms_accepted_for != config.KeyHint()) {
         std::printf(
             "Publishing puts this dump on %s under your account. You confirm you made it\n"
             "yourself with Zircon, it contains reflection metadata only, and you are\n"
@@ -313,13 +543,13 @@ int CommandPublish(const PublishOptions& options) {
     zdex::Client client = MakeClient(config);
 
     zdex::UploadRequest request;
-    request.path  = options.path;
-    request.game  = options.game;
-    request.label = options.label;
-    request.notes = options.notes;
-    request.wait  = options.wait;
+    request.path  = resolved.path;
+    request.game  = resolved.game;
+    request.label = resolved.label;
+    request.notes = resolved.notes;
+    request.wait  = resolved.wait;
 
-    Progress bar(!options.json_output);
+    Progress bar(!resolved.json_output);
 
     zdex::UploadHooks hooks;
     hooks.progress = [&](zdex::UploadPhase phase, std::uint64_t done, std::uint64_t total,
@@ -348,7 +578,7 @@ int CommandPublish(const PublishOptions& options) {
     const zdex::UploadReport report = zdex::Upload(client, request, hooks);
     bar.Clear();
 
-    if (!options.json_output) {
+    if (!resolved.json_output) {
         if (report.compressed)
             Field("compressed", std::format("{} -> {} ({:.1f}x)", Human(report.stats.raw),
                                             Human(report.stats.compressed),
@@ -366,7 +596,7 @@ int CommandPublish(const PublishOptions& options) {
         return Fail(failure);
     }
 
-    if (options.json_output) {
+    if (resolved.json_output) {
         std::printf("{\"dump_id\": %lld, \"url\": \"%s\", \"status\": \"%s\", "
                     "\"duplicate\": %s}\n",
                     static_cast<long long>(report.dump_id), report.url.c_str(),
@@ -386,8 +616,68 @@ int CommandPublish(const PublishOptions& options) {
         }
     }
 
-    if (options.open_browser && !report.url.empty()) OpenInBrowser(report.url);
+    if (!report.url.empty()) RememberPublished(hash, report.url);
+
+    if (resolved.open_browser && !report.url.empty()) OpenInBrowser(report.url);
     return 0;
+}
+
+// Every dump in a directory, each under its own name.
+//
+// The last per-file manual step after a batch: `zircon batch` writes a dozen dumps and
+// publishing them meant a dozen commands with a dozen hand-typed game names.
+int CommandPublishAll(const PublishOptions& options) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(options.path, ec)) {
+        LogError("--all needs a directory: {} is not one", options.path);
+        return 1;
+    }
+
+    std::vector<std::string> dumps;
+    for (const auto& entry : std::filesystem::directory_iterator(options.path, ec)) {
+        if (!entry.is_regular_file()) continue;
+        const auto name = entry.path().filename().string();
+        const bool looks_like =
+            name.size() > 5 &&
+            (name.ends_with(".json") || name.ends_with(".json.gz") || name.ends_with(".zip"));
+        if (looks_like) dumps.push_back(entry.path().string());
+    }
+    std::sort(dumps.begin(), dumps.end());
+
+    if (dumps.empty()) {
+        LogError("no .json, .json.gz or .zip dumps in {}", options.path);
+        return 1;
+    }
+
+    FieldStrong("publishing", std::format("{} dump(s) from {}", dumps.size(), options.path));
+
+    int published = 0, failed = 0;
+    for (const auto& path : dumps) {
+        PublishOptions one = options;
+        one.path = path;
+        one.all  = false;
+        if (one.game.empty()) one.game = GameNameFor(path);
+
+        // Asked once for the whole run rather than once per dump.
+        one.assume_yes = true;
+
+        std::printf("\n");
+        FieldStrong("dump", std::filesystem::path(path).filename().string());
+        Field("game", one.game);
+
+        const int result = CommandPublish(one);
+        if (result != 0) {
+            ++failed;
+            LogError("{} failed with {}; carrying on",
+                     std::filesystem::path(path).filename().string(), result);
+        } else {
+            ++published;
+        }
+    }
+
+    std::printf("\n");
+    FieldStrong("done", std::format("{} sent, {} failed", published, failed));
+    return failed == 0 ? 0 : 4;
 }
 
 int CommandFetch(std::int64_t dump_id, std::string_view kind, std::string_view out_path) {

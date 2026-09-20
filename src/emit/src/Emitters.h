@@ -8,6 +8,7 @@
 namespace zircon::emit {
 
 EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options);
+EmitResult EmitCSharp(const ir::Dump& dump, const EmitOptions& options);
 EmitResult EmitUsmap(const ir::Dump& dump, const EmitOptions& options);
 EmitResult EmitIda(const ir::Dump& dump, const EmitOptions& options);
 EmitResult EmitGhidra(const ir::Dump& dump, const EmitOptions& options);

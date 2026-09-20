@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.7.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.8.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +137,7 @@ add_library(zircon_emit STATIC
   src/emit/src/Util.cpp
   src/emit/src/Registry.cpp
   src/emit/src/CppSdk.cpp
+  src/emit/src/CSharp.cpp
   src/emit/src/Usmap.cpp
   src/emit/src/Ida.cpp
   src/emit/src/Ghidra.cpp
@@ -173,6 +174,7 @@ set_target_properties(zircon_il2cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(zircon_zdex STATIC
   src/zdex/src/Gzip.cpp
+  src/zdex/src/Sha256.cpp
   src/zdex/src/Json.cpp
   src/zdex/src/Http.cpp
   src/zdex/src/Upload.cpp

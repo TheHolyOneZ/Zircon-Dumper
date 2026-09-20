@@ -132,11 +132,12 @@ versions that did not exist when the tool was written.
 
 The result is one JSON file containing the game's whole type system.
 
-### It turns that into eleven different things
+### It turns that into twelve different things
 
 | You want… | Use | What you get |
 |---|---|---|
-| To write a cheat/mod in C++ | `cpp_sdk` | Headers with every class, correct offsets, compile-time checks, and callable wrappers for every reflected function |
+| To write a cheat/mod in C++ | `cpp_sdk` | Headers with every class, correct offsets, compile-time checks, and callable wrappers for every reflected function (Unreal) |
+| To read a Unity game's code | `csharp` | A C# source tree: one folder per assembly, one file per type, offsets and RVAs in the margin |
 | To use UE4SS, FModel, or an asset tool | `usmap` | A `.usmap` mappings file |
 | To reverse the binary in IDA Pro | `ida` | A Python script that imports every struct into your database |
 | Same, but Ghidra | `ghidra` | The same, for Ghidra |
@@ -154,6 +155,7 @@ The result is one JSON file containing the game's whole type system.
 > zircon emit list
 FORMAT        NEEDS  DESCRIPTION
 cpp_sdk       objs   C++ SDK headers with static_assert offset checks
+csharp        objs   C# source tree: one folder per assembly, one file per type
 usmap         objs   UE4SS / FModel .usmap mappings
 ida           objs   IDA Pro Python script importing types
 ghidra        objs   Ghidra Python script importing types
@@ -189,6 +191,38 @@ actor.MovementMode;                // "MOVE_Falling", not 3
 Inherited properties need no qualifying, because `wrap` walks the super chain. Strings,
 maps and delegates are refused rather than written, same rule as everywhere else in the
 tool: their memory holds allocator state beside the value.
+
+`csharp` writes the tree a decompiler would leave behind — the thing you actually open
+when you want to know how a Unity game works:
+
+```
+Assembly-CSharp/
+    Game/Actors/Player.cs
+mscorlib/
+    System/Collections/Generic/List_AchievementMono_.cs
+```
+
+```csharp
+// Token: 0x02000161  Size: 0x38  Read from: both
+public class ActivationLinker : MonoBehaviour, ISenderRpc
+{
+    public List<LinkedActivatables> AllLinkedActivatables; // 0x18
+    public CaveRoom room;                                  // 0x20
+    public bool generationComplete;                        // 0x30
+
+    public void OnGenerationComplete(GameManagerCC manager){ } // RVA: 0x59F2D0
+    public ActivationLinker(){ }                               // RVA: 0x59F810
+}
+```
+
+Method bodies are empty, and every file says so at the top: a body is IL, and a dump holds
+reflection data. Everything else is real — names, base types, interfaces, field offsets,
+RVAs, enum values — so the tree is readable, greppable and diffable, which is what it is
+for. On a metadata-only dump the offsets are absent and the files say that instead of
+printing `0`.
+
+`cpp_sdk` is the Unreal half of the same idea, and each refuses the other's dumps rather
+than running a C# type through a C++ name mangler.
 
 `python_stubs` is the same type system as `.pyi` stubs, so an editor completes it:
 
@@ -514,6 +548,7 @@ obvious one.
 |---|---|
 | `zircon dump` | `dump.json` in the current folder, or wherever `-o` says |
 | `zircon emit cpp_sdk … -o out/` | `out\SDK\*.hpp`, one header per package, plus `out\SDK.hpp` that includes them all |
+| `zircon emit csharp … -o out/` | `out\<Assembly>\<Namespace>\Type.cs`, one file per top-level type |
 | `zircon emit usmap … -o out/` | `out\<GameName>-Win64-Shipping.usmap` |
 | `zircon emit ida … -o out/` | `out\zircon_ida.py` |
 | `zircon emit ghidra … -o out/` | `out\zircon_ghidra.py` |
@@ -772,6 +807,21 @@ That prints a URL. `--label` is how you'll tell two builds apart later, so it's 
 filling in; `--game` is guessed from the process the dump came from and only needs saying
 when the guess is wrong.
 
+`--label auto` takes it from the dump instead — the image size of the module the dump came
+from, which changes whenever the game is rebuilt and is the same across two runs of the same
+build. A dump read from metadata alone has no loaded image, so there it says so rather than
+making one up.
+
+A whole batch goes up in one command, each dump named from its own header:
+
+```
+zircon publish dumps\ --all --label auto
+```
+
+A dump already published from this machine is skipped before the upload starts, not after —
+Zdex refuses an identical dump anyway, and finding that out the other way costs the whole
+upload. `--force` sends it regardless.
+
 `login` takes an **API key**, not an account — get one from your Zdex profile. There's no
 browser flow and no OAuth. The key lives in `%APPDATA%\Zircon\config.json` and nowhere else:
 not in the dump, not in a log line, not in anything committed. `zircon logout` deletes it.
@@ -875,6 +925,30 @@ reason rather than guessing. `docs/IL2CPP.md` has the whole argument.
 zircon metadata <global-metadata.dat>      what Zircon worked out, and the evidence for it
 ```
 
+### Before you launch anything
+
+```
+zircon check "D:\Games\Thing\Thing.exe"
+```
+
+A live dump means starting the game and waiting for its runtime. When that cannot work the
+way you find out is a full launch and a timeout, once per title. `check` reads the install
+folder and the process list instead: which runtime it is, which store it came from, whether
+that store is running, whether the game is already up, and its Steam build number.
+
+For a Unity game the answer is better than yes or no, because it can be dumped from
+`global-metadata.dat` whether or not it ever launches:
+
+```
+runtime           Unity IL2CPP
+store             Steam, not running
+
+live dump         unlikely to work as it stands
+
+static dump       works either way, with the game never started
+try               zircon dump --metadata "...\global-metadata.dat" -o dump.json.gz
+```
+
 ### Dumping every game on the machine
 
 ```
@@ -887,9 +961,15 @@ known titles, and skips the crash reporters and web helpers Unreal ships beside 
 Mono-backend Unity games are listed and commented out: they have no `GameAssembly.dll`, so the
 IL2CPP path has nothing to talk to, and that is a correct no rather than a gap.
 
+The manifest is valid TOML, and carries Steam's own build number for each game where the
+install makes it available — which is a better build label than anything typed by hand,
+because it changes on exactly the event that matters.
+
 `batch` runs each one in turn. One failing does not stop the rest, and **a game whose runtime
 faults partway through falls back to its metadata**, so it still yields its type system
-instead of a hole in the batch.
+instead of a hole in the batch. Those are counted and listed separately rather than as
+successes, and the run exits 3: they carry the type system without offsets, RVAs or concrete
+generics.
 
 An output path ending `.json.gz` is written compressed. A Unity dump is around 600 MB of JSON
 and 20 of gzip, which is the difference between 2.5 GB and a hundred for four games.

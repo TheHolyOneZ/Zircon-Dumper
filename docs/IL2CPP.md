@@ -96,6 +96,18 @@ Measured on Cave Crawlers: 12,318 types both sides had, 36,244 the runtime had a
 could not contain (instantiations), 841 the file declared and the runtime never built. Each
 reading alone was missing a large piece of the other's answer.
 
+Those three numbers are one run, not a property of the game. The split moves with how much of
+the game had happened before the walk: the class cache grows as code runs, so a dump taken at
+the main menu leaves more types in the metadata-only column than one taken with
+`--wait-for-settle`, or one taken after loading a level. The metadata column is fixed -- the
+file does not change -- and the runtime column is whatever had been built by the time you
+looked.
+
+So two dual runs of the same build can report different splits and both be right. A number
+that dropped since last time usually means more of the game had run, not that something was
+lost. What does not move is the total type set, and any disagreement between the two sides
+lands in `header.conflicts` either way.
+
 ---
 
 ## Reading the metadata without a version table

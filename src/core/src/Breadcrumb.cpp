@@ -101,6 +101,12 @@ std::optional<std::string> ReadBreadcrumb(const std::filesystem::path& path) {
 
     const auto end = buffer.find('\0');
     if (end != std::string::npos) buffer.resize(end);
+
+    // A trimmed file ends in a newline and one left NUL-padded by a crash does not. Dropping
+    // it here means both read back the same, so nothing downstream has to know which it got.
+    while (!buffer.empty() && (buffer.back() == '\n' || buffer.back() == '\r'))
+        buffer.pop_back();
+
     if (buffer.empty()) return std::nullopt;
     return buffer;
 }
@@ -113,6 +119,18 @@ std::string_view BreadcrumbKey(std::string_view text) {
 std::string_view BreadcrumbPhase(std::string_view text) {
     const auto split = text.find('\n');
     return split == std::string_view::npos ? std::string_view{} : text.substr(split + 1);
+}
+
+void TrimBreadcrumbFile(const std::filesystem::path& path, std::string_view contents) {
+    auto text = contents;
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
+        text.remove_suffix(1);
+    if (text.empty()) return;
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.put('\n');
 }
 
 } // namespace zircon::core

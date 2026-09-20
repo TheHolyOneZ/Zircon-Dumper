@@ -7,6 +7,7 @@
 
 #include "zdex/Config.h"
 #include "zdex/Gzip.h"
+#include "zdex/Sha256.h"
 #include "zdex/Json.h"
 
 #include <cstdio>
@@ -67,6 +68,170 @@ std::string Repeat(std::string_view unit, std::size_t times) {
     out.reserve(unit.size() * times);
     for (std::size_t i = 0; i < times; ++i) out += unit;
     return out;
+}
+
+// ---------------------------------------------------------------------------------
+// Reading it back
+// ---------------------------------------------------------------------------------
+
+// Round trip through our own compressor. 0.7.0 shipped the writer without the reader and
+// four commands could not open what the batch runner wrote, so this is the test that would
+// have caught it.
+void RoundTrip(std::string_view label, const std::string& data) {
+    const std::string packed = zdex::GzipCompress(data);
+    CHECK(zdex::LooksGzipped(packed));
+
+    std::string error;
+    const std::string back = zdex::GzipDecompress(packed, error);
+    if (!error.empty()) {
+        std::fprintf(stderr, "      %.*s: %s\n", static_cast<int>(label.size()), label.data(),
+                     error.c_str());
+    }
+    CHECK(error.empty());
+    CHECK(back.size() == data.size());
+    CHECK(back == data);
+}
+
+void TestRoundTrip() {
+    RoundTrip("empty", "");
+    RoundTrip("one", "x");
+    RoundTrip("three", "abc");
+    RoundTrip("nomatch", "abcdefghijklmnopqrstuvwxyz0123456789");
+    RoundTrip("allsame", std::string(70000, 'A'));      // overlapping back-references
+    RoundTrip("repeated", Repeat("the quick brown fox ", 5000));
+
+    // Something shaped like what this actually carries.
+    std::string json = "{\"schema_version\": 3, \"packages\": [";
+    for (int i = 0; i < 2000; ++i)
+        json += "{\"name\": \"Assembly-CSharp\", \"path\": \"Game.Type" + std::to_string(i) +
+                ", Assembly-CSharp\"},";
+    json += "]}";
+    RoundTrip("dumpish", json);
+
+    // Every byte value, so nothing depends on the input being text.
+    std::string bytes;
+    for (int i = 0; i < 256; ++i) bytes.push_back(static_cast<char>(i));
+    RoundTrip("allbytes", Repeat(bytes, 40));
+}
+
+// A gzip file this compressor could never have produced. GzipCompress only emits fixed-Huffman
+// blocks; anything gzipped by Python, gzip(1) or 7-Zip uses dynamic ones, and a reader that
+// only handled what we write would fail on every file a user brings.
+void TestForeignGzip() {
+    const auto tools = OutDir() / "foreign";
+    std::error_code ec;
+    std::filesystem::create_directories(tools, ec);
+
+    // Built by hand rather than shelled out to, so the suite still needs nothing installed:
+    // a stored block, which is legal DEFLATE and which our own writer never emits either.
+    const std::string payload = "stored blocks are legal and we never write one";
+
+    std::string file;
+    file += '\x1f'; file += '\x8b'; file += '\x08'; file += '\x00';   // magic, deflate, no flags
+    file += std::string(6, '\x00');                                    // mtime, xfl, os
+
+    file += '\x01';                                                    // final, stored
+    const auto n = static_cast<std::uint16_t>(payload.size());
+    file += static_cast<char>(n & 0xFF);
+    file += static_cast<char>((n >> 8) & 0xFF);
+    file += static_cast<char>(~n & 0xFF);
+    file += static_cast<char>((~n >> 8) & 0xFF);
+    file += payload;
+
+    const std::uint32_t crc = zdex::Crc32(payload);
+    for (int i = 0; i < 4; ++i) file += static_cast<char>((crc >> (i * 8)) & 0xFF);
+    for (int i = 0; i < 4; ++i) file += static_cast<char>((n >> (i * 8)) & 0xFF);
+
+    std::string error;
+    const std::string back = zdex::GzipDecompress(file, error);
+    CHECK(error.empty());
+    CHECK(back == payload);
+}
+
+// Refusals. A file that inflates to something it says is wrong is not a file to parse.
+void TestGunzipRefusals() {
+    std::string error;
+
+    CHECK(zdex::GzipDecompress("not gzip at all", error).empty());
+    CHECK(!error.empty());
+    CHECK(!zdex::LooksGzipped("not gzip at all"));
+
+    // Truncated.
+    const std::string packed = zdex::GzipCompress(Repeat("abcdefgh", 4000));
+    CHECK(zdex::GzipDecompress(packed.substr(0, packed.size() / 2), error).empty());
+    CHECK(!error.empty());
+
+    // Corrupt payload, intact trailer: the CRC has to catch it.
+    std::string bent = packed;
+    bent[bent.size() / 2] = static_cast<char>(bent[bent.size() / 2] ^ 0xFF);
+    const std::string out = zdex::GzipDecompress(bent, error);
+    CHECK(!error.empty() || out.empty());
+
+    // A good file with a wrong length in its trailer.
+    std::string lied = packed;
+    lied[lied.size() - 1] = static_cast<char>(lied[lied.size() - 1] ^ 0x5A);
+    CHECK(zdex::GzipDecompress(lied, error).empty());
+    CHECK(!error.empty());
+}
+
+void TestGunzipFile() {
+    const auto raw = OutDir() / "gunzip-in.txt";
+    const auto gz  = OutDir() / "gunzip-in.txt.gz";
+    const auto out = OutDir() / "gunzip-out.txt";
+
+    const std::string data = Repeat("round and round it goes ", 3000);
+    Write(raw, data);
+
+    std::string error;
+    CHECK(zdex::GzipFile(raw.string(), gz.string(), error));
+    CHECK(error.empty());
+    CHECK(zdex::GunzipFile(gz.string(), out.string(), error));
+    CHECK(error.empty());
+
+    std::ifstream back(out, std::ios::binary);
+    const std::string got((std::istreambuf_iterator<char>(back)),
+                          std::istreambuf_iterator<char>());
+    CHECK(got == data);
+}
+
+// ---------------------------------------------------------------------------------
+// SHA-256
+// ---------------------------------------------------------------------------------
+
+// The published vectors, plus the lengths around the block boundary where padding goes
+// wrong: 55 bytes still fits the length field, 56 forces a second block, 64 is exact.
+void TestSha256() {
+    CHECK(zdex::Sha256Hex("") ==
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    CHECK(zdex::Sha256Hex("abc") ==
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    CHECK(zdex::Sha256Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
+          "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+    CHECK(zdex::Sha256Hex(std::string(55, 'a')) ==
+          "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
+    CHECK(zdex::Sha256Hex(std::string(56, 'a')) ==
+          "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a");
+    CHECK(zdex::Sha256Hex(std::string(64, 'a')) ==
+          "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
+
+    CHECK(zdex::Sha256Hex(Repeat("a", 1000000)) ==
+          "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+
+    // Every byte value, so nothing depends on the input being text.
+    std::string bytes;
+    for (int i = 0; i < 256; ++i) bytes.push_back(static_cast<char>(i));
+    CHECK(zdex::Sha256Hex(bytes) ==
+          "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880");
+
+    // A file and the same bytes in memory have to agree, or a skipped upload is skipped
+    // against the wrong number.
+    const auto path = OutDir() / "sha-input.bin";
+    const std::string data = Repeat("zircon ", 30000);
+    Write(path, data);
+    CHECK(zdex::Sha256File(path.string()) == zdex::Sha256Hex(data));
+
+    CHECK(zdex::Sha256File((OutDir() / "no-such-file").string()).empty());
 }
 
 void TestCrc32KnownVectors() {
@@ -343,6 +508,11 @@ int main() {
     TestAbortRemovesOutput();
     TestMissingInput();
     TestRatioIsWorthHaving();
+    TestRoundTrip();
+    TestForeignGzip();
+    TestGunzipRefusals();
+    TestGunzipFile();
+    TestSha256();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     std::printf("artefacts in %s\n", OutDir().string().c_str());

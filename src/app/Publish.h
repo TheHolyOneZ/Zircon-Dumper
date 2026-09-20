@@ -22,6 +22,14 @@ struct PublishOptions {
     // Check everything and send nothing. Answers "would this be accepted, and as what"
     // before spending minutes compressing several hundred megabytes.
     bool dry_run{false};
+
+    // Publish every dump in a directory instead of one file, each under the name its own
+    // header gives. The last per-file manual step after a batch.
+    bool all{false};
+
+    // Send a dump this machine has published before. Off by default: the server refuses an
+    // identical dump anyway, and finding that out costs the whole upload.
+    bool force{false};
 };
 
 // `login` only ever stores an API key. There is no account, no password and no browser
@@ -31,6 +39,9 @@ int CommandLogin(std::string_view key);
 int CommandLogout();
 
 int CommandPublish(const PublishOptions& options);
+
+// Every dump in a directory, each named from its own header.
+int CommandPublishAll(const PublishOptions& options);
 
 // Why Zdex won't take this dump, or empty when it will.
 //

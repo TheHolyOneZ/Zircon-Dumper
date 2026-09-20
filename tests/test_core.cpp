@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -1413,6 +1414,48 @@ void TestGlobalResolver() {
 // The crash breadcrumb. What matters is that the file on disk is readable while the writer
 // is still holding it open -- that is the whole case it exists for, since the writer is a
 // process that is about to die.
+// A crashed walk leaves the page NUL-padded, and nothing is alive to tidy it. The next run
+// is the first thing that can, so check it does -- and that it reads the same either way.
+void TestBreadcrumbTrim() {
+    const auto path = std::filesystem::temp_directory_path() / "zircon-crumb-trim.txt";
+
+    {
+        CrashBreadcrumb crumb;
+        CHECK(crumb.Open(path));
+        crumb.Note("Game.Enemy, Assembly-CSharp");
+        crumb.Append("phase fields");
+        // No Finish(): that is what a crash looks like from here.
+    }
+
+    CHECK(std::filesystem::file_size(path) == kBreadcrumbSize);
+
+    const auto before = ReadBreadcrumb(path);
+    CHECK(before.has_value());
+    CHECK(BreadcrumbKey(*before) == "Game.Enemy, Assembly-CSharp");
+
+    TrimBreadcrumbFile(path, *before);
+
+    // The padding is gone and the content is not.
+    const auto size = std::filesystem::file_size(path);
+    CHECK(size < kBreadcrumbSize);
+    CHECK(size == before->size() + 1);      // the text, plus one newline
+
+    std::ifstream in(path, std::ios::binary);
+    const std::string raw((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    CHECK(raw.find('\0') == std::string::npos);
+    CHECK(raw == "Game.Enemy, Assembly-CSharp\nphase fields\n");
+
+    // Reading a trimmed file has to give back what reading the padded one did.
+    const auto after = ReadBreadcrumb(path);
+    CHECK(after.has_value());
+    CHECK(BreadcrumbKey(*after) == BreadcrumbKey(*before));
+    CHECK(BreadcrumbPhase(*after) == BreadcrumbPhase(*before));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 void TestBreadcrumb() {
     const auto path = std::filesystem::temp_directory_path() /
                       "zircon_breadcrumb_test" / "walk.breadcrumb";
@@ -1491,6 +1534,7 @@ int main() {
     TestNameEntryDecoder();
     TestGlobalResolver();
     TestBreadcrumb();
+    TestBreadcrumbTrim();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

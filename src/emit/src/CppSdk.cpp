@@ -1138,6 +1138,17 @@ struct FFieldPath         {{ uint8 Opaque[0x{:X}]; }};
 EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
     EmitResult result;
 
+    // Everything below assumes Unreal: the U/A/F prefixes, the UObject root, the
+    // static_assert layout checks. Pointed at a Unity dump it ran anyway and produced
+    // headers full of things like `struct UList_AchievementMono___mscorlib;` -- a C#
+    // generic pushed through a C++ name mangler, with a UClass prefix on a type that was
+    // never a UClass. It did not compile and could not be read either.
+    if (dump.header.runtime == "il2cpp") {
+        result.error = "this is a Unity IL2CPP dump, and its types are C# rather than "
+                       "C++ UObjects; emit csharp writes the source tree for those";
+        return result;
+    }
+
     if (dump.header.partial && !options.allow_partial) {
         result.error = "this dump is partial (no live objects), so an SDK would be "
                        "incomplete; pass --allow-partial to override";

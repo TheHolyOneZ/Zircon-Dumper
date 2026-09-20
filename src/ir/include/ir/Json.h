@@ -52,6 +52,12 @@ JsonExpected<Dump> ReadJsonFile(std::string_view path);
 // reader to drift.
 JsonExpected<Header> ReadJsonHeaderFile(std::string_view path);
 
+// The same thing from bytes already in hand. Needed because a .json.gz has to be inflated
+// before any of this means anything, and inflating belongs in the layer that is allowed to
+// depend on something -- ir links nothing. Pass a prefix, not the whole dump: only the
+// header is read.
+JsonExpected<Header> ParseJsonHeader(std::string_view text);
+
 // Maximum container nesting the parser will accept. Hostile or corrupt input must fail
 // with an error instead of recursing until the stack runs out.
 inline constexpr int kMaxJsonDepth = 64;

@@ -82,6 +82,8 @@ public:
         return ok;
     }
 
+    void RescanModules() override { inner_->RescanModules(); }
+
     std::span<const ModuleInfo> Modules() const override { return inner_->Modules(); }
     std::span<const RegionInfo> Regions() const override { return inner_->Regions(); }
     Capabilities                Caps()    const override { return inner_->Caps(); }

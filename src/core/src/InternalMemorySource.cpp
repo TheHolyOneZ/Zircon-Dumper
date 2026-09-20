@@ -70,6 +70,8 @@ public:
         return copied == size;
     }
 
+    void RescanModules() override { RefreshModules(); }
+
     std::span<const ModuleInfo> Modules() const override { return modules_; }
     std::span<const RegionInfo> Regions() const override { return regions_; }
 
@@ -106,18 +108,36 @@ private:
     }
 
     void RefreshModules() {
-        HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,
-                                                     ::GetCurrentProcessId());
+        // Retried, because a snapshot of your own modules fails with ERROR_BAD_LENGTH while
+        // the loader is still working -- which is exactly where an injected payload lands
+        // when the game was started a second ago. Giving up here made a Unity game look like
+        // it had no modules at all, so the runtime was never found and the walk fell through
+        // to the Unreal path. Retrying is the documented answer.
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ::GetCurrentProcessId());
+            if (snapshot != INVALID_HANDLE_VALUE) {
+                if (attempt > 0)
+                    LogInfo("enumerated own modules on attempt {} ({}ms in)", attempt + 1,
+                            attempt * 50);
+                break;
+            }
+            if (::GetLastError() != ERROR_BAD_LENGTH) break;   // not the transient one
+            ::Sleep(50);
+        }
         if (snapshot == INVALID_HANDLE_VALUE) {
-            LogWarn("cannot enumerate own modules");
+            LogWarn("cannot enumerate own modules (error {})", ::GetLastError());
             return;
         }
 
+        // Filled to the side and swapped in at the end. This runs again while the game is
+        // loading, and half a module list is worse than the one already held.
+        std::vector<ModuleInfo> found;
         MODULEENTRY32W entry{};
         entry.dwSize = sizeof(entry);
         if (::Module32FirstW(snapshot, &entry)) {
             do {
-                modules_.push_back(ModuleInfo{
+                found.push_back(ModuleInfo{
                     Narrow(entry.szModule),
                     Narrow(entry.szExePath),
                     static_cast<Address>(reinterpret_cast<std::uint64_t>(entry.modBaseAddr)),
@@ -126,6 +146,8 @@ private:
             } while (::Module32NextW(snapshot, &entry));
         }
         ::CloseHandle(snapshot);
+
+        if (!found.empty()) modules_ = std::move(found);
     }
 
     void RefreshRegions() {

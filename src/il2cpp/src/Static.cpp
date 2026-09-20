@@ -52,6 +52,11 @@ public:
         dump.header.created_utc        = Utc();
         dump.header.engine.evidence    = layout_.evidence;
 
+        // A solved layout is not a guess. Four independent constraints have to agree before
+        // SolveMetadataLayout returns at all, and it refuses by name when they do not.
+        dump.header.engine.version     = std::format("IL2CPP metadata v{}", layout_.version);
+        dump.header.engine.confidence  = 1.0f;
+
         // Which reading produced this. A dual run overwrites it with both; on its own it is
         // one word, and without it a reader cannot tell a static dump from an old one that
         // predates there being more than one way to read a game.
@@ -342,6 +347,11 @@ ir::Dump MergeDumps(const ir::Dump& live, const ir::Dump& from_metadata, MergeSt
 
     for (const auto& line : from_metadata.header.engine.evidence)
         out.header.engine.evidence.push_back("metadata: " + line);
+
+    // Each half knows something the other does not: the metadata names its own version, the
+    // live runtime is what the confidence was measured against.
+    if (out.header.engine.version.empty())
+        out.header.engine.version = from_metadata.header.engine.version;
 
     const auto live_types = PathsIn(live);
     const auto meta_types = ByPath(from_metadata);

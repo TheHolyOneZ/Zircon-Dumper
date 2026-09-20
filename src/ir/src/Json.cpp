@@ -1199,6 +1199,15 @@ JsonExpected<Header> ReadJsonHeaderFile(std::string_view path) {
     file.read(prefix.data(), static_cast<std::streamsize>(kPrefix));
     prefix.resize(static_cast<std::size_t>(file.gcount()));
 
+    auto header = ParseJsonHeader(prefix);
+    if (!header) return JsonError{header.error().message + " in '" + std::string(path) + "'",
+                                  header.error().offset};
+    return header;
+}
+
+JsonExpected<Header> ParseJsonHeader(std::string_view text) {
+    const std::string prefix(text);
+
     // Find the top-level "header" key, tracking strings so the word inside an evidence
     // line can't be mistaken for it.
     std::size_t depth = 0, start = std::string::npos;
@@ -1231,7 +1240,7 @@ JsonExpected<Header> ReadJsonHeaderFile(std::string_view path) {
 
     if (start == std::string::npos)
         return JsonError{"no header in the first " + std::to_string(prefix.size()) +
-                         " bytes of '" + std::string(path) + "'", 0};
+                         " bytes", 0};
 
     // Brace-match the header object itself, again respecting strings.
     std::size_t nesting = 0, end = std::string::npos;
@@ -1251,7 +1260,7 @@ JsonExpected<Header> ReadJsonHeaderFile(std::string_view path) {
     }
 
     if (end == std::string::npos)
-        return JsonError{"the header in '" + std::string(path) + "' is cut off", start};
+        return JsonError{"the header is cut off", start};
 
     // Wrap it in a minimal document and hand it to the real parser. One reader.
     std::string document = "{\"schema_version\":";

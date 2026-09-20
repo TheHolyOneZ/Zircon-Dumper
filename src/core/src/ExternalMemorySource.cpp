@@ -121,6 +121,8 @@ public:
         return ok;
     }
 
+    void RescanModules() override { RefreshModules(); }
+
     std::span<const ModuleInfo> Modules() const override { return modules_; }
     std::span<const RegionInfo> Regions() const override { return regions_; }
 

@@ -61,4 +61,13 @@ std::optional<std::string> ReadBreadcrumb(const std::filesystem::path& path);
 std::string_view BreadcrumbKey(std::string_view text);
 std::string_view BreadcrumbPhase(std::string_view text);
 
+// Cuts the file down to the bytes that mean something.
+//
+// The file is a fixed 1024 bytes because it is written by memcpy into a mapped page, and a
+// walk that ends in a crash leaves the tail NUL-padded -- nothing is alive afterwards to
+// tidy it up. Anyone who opens it with `type` gets a screen of control characters after the
+// useful lines. Called once the contents have been read, which is the first moment a live
+// process is looking at it again.
+void TrimBreadcrumbFile(const std::filesystem::path& path, std::string_view contents);
+
 } // namespace zircon::core

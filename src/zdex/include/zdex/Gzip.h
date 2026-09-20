@@ -1,13 +1,13 @@
 #pragma once
 
-// A gzip writer, because Zdex takes a 300 MB dump far better as 20 MB and nothing in this
-// project had compression in it. The one zip we already write (ReClass) stores its entries
-// uncompressed and gets away with it; an upload cannot.
+// Gzip, both ways. Zdex takes a 300 MB dump far better as 20 MB, and once dumps are written
+// compressed every command that reads one has to be able to open it -- 0.7.0 shipped the
+// writer without the reader and four commands could not read what the batch runner wrote.
 //
-// Written rather than vendored. zlib would be a third dependency for one function, and the
-// correctness risk of writing DEFLATE is answerable: every unit test here decompresses the
-// output with Python's zlib, which is an entirely separate implementation, and compares it
-// to the input byte for byte.
+// Written rather than vendored. zlib would be a third dependency, and the correctness risk is
+// answerable both ways: the writer's tests decompress with Python's zlib, and the reader's
+// tests inflate what Python's gzip produced, including the dynamic-Huffman blocks this
+// compressor never emits.
 
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +36,20 @@ std::string GzipCompress(std::string_view input, GzipStats* stats = nullptr);
 bool GzipFile(std::string_view in_path, std::string_view out_path, std::string& error,
               GzipStats* stats = nullptr,
               const std::function<bool(std::uint64_t)>& progress = {});
+
+// The two-byte magic. Cheap enough to call on anything before deciding how to read it.
+bool LooksGzipped(std::string_view data);
+
+// Inflates a complete gzip member. Empty with `error` set when the input is not gzip, is
+// truncated, or fails its own CRC32 -- a dump that inflates to something the file itself
+// says is wrong is not a dump worth parsing.
+//
+// Handles all three DEFLATE block types, not only the fixed-Huffman ones GzipCompress emits:
+// a file gzipped by anything else arrives here too.
+std::string GzipDecompress(std::string_view input, std::string& error);
+
+// Whole file in, whole file out. Same refusals.
+bool GunzipFile(std::string_view in_path, std::string_view out_path, std::string& error);
 
 // Exposed for the tests. CRC32 as gzip and zip both define it.
 std::uint32_t Crc32(std::string_view data, std::uint32_t seed = 0);

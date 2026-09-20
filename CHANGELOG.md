@@ -2,6 +2,139 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.8.0 — 2026-09-20
+
+Everything here came out of a second outside test run on 0.7.0, plus the one feature that run
+did not ask for.
+
+### A C# source tree
+
+`zircon emit csharp` writes what a decompiler leaves behind: one folder per assembly, one
+file per top-level type, namespaces as directories, nested types inside their outer type's
+file where C# puts them.
+
+```
+Assembly-CSharp/
+    Game/Actors/Player.cs
+mscorlib/
+    System/Collections/Generic/List_AchievementMono_.cs
+```
+
+Real syntax, not a listing: `namespace`, `class` / `struct` / `interface` / `enum`, base
+types and interfaces, generic parameters spelled `<T>` rather than `` `1 ``, constructors
+named after their type instead of `.ctor`, `System.Int32` written `int`. Field offsets and
+method RVAs ride along as trailing comments, so the thing you would have gone to the dump
+for is in the file you are already reading.
+
+Method bodies are empty, and every file says so at the top. A body is IL and this tool reads
+reflection data, so the choice was an empty body or an invented one.
+
+Measured on Cave Crawlers: 43,772 files across 81 assemblies.
+
+**`emit cpp_sdk` now refuses a Unity dump.** Pointed at one it used to run anyway and produce
+headers full of `struct UList_AchievementMono___mscorlib` — a C# generic through a C++ name
+mangler, wearing a `U` prefix on a type that was never a `UClass`. `emit csharp` refuses an
+Unreal dump for the same reason in the other direction.
+
+### Bugs from the test run
+
+**Compressed dumps could not be read back.** 0.7.0 wrote `.json.gz` and could not open one,
+so `validate`, `xref`, `diff` and `emit` all failed on what the batch runner had just
+written. Zircon now inflates gzip itself — a full DEFLATE decoder, stored, fixed and dynamic
+blocks, with the trailer's CRC32 and length checked — so files from `gzip`, Python or 7-Zip
+open too, and not only the ones it wrote.
+
+**A payload that gave up said nothing.** The status file was written on success only, so
+`--wait` heard nothing from a run that failed in the first second and sat out the full 900s
+timeout before falling back. Every exit now reports. Headless runs also stopped waiting for
+an END keypress that no one was there to press.
+
+**A Unity game was reported as a failed Unreal one.** Injecting a second into a cold start,
+the payload could not enumerate the process's own modules, so `GameAssembly.dll` was not
+there to find and detection fell through to the Unreal path. Three things were wrong:
+enumerating your own modules fails transiently with `ERROR_BAD_LENGTH` while the loader is
+working and the code gave up on the first failure; the module list was cached from open time
+with no way to refresh it; and the runtime question was asked before the runtime had loaded.
+All three are fixed, and when `global-metadata.dat` is on disk beside the game a missing
+runtime now means *not yet* rather than *no*.
+
+**A degraded batch reported success.** A game whose live walk failed and fell back to its
+metadata was counted as dumped and the run exited 0. Those dumps have the type system but no
+offsets, RVAs or concrete generics. They are now counted and listed separately, and the run
+exits 3.
+
+**`--dry-run` approved labels the server rejects.** It checked everything except the rules
+the upload actually applies. Both the game name and the build label are now checked before
+anything is sent, and the refusal names the offending character rather than listing what is
+allowed. (The character in question was a comma; parentheses were always fine.)
+
+**Interface, abstract and generic flags were noise.** The IL2CPP entry points that answer
+these return `bool`, which on x64 only commits the low byte of the register — called through
+an `int` signature they read as true whenever the leftover bits happened to be non-zero.
+`UnityEngine.Vector3` came out of the walk marked interface *and* abstract *and* value type
+at once, and every compiler-generated closure class was an interface. Nothing downstream
+could have caught it, because each flag is legal on its own. The C# emitter also sanity-
+checks the flag against the record, so dumps taken before this fix still render correctly.
+
+### Less time spent finding things out the slow way
+
+**`zircon check <game.exe>`** answers whether a game can be dumped without starting it.
+Which runtime it is, which store it came from, whether that store is running, whether the
+game already is, and its Steam build number. A live dump means launching the game and
+waiting for its runtime, and when that cannot work the way you used to find out was a full
+launch and a timeout — three of twelve titles in one test run went that way. A Unity game
+gets the better answer: it can be dumped from `global-metadata.dat` whether or not it will
+ever launch, and `check` prints the command.
+
+**`publish <dir> --all`** publishes every dump in a directory, taking each game's name from
+its own header. The last per-file manual step after a batch.
+
+**A dump already published from this machine is skipped.** Zdex keys a dump on the SHA-256 of
+its uncompressed JSON and refuses a repeat, but only at the end, after the whole file has gone
+up. Zircon now works out the same hash before sending and skips, so re-running a batch costs
+nothing for the dumps that have not changed. `--force` sends anyway. (This also meant writing
+SHA-256, which is checked against the published test vectors.)
+
+**`--label auto`** takes the build label from the dump instead of from whoever is typing.
+Labels are what a diff matches on, and by hand they end up as `v1`, `test2` and `final`. The
+image size of the module the dump came from changes whenever the game is rebuilt and is
+identical across two runs of the same build. A dump read from metadata alone has no loaded
+image, so there it refuses rather than inventing one. `scan-games` also writes Steam's own
+build number into the manifest, where the install folder makes it available.
+
+**`dump --launch <exe>`** starts an Unreal game and dumps what comes up. Unity got launch
+automation in 0.7.0 and Unreal did not, so a UE game dumped a minute after launch gave "no
+object array found in 97 writable region(s)" — GObjects is built during engine init, not at
+process start.
+
+What it waits *on* matters, and the obvious signal is wrong: scoring the process as Unreal
+only says the engine is mapped, which is true from the first instant. So it waits by trying,
+every three seconds, to derive the reflection layout, and goes ahead on the first attempt
+that works. It follows a launcher handoff too — the exe you start is often a wrapper that
+exits once the real game is up.
+
+**`publish` reads a compressed dump's header.** The runtime gate parsed the first megabyte of
+the file looking for the header, which on a `.json.gz` is a megabyte of deflate, and a header
+it could not read was treated as nothing to object to. So the gate quietly stopped applying
+the moment dumps started being written compressed.
+
+### Smaller things
+
+- The manifest `scan-games` writes is valid TOML. It quoted Windows paths with `"`, which
+  made `\P` in `C:\Program Files` an invalid escape in 48 of 120 values — Zircon's own
+  reader was loose enough not to mind and nothing else would parse the file. Paths are
+  literal strings now, and both spellings still read.
+- `validate` prints a confidence on Unity dumps. It printed `engine (0%)` on a healthy one
+  while `fingerprint` said 98%, which read like a failed detection.
+- Log filenames use local time. They were UTC while the file's own mtime and the console
+  output were local, so finding the log for a run meant timezone arithmetic.
+- A crash breadcrumb is trimmed once it has been read. It is a fixed 1024 bytes because it is
+  written by memcpy into a mapped page, and nothing is alive after a crash to tidy the
+  padding, so opening one with `type` gave a screen of control characters.
+- `docs/IL2CPP.md` says that the dual split moves with how the dump was taken. The same game
+  reports different numbers at the main menu and after `--wait-for-settle`, and both are
+  right.
+
 ## 0.7.0 — 2026-09-19
 
 ### Hybrid mode: the metadata and the runtime, together
