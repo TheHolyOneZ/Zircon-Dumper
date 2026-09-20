@@ -200,6 +200,45 @@ Some things are excluded on purpose and a PR adding them will be declined:
 
 If you want to add an output format, you may not need to touch this repo at all —
 `docs/PLUGINS.md` covers the C ABI and the vendored Lua host.
+---
+
+## AI assistance
+
+**How this was written.** The README, everything in `docs/`, and the comments throughout
+`src/` were written by Claude Opus 5.0. I used it for implementation help and for bug fixes
+as well. The architecture, the layering rule, [the CMake build and the CLI surface — replace
+or delete], the testing and the debugging are mine.
+
+I am saying this because it is visible if you look. The comment density in this repository is
+several times what it is in anything else I have published, and anyone comparing them would
+work it out. Better from me than inferred.
+
+**What it does not mean.** It does not mean the output was taken on trust. `docs/UE-Test.md`
+records seventeen targets, which games they were, what level each one reached, and the one
+that failed. `docs/ENGINEERING-LOG.md` has eight derivations that were wrong and how each was
+caught. None of that came out of a model — those are runs against games I own, and the bugs
+in them are ones I hit and fixed. The rule in `## Style` above, *say what was measured, not
+what should be true*, is the rule this project is actually built on, and it does not change
+depending on who typed the line.
+
+The cache bug in 0.4.0 is the example worth knowing. It passed every one of the six
+verification levels, because all three providers sat behind the same read cache and agreed
+with each other perfectly while all being wrong. It only reproduces through a sequence —
+attach, browse, leave the window open, change level, then dump. No amount of generated code
+or generated prose finds that. Somebody has to sit in front of the game.
+
+**If you contribute.** Use whatever tools you like; I do. Two conditions:
+
+1. **Say so in the PR.** One line is enough. It tells me what to read closely, and reviewing
+   is the scarce thing here.
+2. **The rules in `## Tests` and `## Changing a derivation` do not bend.** A generated test
+   still has to bite — revert the fix and watch it fail. A generated derivation still needs a
+   positive distinguishing property, an independent anchor, and an A/B against real games with
+   the targets named. Output you have not verified is not a contribution; it is work moved
+   onto me.
+
+A patch you understand and can defend is welcome whoever helped write it. A patch you cannot
+explain is not, and that has always been the rule.
 
 ---
 
