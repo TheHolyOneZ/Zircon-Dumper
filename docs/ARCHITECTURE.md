@@ -10,26 +10,33 @@ How the code is laid out and why. For what the tool does, see the README.
                  +---------- emit/  +  diff/ -----------------+
                                 \      /
                                   ir/                <- pure data, links nothing
-                                 ^    ^
-                        engine/       il2cpp/        <- two runtimes, side by side
-                                 ^    ^
+                              ^   ^   ^
+                    engine/    il2cpp/   mono/       <- three runtimes, side by side
+                              ^   ^   ^
                                 core/                <- memory, PE, patterns
 ```
 
-Arrows point one way. `core/` knows nothing about any engine. `engine/` and `il2cpp/` know
-nothing about output formats, and nothing about each other. `ir/` knows nothing about
-anything. `emit/` and `diff/` see the IR and never touch a process.
+Arrows point one way. `core/` knows nothing about any engine. `engine/`, `il2cpp/` and
+`mono/` know nothing about output formats, and nothing about each other. `ir/` knows nothing
+about anything. `emit/` and `diff/` see the IR and never touch a process.
 
-`il2cpp/` sits *beside* `engine/` rather than under it, because a Unity game and an Unreal
-game have nothing in common until they reach the IR. Sharing the IR is what makes a second
-backend worth having at all: every emitter, the linter, the diff and the browser work on a
-Unity dump the day the walk starts filling one in, with no changes.
+The three backends sit *beside* each other rather than under a shared base, because an Unreal
+game and either kind of Unity game have nothing in common until they reach the IR. Sharing the
+IR is what makes a second and third backend worth having at all: every emitter, the linter, the
+diff and the browser work on a new kind of dump the day the walk starts filling one in, with no
+changes. Nothing in `emit/` was touched to make it render Mono.
 
-The one asymmetry: `engine/` reads memory and never touches the target, while `il2cpp/` must
-*call* into it — `il2cpp_field_get_offset` is a function, and reading memory will not make it
-run. So the Unity path injects where the Unreal path never has to. `il2cpp/Bridge.h` is an
-interface rather than a direct set of calls for that reason: it is the seam a minidump reader
-and an external no-inject reader slot into later.
+The one asymmetry: `engine/` reads memory and never touches the target, while both Unity
+backends must *call* into it. `il2cpp_field_get_offset` and `mono_field_get_offset` are
+functions, and reading memory will not make them run. So the Unity paths inject where the
+Unreal path never has to. Each has a `Bridge.h` that is an interface rather than a direct set
+of calls, which is the seam a minidump reader and an external no-inject reader slot into later.
+
+Both Unity backends also have a second, file-reading half that needs no process at all —
+`il2cpp/Metadata.cpp` for `global-metadata.dat`, `mono/Assembly.cpp` for the game's managed
+assemblies — and a merge that joins the two readings on the assembly-qualified path. Those
+halves live in the same module as their runtime rather than in `core/`, because what they parse
+is specific to the backend even though neither needs a process.
 
 This is enforced by the CMake targets rather than by convention: `zircon_ir` links
 nothing at all, and `zircon_emit` and `zircon_diff` link only `zircon_ir`. Violating the

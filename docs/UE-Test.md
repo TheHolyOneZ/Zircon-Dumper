@@ -1,7 +1,7 @@
 # UE version coverage
 
-This file is about Unreal targets. The Unity IL2CPP backend keeps its coverage, and the
-reasoning behind it, in `docs/IL2CPP.md`.
+This file is about Unreal targets. The Unity backends keep their coverage, and the reasoning
+behind it, in `docs/IL2CPP.md` and `docs/MONO.md`.
 
 What Zircon has actually been run against, what it has not, and what is missing entirely.
 

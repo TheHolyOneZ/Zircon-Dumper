@@ -26,6 +26,11 @@
 #include "il2cpp/Runtime.h"
 #include "il2cpp/Static.h"
 #include "il2cpp/Walker.h"
+#include "mono/Assembly.h"
+#include "mono/Bridge.h"
+#include "mono/Runtime.h"
+#include "mono/Static.h"
+#include "mono/Walker.h"
 #include "ir/Json.h"
 #include "zdex/Gzip.h"
 
@@ -90,6 +95,8 @@ constexpr const char* kDefaultEmitters[] = {"cpp_sdk", "usmap", "json"};
 // one that was missing: someone who injected into a Unity game wants the source tree without
 // having to run a second command for it.
 constexpr const char* kIl2CppEmitters[] = {"csharp", "json"};
+
+constexpr const char* kMonoEmitters[] = {"csharp", "json"};
 
 void WriteDump(const ir::Dump& dump, const std::filesystem::path& out,
                std::span<const char* const> emitters) {
@@ -536,6 +543,115 @@ void SettleModules(core::IMemorySource& memory, int seconds) {
                   seconds);
 }
 
+bool RunMonoDump(core::IMemorySource& memory, const std::filesystem::path& out) {
+    auto runtime = mono::FindRuntime(memory);
+
+    const auto* exe = memory.MainModule();
+    const auto managed = exe ? mono::ManagedFolderBeside(exe->path) : std::filesystem::path{};
+
+    if (!runtime && !managed.empty()) {
+        core::LogInfo("a Managed folder is on disk, so this is a Mono game whose runtime has "
+                      "not loaded yet; waiting");
+        for (int waited = 0; waited < 300 && !runtime; ++waited) {
+            ::Sleep(100);
+            memory.RescanModules();
+            runtime = mono::FindRuntime(memory);
+        }
+    }
+    if (!runtime) return false;
+
+    core::LogInfo("Unity Mono: {} at {:#x}", runtime->module_name,
+                  core::Raw(runtime->module_base));
+    for (const auto& line : runtime->evidence) core::LogInfo("  - {}", line);
+
+    if (!runtime->api.Complete()) {
+        core::LogError("this build does not export everything the walk needs");
+        for (const auto& name : runtime->api.missing) core::LogError("  missing {}", name);
+        ReportStatus("failed", "this build has stripped Mono exports the walk needs");
+        return true;
+    }
+
+    auto bridge = mono::MakeInProcessBridge(*runtime, memory);
+    if (!bridge) {
+        core::LogError("{}", bridge.error().message);
+        ReportStatus("failed", bridge.error().message);
+        return true;
+    }
+
+    const auto crumb_path = out / "logs" /
+                            (SafeStem(exe ? exe->name : std::string{"mono"}) + ".breadcrumb");
+    core::CrashBreadcrumb crumb;
+    crumb.Open(crumb_path);
+
+    g_fault_crumb = &crumb;
+    g_fault_base  = core::Raw(runtime->module_base);
+    g_fault_size  = runtime->module_size;
+    g_walk_thread = ::GetCurrentThreadId();
+    g_fault_seen  = 0;
+    g_fault_token = ::AddVectoredExceptionHandler(1, FaultWatch);
+
+    core::LogInfo("walking the Mono domain (assemblies, images, types, members)");
+    mono::WalkOptions options;
+    options.skip = ReadSkipList(out.parent_path() / kSkipFile);
+    if (crumb.IsOpen())
+        options.breadcrumb = [&crumb](std::string_view what) { crumb.Note(what); };
+
+    mono::WalkStats stats;
+    ir::Dump dump = mono::Walk(*bridge.value(), options, stats);
+
+    if (g_fault_token) ::RemoveVectoredExceptionHandler(g_fault_token);
+    g_fault_crumb = nullptr;
+    g_walk_thread = 0;
+    crumb.Finish();
+
+    dump.header.tool_version   = ZIRCON_VERSION;
+    dump.header.source.kind    = "internal";
+    dump.header.source.process = exe ? exe->name : "";
+    dump.header.engine.confidence = runtime->confidence;
+
+    core::LogInfo("dump: {} assemblies, {} classes, {} structs, {} enums, {} fields, "
+                  "{} methods, {} properties",
+                  stats.images, dump.TotalClasses(), dump.TotalStructs(), dump.TotalEnums(),
+                  stats.fields, stats.methods, stats.accessors);
+
+    // Enum values and IL RVAs are only in the assemblies, so dual is the mode that answers
+    // everything. Taken automatically when the folder is right there.
+    const bool dual = g_handoff.mode == "dual" || g_handoff.mode.empty();
+    if (dual && !managed.empty()) {
+        core::LogInfo("reading the managed assemblies from {}", managed.string());
+        mono::AssemblySetStats set_stats;
+        const auto assemblies = mono::ReadManagedFolder(managed.string(), set_stats);
+        if (!assemblies.empty()) {
+            core::LogInfo("{} of {} assemblies read", set_stats.read, set_stats.files);
+            mono::StaticStats static_stats;
+            const auto from_metadata = mono::BuildStaticDump(assemblies, static_stats);
+
+            mono::MergeStats merge;
+            dump = mono::MergeDumps(dump, from_metadata, merge);
+            dump.header.tool_version = ZIRCON_VERSION;
+            core::LogInfo("merged: {} types both sides had, {} live only, {} the file declared "
+                          "and the runtime never built, {} enums filled in, {} IL bodies placed",
+                          merge.matched, merge.live_only, merge.static_only,
+                          merge.enums_filled, merge.il_filled);
+        } else {
+            core::LogWarn("no managed assemblies could be read, so enum values stay absent");
+        }
+    } else if (managed.empty()) {
+        core::LogWarn("no Managed folder was found beside the game, so enum values and IL "
+                      "RVAs are absent from this dump");
+    }
+
+    const auto& requested_out = g_handoff.out;
+    if (requested_out.empty()) {
+        WriteDump(dump, out, kMonoEmitters);
+    } else {
+        WriteJsonMaybeGzipped(dump, requested_out);
+    }
+
+    ReportStatus("ok", requested_out.empty() ? out.string() : requested_out.string());
+    return true;
+}
+
 // False when this isn't a Unity game: carry on into the Unreal path.
 bool RunIl2CppDump(core::IMemorySource& memory, const std::filesystem::path& out) {
     auto runtime = il2cpp::FindRuntime(memory);
@@ -829,6 +945,11 @@ DWORD WINAPI PayloadThread(LPVOID) {
             // RunIl2CppDump has already reported its own outcome, good or bad.
             FinishPayload({}, {});
         }
+
+        if (RunMonoDump(*memory, out)) {
+            core::LogInfo("output directory: {}", out.string());
+            FinishPayload({}, {});
+        }
     }
 
     // Confirm we are inside something Unreal-shaped, so a mis-injection is obvious now
@@ -847,8 +968,9 @@ DWORD WINAPI PayloadThread(LPVOID) {
     auto reflection = engine::Reflect(*memory);
     if (!reflection.Valid()) {
         core::LogError("could not derive the reflection layout; nothing to do");
-        FinishPayload("failed", "could not derive the reflection layout: this is neither a "
-                                "Unity IL2CPP game nor an Unreal one the walk could read");
+        FinishPayload("failed", "could not derive the reflection layout: this is not a Unity "
+                                "game on either backend, nor an Unreal one the walk could "
+                                "read");
     }
 
     const auto out = OutputDirectory();

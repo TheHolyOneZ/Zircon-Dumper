@@ -200,32 +200,37 @@ Some things are excluded on purpose and a PR adding them will be declined:
 
 If you want to add an output format, you may not need to touch this repo at all —
 `docs/PLUGINS.md` covers the C ABI and the vendored Lua host.
+
 ---
 
 ## AI assistance
 
-**How this was written.** The README, everything in `docs/`, and the comments throughout
-`src/` were written by Claude Opus 5.0. I used it for implementation help and for bug fixes
-as well. The architecture, the layering rule, [the CMake build and the CLI surface — replace
-or delete], the testing and the debugging are mine.
+**How this was written.** The README, everything in `docs/`, and the comments throughout `src/`
+were written with AI assistance. I used it for implementation help and for bug fixes as well.
+The architecture, the layering rule, the CMake build and the CLI surface, the testing and the
+debugging are mine.
 
 I am saying this because it is visible if you look. The comment density in this repository is
 several times what it is in anything else I have published, and anyone comparing them would
 work it out. Better from me than inferred.
 
 **What it does not mean.** It does not mean the output was taken on trust. `docs/UE-Test.md`
-records seventeen targets, which games they were, what level each one reached, and the one
-that failed. `docs/ENGINEERING-LOG.md` has eight derivations that were wrong and how each was
-caught. None of that came out of a model — those are runs against games I own, and the bugs
-in them are ones I hit and fixed. The rule in `## Style` above, *say what was measured, not
-what should be true*, is the rule this project is actually built on, and it does not change
+records seventeen targets, which games they were, what level each one reached, and the one that
+failed. `docs/ENGINEERING-LOG.md` has eight derivations that were wrong and how each was
+caught. None of that came out of a model — those are runs against games I own, and the bugs in
+them are ones I hit and fixed. The rule in `## Style` above, *say what was measured, not what
+should be true*, is the rule this project is actually built on, and it does not change
 depending on who typed the line.
 
 The cache bug in 0.4.0 is the example worth knowing. It passed every one of the six
-verification levels, because all three providers sat behind the same read cache and agreed
-with each other perfectly while all being wrong. It only reproduces through a sequence —
-attach, browse, leave the window open, change level, then dump. No amount of generated code
-or generated prose finds that. Somebody has to sit in front of the game.
+verification levels, because all three providers sat behind the same read cache and agreed with
+each other perfectly while all being wrong. It only reproduces through a sequence — attach,
+browse, leave the window open, change level, then dump. No amount of generated code or
+generated prose finds that. Somebody has to sit in front of the game.
+
+The three Mono bugs in 0.9.0 are the same lesson on a different backend. Every one of them was
+a C function called through a prototype that did not match it, every one killed a real game,
+and not one of them could have been reached from a fixture — see `docs/MONO.md`.
 
 **If you contribute.** Use whatever tools you like; I do. Two conditions:
 

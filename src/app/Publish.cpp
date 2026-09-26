@@ -245,7 +245,8 @@ int CommandLogout() {
 }
 
 std::string PublishRefusal(std::string_view runtime) {
-    if (runtime.empty() || runtime == "unreal" || runtime == "il2cpp") return {};
+    if (runtime.empty() || runtime == "unreal" || runtime == "il2cpp" || runtime == "mono")
+        return {};
     return std::format("this dump reports its runtime as '{}', which Zdex does not index",
                        runtime);
 }
@@ -447,6 +448,12 @@ std::string AutoLabel(std::string_view path) {
     const auto header = HeaderOf(path);
     if (!header || header->source.image_size == 0) return {};
 
+    // Not on Mono. The image measured there is the shared Mono runtime, the same size for
+    // every game built on that Unity version, so it would label two different games
+    // identically. What does identify a Mono build is each assembly's MVID, and that lives
+    // per package rather than in the header.
+    if (header->runtime == "mono") return {};
+
     std::string module = header->source.main_module;
     if (module.size() > 4 && module.compare(module.size() - 4, 4, ".dll") == 0)
         module.resize(module.size() - 4);
@@ -477,8 +484,10 @@ int CommandPublish(const PublishOptions& options) {
         resolved.label = AutoLabel(resolved.path);
         if (resolved.label.empty()) {
             LogError("--label auto needs something in the dump that identifies the build, "
-                     "and this one has no loaded image size to go on");
-            LogInfo("a dump read from metadata alone never has one; pass a label");
+                     "and this one has nothing that identifies it on its own");
+            LogInfo("a dump read from metadata alone has no loaded image, and a Mono dump has "
+                    "one that measures the shared runtime rather than the game. Pass a label, "
+                    "or take one from an assembly's mvid in the dump");
             return ExitFor(zdex::Outcome::Usage);
         }
         Field("label", std::format("{} (from the dump)", resolved.label));

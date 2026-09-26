@@ -15,7 +15,7 @@
 
 namespace zircon::ir {
 
-inline constexpr int kSchemaVersion = 3;
+inline constexpr int kSchemaVersion = 4;
 
 // ---------------------------------------------------------------------------------
 // Types
@@ -182,6 +182,12 @@ struct Function {
     // Metadata token. What disassembler scripts and C# decompilers key on. 0 when absent.
     std::uint32_t token{0};
 
+    // (4) Where the IL body sits in the assembly, as an RVA. Mono JITs a method the first
+    // time it is called, so there is no stable native address to record the way there is for
+    // IL2CPP -- the IL is the thing that does not move. 0 when the method has no body
+    // (abstract, or a P/Invoke) or when the dump did not read one.
+    std::uint32_t il_rva{0};
+
     // More than one method lives at native_rva. Unreferenced methods get a shared stub and
     // the linker folds identical bodies, so "this address is this method" is sometimes
     // false. Counted from the finished dump, not assumed.
@@ -307,6 +313,13 @@ struct Struct {
 
 struct Package {
     std::string name;              // "/Script/Engine"
+
+    // (4) Mono only. The assembly's own version, and its Module Version ID, which the CLI
+    // writes fresh on every build -- so the MVID is an exact build fingerprint and makes a
+    // better label than anything typed by hand. Empty on Unreal and IL2CPP dumps.
+    std::string assembly_version;
+    std::string mvid;
+
     std::vector<Struct> classes;
     std::vector<Struct> structs;
     std::vector<Enum>   enums;

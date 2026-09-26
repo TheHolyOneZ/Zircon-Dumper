@@ -699,7 +699,15 @@ EmitResult EmitCSharp(const ir::Dump& dump, const EmitOptions& options) {
         dump.header.tool_version.empty() ? "?" : dump.header.tool_version,
         dump.header.runtime);
 
-    if (static_only) {
+    if (static_only && dump.header.runtime == "mono") {
+        banner +=
+            "//\n"
+            "// Read from the game's own managed assemblies with the game not running. Names,\n"
+            "// namespaces, tokens, base types, interfaces, enum values and IL RVAs are exact:\n"
+            "// all of it is ECMA-335 metadata. Field offsets are absent, because the CLI does\n"
+            "// not store them -- the runtime lays a type out the first time it is used. Dump\n"
+            "// the game live, or with --mode dual, for offsets.\n";
+    } else if (static_only) {
         banner +=
             "//\n"
             "// Read from global-metadata.dat with the game not running. Names, namespaces and\n"

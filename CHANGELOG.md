@@ -2,6 +2,103 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.9.0 — 2026-09-26
+
+Unity has two scripting backends. Zircon supported one of them.
+
+### Mono
+
+`scan-games` found nineteen Mono games on this machine and commented every one of them out,
+because there was no `GameAssembly.dll` for the IL2CPP path to talk to. That was a correct no
+and a large gap: Mono is what Unity shipped for years and what a great many games still use.
+
+Mono is dumped the same way IL2CPP is, and for the same reason — **no version tables.**
+`mono-2.0-bdwgc.dll` exports the Mono embedding API by name, 1,202 entry points on the build
+measured here, so the runtime gets asked rather than reverse engineered. 34 required entry
+points and 35 optional ones, all resolved by name.
+
+The other half is better than IL2CPP's. A Mono game ships its code as real .NET
+assemblies in `<Game>_Data/Managed`, so the static path is not a constraint-solving problem at
+all — it is ECMA-335, a published standard that does not move. `zircon dump --managed <Managed>`
+reads them with the game never started.
+
+The two halves know different things, and neither is complete:
+
+- Only the runtime knows field offsets. The CLI does not store them; a type is laid out the
+  first time it is used.
+- Only the assemblies know enum values and IL RVAs. A `const` has no storage, and there is no
+  call in the embedding API that reads one. Every other Mono dumper that reports enum values
+  from a live process is reporting something it did not read.
+
+So a live Mono dump reads the assemblies too, by default, and merges. Measured on Haste:
+16,816 types both sides had, 118,218 the assemblies declared that the runtime had not built,
+2,135 enums filled in, 142,113 IL bodies placed. 43,769 real field offsets, 43,930 enum values,
+0 lint errors.
+
+`zircon assemblies <Managed|one.dll>` says what can be read out of them before you dump
+anything, the way `zircon metadata` does for IL2CPP.
+
+The reader is checked against Microsoft's own. A/B against
+`System.Reflection.Metadata` across all 217 assemblies of one game: types 137,783, methods
+829,152, IL bodies 427,639, enums 3,709, enum values 40,362, and the MVID — every number
+identical. Field counts differ by exactly the enum members, which this dump files as enum
+values rather than fields, and reconcile to the byte.
+
+`zircon.exe`, `zircon-gui.exe` and `zircon.dll` all take the same treatment. The payload walks
+a Mono game and writes the C# tree itself; `check`, `detect`, `fingerprint`, `scan-games` and
+`batch` all know the backend; `emit cpp_sdk` refuses a Mono dump for the same reason it refuses
+an IL2CPP one.
+
+### Three bugs the live runs found
+
+None of these could have come from a fixture, and each one killed a real game.
+
+A binding table declared 71 rows and had 69. The two spare rows were zero-filled, so a lookup
+ran `std::string(nullptr)`. It segfaulted `zircon.exe` itself, which is how it was
+caught; the table's length is now deduced from its entries so it cannot drift again. IL2CPP's
+equivalent table was checked and is correct.
+
+`mono_assembly_name_get_version` is not a one-argument getter. It is
+`(MonoAssemblyName*, uint16_t*, uint16_t*, uint16_t*, uint16_t*)` and writes through all four
+out-params. Declared with one argument it wrote into whatever the argument registers happened
+to hold, which is why the first fault was a *write* near the instruction pointer.
+
+`mono_type_get_class` is a raw union read. For a multi-dimensional array that union holds a
+`MonoArrayType*`, not a `MonoClass*` — so `System.Globalization.ChineseLunisolarCalendar`, which
+has `static readonly int[,]` fields, had `mono_class_init` called on something that was never a
+class. Array types now go through `mono_class_from_mono_type`, which handles every case.
+
+Worth recording for anyone reading 0.8.0's notes: Mono's `mono_bool` really is a 32-bit int, so
+the IL2CPP `bool`-return trap does **not** apply here. The Mono traps are out-params, union
+reads and table lengths instead.
+
+The live walk also stopped asking the runtime for method signatures. It is the one thing the
+assemblies describe better, and asking for it was two of the three crashes above. Offsets stay
+where only the runtime can answer.
+
+### Schema 4
+
+- `packages[].assembly_version` and `packages[].mvid`. The compiler writes a fresh MVID on
+  every build, so it identifies a build exactly — better than any label typed by hand.
+- `functions[].il_rva`. Mono compiles a method the first time it is called, so there is no
+  stable native address to record the way there is on IL2CPP. The IL is what does not move.
+
+Zdex gates uploads on the schema number, so the updated Zdex has to go up before any 0.9.0
+dump can be published, Unreal included. `DUMP_SCHEMA_MAX` is 4, `header.runtime` accepts
+`"mono"`, and the MVID is stored per assembly. No migration: the per-dump sidecar is rebuilt at
+import.
+
+### Smaller things
+
+- `inject --launch` waits for either Unity backend rather than for `GameAssembly.dll`
+  specifically.
+- `batch` runs Mono games live first and falls back to their assemblies, counted as degraded
+  the same way the IL2CPP fallback is.
+- `scan-games` records each Mono game's `Managed` folder and no longer comments them out.
+- The payload's breadcrumb keeps the type name on the first line through every phase and names
+  the member index, so a crash in a member walk says which member. That is what localised all
+  three bugs above.
+
 ## 0.8.0 — 2026-09-20
 
 Everything here came out of a second outside test run on 0.7.0, plus the one feature that run

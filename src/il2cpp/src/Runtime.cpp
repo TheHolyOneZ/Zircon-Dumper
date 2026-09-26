@@ -1,6 +1,7 @@
 #include "il2cpp/Runtime.h"
 
 #include "core/Log.h"
+#include "core/ModuleExports.h"
 #include "core/ProcessList.h"
 
 #include <algorithm>
@@ -201,54 +202,7 @@ bool LooksLikeIl2CppModuleName(std::string_view name) {
 }
 
 std::vector<core::PeExport> ReadExports(core::IMemorySource& memory, Address module_base) {
-    std::vector<core::PeExport> out;
-    if (IsNull(module_base)) return out;
-
-    const auto dos = core::ReadOr<std::uint16_t>(memory, module_base);
-    if (dos != kDosMagic) return out;
-
-    const auto e_lfanew = core::ReadOr<std::int32_t>(memory, module_base + 0x3C);
-    if (e_lfanew <= 0 || e_lfanew > 0x10000) return out;
-
-    const Address nt = module_base + static_cast<std::uint64_t>(e_lfanew);
-    if (core::ReadOr<std::uint32_t>(memory, nt) != kPeMagic) return out;
-
-    // The data directory sits at a different offset in PE32 and PE32+, and the magic in the
-    // optional header is the only thing that says which this is.
-    const auto magic = core::ReadOr<std::uint16_t>(memory, nt + 0x18);
-    const bool pe64  = magic == 0x20B;
-    const Address data_dir = nt + 0x18 + (pe64 ? 0x70 : 0x60);
-
-    const auto export_rva = core::ReadOr<std::uint32_t>(memory, data_dir);
-    if (export_rva == 0) return out;
-
-    const Address dir = module_base + export_rva;
-    const auto name_count = core::ReadOr<std::uint32_t>(memory, dir + 0x18);
-    const auto names_rva  = core::ReadOr<std::uint32_t>(memory, dir + 0x20);
-    const auto ords_rva   = core::ReadOr<std::uint32_t>(memory, dir + 0x24);
-    const auto funcs_rva  = core::ReadOr<std::uint32_t>(memory, dir + 0x1C);
-    const auto ord_base   = core::ReadOr<std::uint32_t>(memory, dir + 0x10);
-
-    if (name_count == 0 || name_count > kMaxExportNames) return out;
-    if (names_rva == 0 || ords_rva == 0 || funcs_rva == 0) return out;
-
-    out.reserve(name_count);
-    for (std::uint32_t i = 0; i < name_count; ++i) {
-        const auto name_rva = core::ReadOr<std::uint32_t>(memory, module_base + names_rva + i * 4);
-        if (name_rva == 0) continue;
-
-        std::string name = ReadName(memory, module_base + name_rva);
-        if (name.empty()) continue;
-
-        const auto ordinal = core::ReadOr<std::uint16_t>(memory, module_base + ords_rva + i * 2);
-        const auto func_rva = core::ReadOr<std::uint32_t>(memory,
-                                                          module_base + funcs_rva + ordinal * 4);
-        if (func_rva == 0) continue;
-
-        out.push_back(core::PeExport{std::move(name), func_rva,
-                                     static_cast<std::uint16_t>(ordinal + ord_base)});
-    }
-    return out;
+    return core::ReadModuleExports(memory, module_base);
 }
 
 std::vector<std::uint32_t> ReadFunctionStarts(core::IMemorySource& memory,

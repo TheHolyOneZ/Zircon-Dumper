@@ -6,9 +6,9 @@ A reflection extraction and analysis toolkit for game engines. It reads a runnin
 (or a dump, or a binary on disk), reconstructs the engine's reflection data into a versioned
 intermediate representation, and emits that IR into as many useful formats as it can.
 
-Unreal came first and is the deeper of the two. Since 0.6.0 there is a second backend for
-Unity IL2CPP, which produces the same IR and therefore reaches the same emitters. The two
-share `core/` and `ir/` and nothing else.
+Unreal came first and is still the deepest. Since 0.6.0 there is a second backend for Unity
+IL2CPP, and since 0.9.0 a third for Unity Mono. All three produce the same IR and therefore
+reach the same emitters, and all three share `core/` and `ir/` and nothing else.
 
 It is not "a better Dumper-7". Dumper-7 is one feature of this tool (the C++ SDK
 emitter), reached through a pipeline that also produces diffs, disassembler types,
@@ -21,6 +21,7 @@ mappings, decompiled script bytecode, and a live inspector.
 | Memory access | `IMemorySource` abstraction, four providers shipped up front |
 | Engine coverage | UE4.20 → UE5.7, runtime fingerprint + offset auto-derivation |
 | Second runtime | Unity IL2CPP, via the exported embedding API rather than metadata parsing |
+| Third runtime | Unity Mono, via its exported embedding API plus the game's own managed assemblies |
 | Output strategy | Reflection → IR → N emitters; IR is the contract |
 | Language / toolchain | C++20, MSVC (VS2022), CMake + Ninja, x64 Windows first |
 | Auditing | every derivation reports evidence; the finished dump is lint-checkable |
@@ -113,11 +114,16 @@ Legend: ✅ planned · ⭐ beyond anything in Dumper-7 · ➖ out of scope
   owns outright are writable: numbers, bools and enums. Containers, strings and structs
   are refused, since their memory carries allocator state that a plain byte write
   corrupts without any immediate symptom.
-- **Engines whose type system is not there to be read.** Unreal and Unity IL2CPP both keep a
-  full description of their own types, which is what makes this work at all — one as data in
-  memory, the other behind an exported C API. An engine that ships no reflection is a
-  decompilation problem, not this one. Unity's Mono backend is a correct "no" for a different
-  reason: no `GameAssembly.dll`, so the IL2CPP path has nothing to talk to.
+- **Engines whose type system is not there to be read.** Unreal and both Unity backends keep a
+  full description of their own types, which is what makes this work at all — Unreal as data in
+  memory, Unity behind an exported C API and, on Mono, additionally as ECMA-335 metadata in the
+  game's own assemblies. An engine that ships no reflection is a decompilation problem, not this
+  one.
+
+  Mono was listed here as a deliberate "no" until 0.9.0, on the grounds that it has no
+  `GameAssembly.dll` for the IL2CPP path to talk to. That was true and beside the point: it has
+  its own runtime exporting its own API, and its code on disk in a documented format. The
+  entry was wrong rather than out of date.
 - **Overlaying the game's own rendering.** The injected payload opens its own window
   rather than hooking the swap chain's `Present`. A Present hook means writing a
   trampoline over code the game owns, which is the rule above; a separate window is the

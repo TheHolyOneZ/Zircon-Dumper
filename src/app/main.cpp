@@ -23,6 +23,9 @@
 #include "il2cpp/Static.h"
 #include "zdex/Gzip.h"
 #include "il2cpp/Runtime.h"
+#include "mono/Assembly.h"
+#include "mono/Runtime.h"
+#include "mono/Static.h"
 #include "diff/Diff.h"
 #include "emit/Emitter.h"
 #include "ir/Json.h"
@@ -312,6 +315,15 @@ constexpr CommandHelp kCommandHelp[] = {
  "whether or not it will ever launch.\n\n"
  "Exits 3 when a live dump looks unlikely, 5 when there is no such file.\n"},
 
+{"assemblies", "zircon assemblies <Managed folder|assembly.dll>",
+ "What Zircon reads out of a Mono game's own managed assemblies, without running it.\n"
+ "Unity's Mono backend ships real .NET assemblies, so this is ECMA-335 metadata rather\n"
+ "than anything Unity invented -- there is no version table here either, because the\n"
+ "format is a published standard that does not move.\n\n"
+ "Worth running before dumping a Mono game: enum values and IL RVAs come from here and\n"
+ "from nowhere else, since a const has no storage for the live runtime to read.\n\n"
+ "Exits 3 when nothing could be read, 5 when the folder holds no assemblies.\n"},
+
 {"metadata", "zircon metadata <global-metadata.dat>",
  "Says what Zircon worked out about a Unity metadata file, and the evidence for each\n"
  "step: the header layout, which span is which table, the record sizes, and where the\n"
@@ -398,7 +410,9 @@ constexpr CommandHelp kCommandHelp[] = {
  "Full reflection dump to IR JSON. Unreal from outside the process; for Unity use inject,\n"
  "because IL2CPP keeps its field offsets behind a function call.\n\n"
  "  -o, --out <path>   Where to write it (default dump.json); .json.gz compresses it\n"
- "      --metadata <p> Unity: read global-metadata.dat instead, with no process at all\n"
+ "      --metadata <p> Unity IL2CPP: read global-metadata.dat instead, no process at all\n"
+ "      --managed <d>  Unity Mono: read the game's own managed assemblies instead. Enum\n"
+ "                     values and IL RVAs live here and nowhere else\n"
  "      --mode static  the same thing, said the other way round\n"
  "      --names        Embed the whole FName pool\n"
  "      --script       Decompile Kismet bytecode into the dump\n"
@@ -815,6 +829,9 @@ void ScanFolder(const std::filesystem::path& root, int depth, std::vector<FoundG
         if (il2cpp) {
             const auto found = MetadataBeside(root);
             game.metadata = found.string();
+        } else if (!game.exe.empty()) {
+            const auto managed = zircon::mono::ManagedFolderBeside(game.exe);
+            game.metadata = managed.string();
         }
         if (!game.exe.empty()) into.push_back(std::move(game));
         return;                       // a game folder does not contain another game
@@ -1025,8 +1042,9 @@ int CommandScanGames(const std::vector<std::string>& roots, std::string_view out
                         static_cast<int>(Reset().size()), Reset().data(),
                         game.name.substr(0, 34).c_str(), game.exe.c_str());
         }
-        std::printf("\n%zu game(s). Mono ones are listed and cannot be dumped: they have no "
-                    "GameAssembly.dll for the IL2CPP path to talk to.\n", found.size());
+        std::printf("\n%zu game(s). Both Unity backends are dumpable: IL2CPP through "
+                    "global-metadata.dat, Mono through its own managed assemblies.\n",
+                    found.size());
     }
 
     if (!out_path.empty()) {
@@ -1037,10 +1055,10 @@ int CommandScanGames(const std::vector<std::string>& roots, std::string_view out
         }
         manifest << "# Written by zircon scan-games. Run it with: zircon batch "
                  << out_path << "\n";
-        manifest << "# Delete the ones you do not want. Mono entries are commented out "
-                    "because they cannot be dumped.\n\n";
+        manifest << "# Delete the ones you do not want.\n\n";
         for (const auto& game : found) {
-            const bool can = game.runtime == "il2cpp" || game.runtime == "unreal";
+            const bool can = game.runtime == "il2cpp" || game.runtime == "unreal" ||
+                             game.runtime == "mono";
             const char* lead = can ? "" : "# ";
             manifest << lead << "[[game]]\n";
             manifest << lead << "name = " << TomlString(game.name) << "\n";
@@ -1121,6 +1139,8 @@ std::vector<BatchEntry> ReadManifest(std::string_view path, std::string& error) 
 // Each one is the same work `inject --launch --wait` does, run in turn, and one failing does
 // not stop the rest -- the point is to come back to a folder of dumps and a list of what did
 // not work, rather than to find it stopped on the second game four hours ago.
+int CommandManagedDump(std::string_view folder, std::string_view out_path);
+
 int CommandBatch(std::string_view manifest_path, std::string_view out_dir,
                  const InjectOptions& base) {
     std::string error;
@@ -1150,7 +1170,22 @@ int CommandBatch(std::string_view manifest_path, std::string_view out_dir,
         Heading(std::format("{} ({})", stem, entry.runtime));
 
         int result = 0;
-        if (entry.runtime == "il2cpp" && !entry.exe.empty()) {
+        if (entry.runtime == "mono" && !entry.exe.empty()) {
+            InjectOptions options = base;
+            options.launch   = entry.exe;
+            options.out_path = out;
+            options.wait     = true;
+            options.headless = true;
+            TargetSpec spec;
+            result = CommandInject(spec, options);
+
+            if (result != 0 && !entry.metadata.empty()) {
+                LogWarn("{}: the live walk did not finish, falling back to its assemblies",
+                        stem);
+                result = CommandManagedDump(entry.metadata, out);
+                if (result == 0) degraded.push_back(stem);
+            }
+        } else if (entry.runtime == "il2cpp" && !entry.exe.empty()) {
             InjectOptions options = base;
             options.launch   = entry.exe;
             options.out_path = out;
@@ -1174,8 +1209,9 @@ int CommandBatch(std::string_view manifest_path, std::string_view out_dir,
                 if (result == 0) degraded.push_back(stem);
             }
         } else if (!entry.metadata.empty()) {
-            // No executable, or a runtime the injected walk cannot reach. The file still can.
-            result = CommandStaticDump(entry.metadata, out);
+            // No executable, or a runtime the injected walk cannot reach. The files still can.
+            result = entry.runtime == "mono" ? CommandManagedDump(entry.metadata, out)
+                                             : CommandStaticDump(entry.metadata, out);
         } else {
             LogWarn("{}: nothing to do -- {} games are not dumpable by injection and this "
                     "entry has no metadata file", stem, entry.runtime);
@@ -1300,6 +1336,7 @@ int CommandCheck(std::string_view exe_path) {
 
     // --- which runtime, from the files on disk ------------------------------------------
     const auto metadata = MetadataBeside(folder);
+    const auto managed  = zircon::mono::ManagedFolderBeside(exe);
 
     bool unreal = false;
     for (auto at = folder; !at.empty() && at != at.root_path(); at = at.parent_path()) {
@@ -1307,10 +1344,11 @@ int CommandCheck(std::string_view exe_path) {
     }
 
     std::string runtime = "unknown";
-    if (!metadata.empty()) runtime = "Unity IL2CPP";
-    else if (unreal)       runtime = "Unreal";
+    if (!metadata.empty())     runtime = "Unity IL2CPP";
+    else if (!managed.empty()) runtime = "Unity Mono";
+    else if (unreal)           runtime = "Unreal";
     else if (std::filesystem::exists(folder / "UnityPlayer.dll", ec))
-        runtime = "Unity, but not IL2CPP";
+        runtime = "Unity, backend unclear";
     FieldStrong("runtime", runtime);
 
     // --- what starting it would involve --------------------------------------------------
@@ -1402,12 +1440,132 @@ int CommandCheck(std::string_view exe_path) {
         return 0;
     }
 
+    if (!managed.empty()) {
+        std::printf("\n");
+        FieldStrong("static dump", "works either way, with the game never started");
+        Field("assemblies", "{}", managed.string());
+        Field("try", "zircon dump --managed \"{}\" -o dump.json.gz", managed.string());
+        Field("note", "enum values and IL RVAs only exist here, so a live Mono walk reads "
+                      "these too unless told otherwise");
+        return 0;
+    }
+
     std::fflush(stdout);
     if (unreal)
         LogInfo("Unreal reflection only exists inside a running process, so there is no file "
                 "to read instead");
 
     return blockers.empty() ? 0 : 3;
+}
+
+int CommandManagedDump(std::string_view folder, std::string_view out_path) {
+    if (folder.empty()) {
+        LogError("--managed needs the game's Managed folder");
+        return 1;
+    }
+
+    std::error_code ec;
+    std::filesystem::path target{std::string(folder)};
+    if (std::filesystem::is_regular_file(target, ec)) {
+        const auto beside = zircon::mono::ManagedFolderBeside(target);
+        if (!beside.empty()) target = beside;
+    }
+
+    zircon::mono::AssemblySetStats set_stats;
+    const auto assemblies = zircon::mono::ReadManagedFolder(target.string(), set_stats);
+    if (assemblies.empty()) {
+        LogError("no readable managed assemblies in {}", target.string());
+        return 3;
+    }
+
+    LogInfo("{} of {} assemblies read from {}", set_stats.read, set_stats.files,
+            target.string());
+    for (const auto& line : set_stats.refusals) LogWarn("  {}", line);
+
+    zircon::mono::StaticStats stats;
+    auto dump = zircon::mono::BuildStaticDump(assemblies, stats);
+    dump.header.tool_version = kVersion;
+
+    LogInfo("static dump: {} assemblies, {} types, {} fields, {} methods, {} enum values",
+            stats.assemblies, stats.types, stats.fields, stats.methods, stats.enum_values);
+    LogWarn("field offsets are not in the metadata: the CLI does not store them and the "
+            "runtime computes a layout when a type is first used");
+    if (stats.indistinguishable)
+        LogWarn("{} type(s) share a full name with another in the same assembly, so only the "
+                "first of each is in this dump -- MonoMod's HookGen output does this",
+                stats.indistinguishable);
+
+    const std::string path = out_path.empty() ? "dump.json" : std::string(out_path);
+    std::string error;
+    if (!WriteDumpFile(dump, path, error)) {
+        LogError("could not write '{}': {}", path, error);
+        return 5;
+    }
+
+    Heading("Managed dump");
+    Field("output", "{}", path);
+    Field("assemblies", "{}", stats.assemblies);
+    Field("types", "{}", stats.types);
+    Field("enums", "{} carrying {} value(s)", stats.enums, stats.enum_values);
+    Field("methods", "{} ({} with an IL body)", stats.methods, stats.with_il);
+    return 0;
+}
+
+int CommandAssemblies(std::string_view path) {
+    if (path.empty()) {
+        LogError("assemblies needs a folder or a .dll: zircon assemblies <Managed>");
+        return 1;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path target{std::string(path)};
+
+    if (std::filesystem::is_regular_file(target, ec)) {
+        auto read = zircon::mono::ReadAssembly(target.string());
+        if (!read) {
+            LogError("{}", read.error().message);
+            return 3;
+        }
+        const auto& assembly = read.value();
+        Heading(target.filename().string());
+        FieldStrong("assembly", assembly.name);
+        if (!assembly.version.empty()) Field("version", "{}", assembly.version);
+        if (!assembly.mvid.empty())    Field("mvid", "{}", assembly.mvid);
+        if (!assembly.runtime_version.empty())
+            Field("runtime", "{}", assembly.runtime_version);
+        Field("types", "{}", assembly.types.size());
+
+        std::size_t fields = 0, methods = 0, enums = 0, values = 0, with_il = 0;
+        for (const auto& row : assembly.types) {
+            fields  += row.fields.size();
+            methods += row.methods.size();
+            if (row.is_enum) { ++enums; values += row.enum_values.size(); }
+            for (const auto& m : row.methods) if (m.rva) ++with_il;
+        }
+        Field("fields", "{}", fields);
+        Field("methods", "{} ({} with an IL body)", methods, with_il);
+        Field("enums", "{} carrying {} value(s)", enums, values);
+        return 0;
+    }
+
+    zircon::mono::AssemblySetStats stats;
+    const auto assemblies = zircon::mono::ReadManagedFolder(target.string(), stats);
+    if (stats.files == 0) {
+        LogError("no .dll files in {}", target.string());
+        return 5;
+    }
+
+    Heading(target.string());
+    Field("assemblies", "{} of {} read", stats.read, stats.files);
+    Field("types", "{}", stats.types);
+    Field("enum values", "{}", stats.enum_values);
+
+    if (!stats.refusals.empty()) {
+        std::fflush(stdout);
+        LogWarn("{} file(s) were refused:", stats.refusals.size());
+        for (const auto& line : stats.refusals) LogWarn("  {}", line);
+    }
+    return assemblies.empty() ? 3 : 0;
 }
 
 int CommandModules(const TargetSpec& spec) {
@@ -1506,17 +1664,42 @@ void PrintUnityProcesses(const std::vector<zircon::il2cpp::UnityProcess>& unity)
                 static_cast<int>(Reset().size()), Reset().data());
 }
 
+void PrintMonoProcesses(const std::vector<zircon::mono::MonoProcess>& found) {
+    if (found.empty()) return;
+
+    std::printf("\n");
+    Heading(std::format("{:<6} {:<8} {:<40} {}", "READY", "PID", "PROCESS", "RUNTIME"));
+    for (const auto& entry : found) {
+        const auto colour = entry.runtime_loaded ? Green() : Yellow();
+        std::printf("%.*s%-6s%.*s %.*s%-8u%.*s %-40s %s\n",
+                    static_cast<int>(colour.size()), colour.data(),
+                    entry.runtime_loaded ? "yes" : "not yet",
+                    static_cast<int>(Reset().size()), Reset().data(),
+                    static_cast<int>(Dim().size()), Dim().data(),
+                    entry.process.pid,
+                    static_cast<int>(Reset().size()), Reset().data(),
+                    entry.process.name.c_str(),
+                    entry.runtime_loaded ? "Unity Mono, runtime loaded"
+                                         : "Unity Mono, still starting");
+    }
+    std::printf("%.*sUnity is dumped from inside: zircon inject --pid <n>%.*s\n",
+                static_cast<int>(Dim().size()), Dim().data(),
+                static_cast<int>(Reset().size()), Reset().data());
+}
+
 int CommandDetect() {
     const auto candidates = zircon::engine::DetectUnrealProcesses(0.2f);
     const auto unity      = zircon::il2cpp::DetectUnityProcesses();
+    const auto mono       = zircon::mono::DetectMonoProcesses();
 
-    if (candidates.empty() && unity.empty()) {
-        LogWarn("no Unreal Engine or Unity IL2CPP processes detected");
+    if (candidates.empty() && unity.empty() && mono.empty()) {
+        LogWarn("no Unreal Engine or Unity processes detected");
         return 3;
     }
 
     if (candidates.empty()) {
         PrintUnityProcesses(unity);
+        PrintMonoProcesses(mono);
         return 0;
     }
 
@@ -1545,6 +1728,7 @@ int CommandDetect() {
     }
 
     PrintUnityProcesses(unity);
+    PrintMonoProcesses(mono);
     return 0;
 }
 
@@ -1598,6 +1782,41 @@ int CommandFingerprint(const TargetSpec& spec, bool as_json) {
         Evidence(unity->evidence);
 
         if (!unity->api.Complete()) {
+            LogWarn("this build does not export everything the walk needs; "
+                    "a dump would be incomplete");
+            return 3;
+        }
+        return 0;
+    }
+
+    if (const auto runtime = zircon::mono::FindRuntime(*mem)) {
+        if (as_json) {
+            std::printf("{\"ok\": true, \"runtime\": \"mono\", \"module\": %s, "
+                        "\"module_base\": %llu, \"entry_points_resolved\": %d, "
+                        "\"entry_points_required\": %d, \"entry_points_optional\": %d, "
+                        "\"optional_resolved\": %d, \"complete\": %s, "
+                        "\"confidence\": %.2f, \"missing\": %s, \"evidence\": %s}\n",
+                        JsonQuote(runtime->module_name).c_str(),
+                        static_cast<unsigned long long>(Raw(runtime->module_base)),
+                        runtime->api.resolved,
+                        zircon::mono::RequiredEntryPointCount(),
+                        zircon::mono::OptionalEntryPointCount(),
+                        runtime->api.enrichment,
+                        runtime->api.Complete() ? "true" : "false",
+                        runtime->confidence,
+                        JsonList(runtime->api.missing).c_str(),
+                        JsonList(runtime->evidence).c_str());
+            return runtime->api.Complete() ? 0 : 3;
+        }
+
+        FieldStrong("runtime", "Unity Mono");
+        Field("module", "{} at {:#x}", runtime->module_name, Raw(runtime->module_base));
+        Field("api", "{}/{} entry points resolved", runtime->api.resolved,
+              runtime->api.resolved + static_cast<int>(runtime->api.missing.size()));
+        Field("confidence", "{:.0f}%", runtime->confidence * 100.0);
+        Evidence(runtime->evidence);
+
+        if (!runtime->api.Complete()) {
             LogWarn("this build does not export everything the walk needs; "
                     "a dump would be incomplete");
             return 3;
@@ -1905,29 +2124,50 @@ std::uint32_t LaunchAndWait(const std::string& exe, int timeout_seconds) {
     const std::uint32_t pid = process.dwProcessId;
     LogInfo("started {} as pid {}", path.filename().string(), pid);
 
+    bool handed_off = false;
     for (int elapsed = 0; elapsed < timeout_seconds; ++elapsed) {
-        if (!ProcessAlive(pid)) {
-            // Launchers do this: the exe you start hands off to another process and exits.
-            for (const auto& other : zircon::il2cpp::DetectUnityProcesses()) {
-                if (!other.runtime_loaded) continue;
+        const bool alive = ProcessAlive(pid);
+
+        for (const auto& other : zircon::il2cpp::DetectUnityProcesses()) {
+            if (!other.runtime_loaded) continue;
+            if (other.process.pid == pid) {
+                LogInfo("GameAssembly.dll mapped after {}s", elapsed);
+                return pid;
+            }
+            if (!alive) {
                 LogInfo("{} handed off to {} (pid {})", path.filename().string(),
                         other.process.name, other.process.pid);
                 return other.process.pid;
             }
-            LogError("{} exited before its runtime came up", path.filename().string());
-            return 0;
         }
 
-        for (const auto& candidate : zircon::il2cpp::DetectUnityProcesses()) {
-            if (candidate.process.pid != pid || !candidate.runtime_loaded) continue;
-            LogInfo("GameAssembly.dll mapped after {}s", elapsed);
-            return pid;
+        for (const auto& other : zircon::mono::DetectMonoProcesses()) {
+            if (!other.runtime_loaded) continue;
+            if (other.process.pid == pid) {
+                LogInfo("the Mono runtime mapped after {}s", elapsed);
+                return pid;
+            }
+            if (!alive) {
+                LogInfo("{} handed off to {} (pid {})", path.filename().string(),
+                        other.process.name, other.process.pid);
+                return other.process.pid;
+            }
+        }
+
+        if (!alive && !handed_off) {
+            handed_off = true;
+            LogInfo("{} exited, which is what a store wrapper does; waiting for the game it "
+                    "started", path.filename().string());
         }
         ::Sleep(1000);
     }
 
-    LogError("{} did not map GameAssembly.dll within {}s", path.filename().string(),
-             timeout_seconds);
+    if (handed_off)
+        LogError("{} exited and no Unity game appeared within {}s",
+                 path.filename().string(), timeout_seconds);
+    else
+        LogError("{} did not map a Unity scripting runtime within {}s",
+                 path.filename().string(), timeout_seconds);
     return 0;
 }
 
@@ -2938,6 +3178,17 @@ int CommandDump(const TargetSpec& spec, std::string_view out_path,
     auto memory = MakeCached(std::move(source.value()));
     LogInfo("target: {}", memory->Describe());
 
+    if (const auto runtime = zircon::mono::FindRuntime(*memory)) {
+        LogError("this is a Unity Mono game ({}), and its field offsets only exist as answers "
+                 "the runtime gives to calls", runtime->module_name);
+        const std::string how = target.kind == TargetSpec::Kind::Pid
+                                    ? std::format("--pid {}", target.pid)
+                                    : std::format("--process {}", target.value);
+        LogError("run 'zircon inject {}' instead, or read the assemblies with no process at "
+                 "all: zircon dump --managed <Managed>", how);
+        return 3;
+    }
+
     // Unity first, and only to refuse. IL2CPP answers come from calling into the runtime,
     // which we can't do from out here. Say so now rather than fail later with an Unreal
     // reflection message that sends someone looking in the wrong place.
@@ -3724,6 +3975,7 @@ int main(int argc, char** argv) {
     std::string walk_mode;
     std::vector<std::string> scan_roots;
     std::string launch_exe;
+    std::string managed_path;
     bool        wait_for_payload = false;
     int         settle_seconds = 0;
     int         timeout_seconds = kDefaultTimeoutSeconds;
@@ -3843,6 +4095,10 @@ int main(int argc, char** argv) {
             headless = true;
         } else if (arg == "--wait") {
             wait_for_payload = true;
+        } else if (arg == "--managed") {
+            const auto value = next(arg);
+            if (!value) return 1;
+            managed_path = *value;
         } else if (arg == "--launch") {
             const auto value = next(arg);
             if (!value) return 1;
@@ -3923,7 +4179,8 @@ int main(int argc, char** argv) {
         } else if (command == "scan-games" && IsPositional(arg)) {
             scan_roots.emplace_back(arg);
         } else if ((command == "validate" || command == "xref" || command == "metadata" ||
-                    command == "batch" || command == "check") &&
+                    command == "batch" || command == "check" ||
+                    command == "assemblies") &&
                    validate_path.empty() && IsPositional(arg)) {
             validate_path = arg;
         } else if ((command == "publish" || command == "fetch" || command == "login") &&
@@ -3996,11 +4253,13 @@ int main(int argc, char** argv) {
     if (command == "write")       return CommandWrite(spec, name_filter, assignment);
     if (command == "find")        return CommandFind(spec, name_filter, predicate, limit);
     if (command == "dump") {
-        // No process needed, and none asked for: read the file and stop.
+        // No process needed, and none asked for: read the files and stop.
+        if (!managed_path.empty()) return CommandManagedDump(managed_path, out_path);
+
         if (!metadata_path.empty() || walk_mode == "static") {
             if (metadata_path.empty()) {
-                LogError("--mode static needs the metadata file: "
-                         "--metadata <global-metadata.dat>");
+                LogError("--mode static needs a file to read: --metadata "
+                         "<global-metadata.dat> for IL2CPP, or --managed <Managed> for Mono");
                 return 1;
             }
             return CommandStaticDump(metadata_path, out_path);
@@ -4019,6 +4278,7 @@ int main(int argc, char** argv) {
                            allow_partial, publish, launch_exe, timeout_seconds);
     }
     if (command == "check")       return CommandCheck(validate_path);
+    if (command == "assemblies")  return CommandAssemblies(validate_path);
     if (command == "validate")    return CommandValidate(validate_path, strict, limit);
     if (command == "xref")        return CommandXref(validate_path, name_filter, uses, limit);
     if (command == "login")       return zircon::app::CommandLogin(

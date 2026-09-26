@@ -1,6 +1,6 @@
-> **AI assistance:** docs and source comments written by Claude Opus 5.0, with
-> implementation help and bug fixes. Architecture, design, testing and debugging are mine —
-> see [docs/UE-Test.md](docs/UE-Test.md) for what was actually run, and
+> **AI assistance:** the docs and the source comments were written with AI assistance, and I
+> used it for implementation help and bug fixes too. Architecture, design, testing and debugging
+> are mine — see [docs/UE-Test.md](docs/UE-Test.md) for what was actually run, and
 > [CONTRIBUTING.md](CONTRIBUTING.md#ai-assistance) for the full statement.
 
 <img src="docs/images/icon.png" alt="Zircon" width="112" align="right">
@@ -142,7 +142,7 @@ The result is one JSON file containing the game's whole type system.
 | You want… | Use | What you get |
 |---|---|---|
 | To write a cheat/mod in C++ | `cpp_sdk` | Headers with every class, correct offsets, compile-time checks, and callable wrappers for every reflected function (Unreal) |
-| To read a Unity game's code | `csharp` | A C# source tree: one folder per assembly, one file per type, offsets and RVAs in the margin |
+| To read a Unity game's code | `csharp` | A C# source tree: one folder per assembly, one file per type, offsets and RVAs in the margin (IL2CPP and Mono) |
 | To use UE4SS, FModel, or an asset tool | `usmap` | A `.usmap` mappings file |
 | To reverse the binary in IDA Pro | `ida` | A Python script that imports every struct into your database |
 | Same, but Ghidra | `ghidra` | The same, for Ghidra |
@@ -979,6 +979,47 @@ generics.
 An output path ending `.json.gz` is written compressed. A Unity dump is around 600 MB of JSON
 and 20 of gzip, which is the difference between 2.5 GB and a hundred for four games.
 
+### Unity's other backend: Mono
+
+Unity shipped Mono for years and plenty of games still use it. A Mono game has no
+`GameAssembly.dll`; it has `mono-2.0-bdwgc.dll` and its code sits in `<Game>_Data\Managed` as
+real .NET assemblies.
+
+Both halves are read, because neither is complete on its own:
+
+| | live runtime | the assemblies |
+|---|---|---|
+| type system | yes | yes |
+| **field offsets** | **yes** | no — the CLI does not store them |
+| **enum values** | no — a const has no storage to read | **yes** |
+| **IL RVAs** | no — Mono compiles on first call | **yes** |
+| needs the game to run | yes | no |
+
+So a live Mono dump reads the assemblies too and merges them, and neither number is invented.
+Any dumper reporting enum values out of a live Mono process is reporting something it did not
+read.
+
+```
+zircon assemblies <Managed>                        what can be read, before dumping anything
+zircon dump --managed <Managed> -o game.json.gz    no process at all
+zircon inject --launch "Game.exe" --wait           live, and the assemblies merged in
+```
+
+The reader is ECMA-335, a published standard, so there is no version table here either — and
+unlike `global-metadata.dat` there was nothing to derive. `docs/MONO.md` has the whole argument,
+including the three prototype bugs that live runs found. It is checked against
+`System.Reflection.Metadata`, Microsoft's own implementation, across all 217 assemblies of one
+game: types, methods, IL bodies, enums, enum values and the module GUID all match exactly.
+
+Measured on Haste, live with the assemblies merged: 16,816 types both sides had, 118,218 the
+assemblies declared that the runtime had not built, 2,135 enums filled in, 142,113 IL bodies
+placed, 43,769 field offsets, 0 lint errors.
+
+Two Mono games have been walked live, launched by Zircon, and both dumps were published to Zdex
+and imported clean — the index shows them as Unity Mono and correctly offers no `.usmap` or C++
+SDK, since neither means anything for a Unity build. `docs/MONO.md` has the coverage table.
+Nineteen Mono games are installed here and two have been walked, which is the gap to widen next.
+
 ### Unity dumps need injection. Unreal ones don't.
 
 This is the one real difference, and it's worth understanding before you reach for it.
@@ -1440,7 +1481,8 @@ src/app/       CLI shell
 src/dll/       injected payload — dumps, emits, then opens the browser in-process
 src/gui/       Browser (host-agnostic UI) + Host (window, device, frame loop)
 res/           the icon and the version resources
-docs/          SCOPE.md, ARCHITECTURE.md, PLUGINS.md, IL2CPP.md (the Unity backend),
+docs/          SCOPE.md, ARCHITECTURE.md, PLUGINS.md, IL2CPP.md and MONO.md (the two
+               Unity backends),
                UE-Test.md (version coverage), ENGINEERING-LOG.md
 ```
 

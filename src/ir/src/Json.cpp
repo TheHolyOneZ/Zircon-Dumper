@@ -234,6 +234,9 @@ void WriteFunction(Writer& writer, const Function& function) {
     if (function.native_rva != defaults.native_rva) {
         writer.Key("native_rva"); writer.Hex(function.native_rva);
     }
+    if (function.il_rva != defaults.il_rva) {
+        writer.Key("il_rva"); writer.Hex(function.il_rva);
+    }
     if (function.token != defaults.token) { writer.Key("token"); writer.UInt(function.token); }
     if (function.shared_body) { writer.Key("shared_body"); writer.Bool(true); }
     if (!function.script.empty()) {
@@ -856,6 +859,9 @@ private:
         }
 
         if (!ReadHex(value, "native_rva", out.native_rva)) return false;
+        std::uint64_t il_rva = out.il_rva;
+        if (!ReadHex(value, "il_rva", il_rva)) return false;
+        out.il_rva = static_cast<std::uint32_t>(il_rva);
         if (!ReadNumber(value, "token", out.token)) return false;
         if (!ReadBool(value, "shared_body", out.shared_body)) return false;
         if (!ReadNumber(value, "script_size",  out.script_size))  return false;
@@ -1051,6 +1057,9 @@ private:
                 if (item.type != Value::Type::Object)
                     return Fail(item, "package must be an object");
                 if (!ReadString(item, "name", package.name)) return false;
+                if (!ReadString(item, "assembly_version", package.assembly_version))
+                    return false;
+                if (!ReadString(item, "mvid", package.mvid)) return false;
 
                 // is_class isn't serialized. The array a record sits in already says it,
                 // and writing it too would let a file claim is_class=true inside "structs"
@@ -1121,6 +1130,10 @@ std::string WriteJsonString(const Dump& dump, bool pretty) {
     for (const auto& package : dump.packages) {
         writer.BeginObject();
         writer.Key("name"); writer.String(package.name);
+        if (!package.assembly_version.empty()) {
+            writer.Key("assembly_version"); writer.String(package.assembly_version);
+        }
+        if (!package.mvid.empty()) { writer.Key("mvid"); writer.String(package.mvid); }
 
         if (!package.classes.empty()) {
             writer.Key("classes");

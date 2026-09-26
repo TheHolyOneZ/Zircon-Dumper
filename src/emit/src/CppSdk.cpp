@@ -1143,9 +1143,9 @@ EmitResult EmitCppSdk(const ir::Dump& dump, const EmitOptions& options) {
     // headers full of things like `struct UList_AchievementMono___mscorlib;` -- a C#
     // generic pushed through a C++ name mangler, with a UClass prefix on a type that was
     // never a UClass. It did not compile and could not be read either.
-    if (dump.header.runtime == "il2cpp") {
-        result.error = "this is a Unity IL2CPP dump, and its types are C# rather than "
-                       "C++ UObjects; emit csharp writes the source tree for those";
+    if (dump.header.runtime == "il2cpp" || dump.header.runtime == "mono") {
+        result.error = "this is a Unity dump, and its types are C# rather than C++ UObjects; "
+                       "emit csharp writes the source tree for those";
         return result;
     }
 

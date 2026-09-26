@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.8.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.9.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,7 @@ add_library(zircon_core STATIC
   src/core/src/Breadcrumb.cpp
   src/core/src/Term.cpp
   src/core/src/PeImage.cpp
+  src/core/src/ModuleExports.cpp
   src/core/src/PatternScanner.cpp
   src/core/src/ProcessList.cpp
   src/core/src/Injector.cpp
@@ -172,6 +173,20 @@ target_include_directories(zircon_il2cpp PUBLIC src/il2cpp/include)
 target_link_libraries(zircon_il2cpp PUBLIC zircon_core zircon_ir)
 set_target_properties(zircon_il2cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# mono/ is the third runtime backend: Unity's other scripting backend, where the game ships
+# real .NET assemblies and the runtime exports the Mono embedding API. Beside il2cpp/ rather
+# than under it -- neither needs the other.
+add_library(zircon_mono STATIC
+  src/mono/src/Runtime.cpp
+  src/mono/src/Assembly.cpp
+  src/mono/src/InProcessBridge.cpp
+  src/mono/src/Walker.cpp
+  src/mono/src/Static.cpp
+)
+target_include_directories(zircon_mono PUBLIC src/mono/include)
+target_link_libraries(zircon_mono PUBLIC zircon_core zircon_ir)
+set_target_properties(zircon_mono PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(zircon_zdex STATIC
   src/zdex/src/Gzip.cpp
   src/zdex/src/Sha256.cpp
@@ -205,14 +220,16 @@ if(ZIRCON_BUILD_CLI)
   set(ZIRCON_RC_CLI "")
   set(ZIRCON_RC_GUI "")
   set(ZIRCON_RC_DLL "")
+  set(ZIRCON_RC_LUA "")
   if(WIN32)
     set(ZIRCON_RC_CLI res/zircon_cli.rc)
     set(ZIRCON_RC_GUI res/zircon_gui.rc)
     set(ZIRCON_RC_DLL res/zircon_payload.rc)
+    set(ZIRCON_RC_LUA res/zircon_lua.rc)
   endif()
 
   add_executable(zircon src/app/main.cpp src/app/Publish.cpp ${ZIRCON_RC_CLI})
-  target_link_libraries(zircon PRIVATE zircon_engine zircon_emit zircon_diff zircon_plugin zircon_zdex zircon_il2cpp)
+  target_link_libraries(zircon PRIVATE zircon_engine zircon_emit zircon_diff zircon_plugin zircon_zdex zircon_il2cpp zircon_mono)
   set_target_properties(zircon PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
 endif()
 
@@ -236,7 +253,7 @@ if(ZIRCON_BUILD_GUI)
   add_library(zircon_gui_lib STATIC src/gui/Host.cpp src/gui/Browser.cpp)
   target_include_directories(zircon_gui_lib PUBLIC src/gui res)
   # zircon_emit so the browser can write a dump itself, not only browse one.
-  target_link_libraries(zircon_gui_lib PUBLIC zircon_engine zircon_il2cpp zircon_emit zircon_imgui zircon_zdex)
+  target_link_libraries(zircon_gui_lib PUBLIC zircon_engine zircon_il2cpp zircon_mono zircon_emit zircon_imgui zircon_zdex)
   set_target_properties(zircon_gui_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
   add_executable(zircon_gui WIN32 src/gui/main_gui.cpp ${ZIRCON_RC_GUI})
@@ -307,7 +324,7 @@ if(ZIRCON_BUILD_PLUGINS)
     target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
   endif()
 
-  add_library(zircon_lua MODULE src/plugins/lua/LuaPlugin.c)
+  add_library(zircon_lua MODULE src/plugins/lua/LuaPlugin.c ${ZIRCON_RC_LUA})
   target_link_libraries(zircon_lua PRIVATE lua_static)
   target_include_directories(zircon_lua PRIVATE include)
   if(MSVC)
@@ -330,7 +347,7 @@ endif()
 # both dumps and opens the live UI, and neither half is worth duplicating.
 if(ZIRCON_BUILD_DLL)
   add_library(zircon_payload SHARED src/dll/dllmain.cpp ${ZIRCON_RC_DLL})
-  target_link_libraries(zircon_payload PRIVATE zircon_engine zircon_emit zircon_ir zircon_il2cpp zircon_zdex)
+  target_link_libraries(zircon_payload PRIVATE zircon_engine zircon_emit zircon_ir zircon_il2cpp zircon_mono zircon_zdex)
   if(ZIRCON_BUILD_GUI)
     target_link_libraries(zircon_payload PRIVATE zircon_gui_lib)
     target_compile_definitions(zircon_payload PRIVATE ZIRCON_WITH_GUI=1)
@@ -382,6 +399,11 @@ if(ZIRCON_BUILD_TESTS)
   target_link_libraries(zircon_il2cpp_tests PRIVATE zircon_il2cpp)
   set_target_properties(zircon_il2cpp_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
   add_test(NAME il2cpp COMMAND zircon_il2cpp_tests)
+
+  add_executable(zircon_mono_tests tests/test_mono.cpp)
+  target_link_libraries(zircon_mono_tests PRIVATE zircon_mono)
+  set_target_properties(zircon_mono_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ZIRCON_OUT})
+  add_test(NAME mono COMMAND zircon_mono_tests)
 
   add_executable(zircon_zdex_tests tests/test_zdex.cpp)
   target_link_libraries(zircon_zdex_tests PRIVATE zircon_zdex)
