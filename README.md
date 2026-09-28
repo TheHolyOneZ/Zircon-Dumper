@@ -9,20 +9,29 @@
 
 **Game engine reflection extraction and analysis toolkit.**
 
-Point it at an Unreal game — running, crashed, or just sitting on disk — and get back the
-engine's entire type system: every class, struct, enum, property offset, function
-signature and Blueprint script. Then turn that into a C++ SDK, a `.usmap`, types for IDA,
-Ghidra or Binary Ninja, Frida bindings, Python stubs, readable Blueprint logic, or a report
-on what a patch just broke.
+Point it at a game — running, crashed, or just sitting on disk — and extract its runtime
+type system and metadata. **Zircon supports Unreal Engine, Unity IL2CPP, and Unity Mono**,
+covering native reflection data, managed assemblies, runtime types, field offsets, method
+information, enums, scripts and other engine-specific metadata.
 
-Since 0.6.0 it does the same for **Unity IL2CPP** games: every C# type, field offset,
-method RVA and enum value, out of the running game.
+Turn the results into a C++ SDK, a `.usmap`, types for IDA, Ghidra or Binary Ninja, Frida
+bindings, Python stubs, readable Blueprint or managed-code logic, or a report on what a
+patch just broke.
 
-<sub>Sixteen Unreal games verified · UE 4.22 → 5.7 · both property systems · both name
-pools · plus Unity IL2CPP · <b>no engine-version table anywhere in the codebase</b></sub>
+For **Unreal Engine**, Zircon supports UE 4.22 → 5.7, both property systems and both name
+pools, with extraction from running games, crashes and disk images.
 
-<sub>Cross-checked against Dumper-7 on the same UE 5.6 game:
-<b>26,625 of 26,625 shared member offsets agree exactly</b>, with 48,535 data members
+For **Unity IL2CPP**, Zircon extracts C# types, field offsets, method RVAs, enum values and
+other metadata directly from the native IL2CPP runtime.
+
+For **Unity Mono**, Zircon combines live runtime information with the game's real .NET
+assemblies, recovering types, field offsets, enum values and IL information that can be
+obtained from either source.
+
+<sub>Unreal Engine · Unity IL2CPP · Unity Mono · UE 4.22 → 5.7 · both Unreal property
+systems · both Unreal name pools · <b>no engine-version table anywhere in the codebase</b></sub>
+
+<sub>Cross-checked against Dumper-7 on the same UE 5.6 game: <b>26,625 of 26,625 shared member offsets agree exactly</b>, with 48,535 data members
 emitted against its 44,701. And cross-checked against itself: the same game dumped from
 outside, from inside, and from a 7 GB minidump gives <b>10,850 of 10,850 types
 byte-identical</b> three ways.</sub>
