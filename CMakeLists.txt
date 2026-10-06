@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Zircon VERSION 0.9.0 LANGUAGES CXX C)
+project(Zircon VERSION 0.10.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -113,6 +113,7 @@ add_library(zircon_engine STATIC
   src/engine/src/ValueReader.cpp
   src/engine/src/ValueWriter.cpp
   src/engine/src/ProcessEvent.cpp
+  src/engine/src/Globals.cpp
   src/engine/src/DumpBuilder.cpp
 )
 target_include_directories(zircon_engine PUBLIC src/engine/include)

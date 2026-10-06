@@ -95,20 +95,36 @@ SCORE  PID      PROCESS                          PROJECT
 
 READY  PID      PROCESS                          RUNTIME
 yes    22512    Road 96.exe                      Unity IL2CPP, GameAssembly.dll loaded
-
-> zircon fingerprint --pid 25244
-engine version    5.6
-confidence        60%
-property model    FProperty
-name pool         FNamePool
-object array      chunked
-evidence
-  - version string: ++UE5+Release-5.6
-  - layout defaults from 5.6: FProperty, FNamePool, chunked GObjects
 ```
 
 `100%` is your game. The 20% rows are the helper processes every launcher spawns. Hover
 or use `-v` to see the evidence behind each score.
+
+`fingerprint` then says what the engine is and hands you the addresses a mod starts from,
+all read from outside. On Escape the Backrooms:
+
+```
+> zircon fingerprint --pid 14464
+engine version    4.27
+confidence        90%
+property model    FProperty
+name pool         FNamePool
+object array      chunked
+GObjects          0x516fee0
+ObjObjects        0x516fef0
+FNamePool         0x5133a50
+GWorld            0x52b44f8
+ProcessEvent      0x16e1b30
+ProcessEventIdx   0x44
+AppendString      0x14c5630
+evidence
+  - version string: ++UE4+Release-4.27
+  - layout defaults from 4.27: FProperty, FNamePool, chunked GObjects
+  - memory layout confirms 4.27: FProperty, FNamePool, chunked GObjects
+```
+
+A version string alone counts for 60%. It rises to 90% once the layout read from the running
+game agrees with what that version should look like.
 
 ### It dumps everything in one pass
 
@@ -266,8 +282,10 @@ ZirconSDK::BindToZirconPayload();
 ```
 
 The second of those is `UObject::ProcessEvent`, a virtual whose position the engine does
-not record anywhere. Zircon works it out by calling a function whose answer it already
-knows, once, and bakes the result into the SDK it generates. See
+not record anywhere. Zircon reads it out of the code: of all `UObject`'s virtuals, only one
+tests `FunctionFlags` for both `FUNC_Native` and `FUNC_HasOutParms`. That works from outside
+the game too, so every dump and every SDK carries the slot. Injected, it can also confirm the
+slot by calling a function whose answer it already knows. See
 [Editing values](#editing-values-live) for the safety note on that.
 
 ### It shows you the game while it runs
@@ -1330,7 +1348,8 @@ Dump
 │   ├── engine        version, confidence, property model, name pool shape, evidence
 │   ├── source        internal | external | dump | static, process, module, base, size
 │   ├── offsets       every offset that was derived, by name and value
-│   └── globals       GObjects, FNamePool — module-relative where known
+│   └── globals       GObjects, GObjects.ObjObjects, FNamePool, GWorld, ProcessEvent,
+│                     AppendString — module-relative, each only when found unambiguously
 ├── names[]           the whole FName pool, when asked for with --names
 └── packages[]        "/Script/Engine", "/Game/MyGame/..."
     ├── classes[]  ─┐

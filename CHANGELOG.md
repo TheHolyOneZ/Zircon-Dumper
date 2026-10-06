@@ -2,6 +2,82 @@
 
 Notable changes per release. Dates are when the work landed, not when it was tagged.
 
+## 0.10.0 — 2026-10-06
+
+Everything here came out of using Zircon for real: re-checking a mod menu against a game update
+on Escape the Backrooms, then porting work from it. Each item is something that had to be worked
+around by hand.
+
+### The globals a mod actually needs, read from outside
+
+A dump reported GObjects and the name pool and nothing else. GWorld, AppendString and
+ProcessEvent are the three addresses every mod menu starts from, and getting them meant reading
+the game's memory by hand or reaching for a second tool. ProcessEvent's vtable slot was only
+found in-process, by calling candidates, so every external dump wrote `-1` for it.
+
+All three are now found by reading, external dumps included:
+
+- **GWorld** — every live `UWorld` is found in GObjects, then the module's writable data is
+  searched for the one global pointing at it. Exactly one hit or nothing.
+- **ProcessEvent** — each virtual of `UObject` is read as code and checked for what only
+  ProcessEvent does: test `FunctionFlags` (at the offset this dump derived) against
+  `FUNC_Native`, and later against `FUNC_HasOutParms`. Exactly one slot or nothing. The slot
+  goes into the dump and the generated SDK, so `kProcessEventSlot` is no longer `-1` outside
+  the payload.
+- **AppendString** — the call that follows the FName built from `ForwardShadingQuality_`, the
+  same anchor Dumper-7 uses, found in both its narrow and wide spelling.
+
+Checked against Dumper-7 and against the running game:
+
+| | Escape the Backrooms (4.27) | Ready Or Not (5.3) |
+|---|---|---|
+| GWorld | `0x52B44F8`, same as Dumper-7 | points at a live `World` |
+| ProcessEvent | slot `0x44`, `0x16E1B30`, same as Dumper-7 | slot `0x4D`, same as Dumper-7; `vtable[0x4D]` is the address found |
+| AppendString | `0x14C5630`, same as Dumper-7 | starts a function, same call shape |
+
+`zircon fingerprint` shows them too, so the fastest way to start a mod is one command and about
+a second.
+
+### GObjects, both ways
+
+Zircon reports `FUObjectArray` as GObjects; Dumper-7 reports its `ObjObjects` member, 0x10
+further in. Comparing the two looked like the address had moved when it had not. The header now
+carries both, by name: `GObjects=` as before, plus `GObjects.ObjObjects=`.
+
+### Every resolved offset is written
+
+The JSON writer left out any field equal to its default, so the first member of every struct,
+at offset 0, had no `offset` at all. On Escape the Backrooms that was 1,509 properties. Any
+script reading `property["offset"]` crashed on them. A resolved offset and its size are now always
+written; only `offset_unresolved` members go without. Function parameters get the same rule.
+
+### No more `Default__` types
+
+The class default objects of the meta-classes themselves — `Default__Class`,
+`Default__ScriptStruct`, `Default__BlueprintGeneratedClass` and so on — are instances whose
+class is a type, so they were walked as if they were types: nine of them per dump, every one
+without a size. They are skipped.
+
+### `cpp_name`
+
+Next to `cpp_prefix`, every class and struct now carries the name C++ code uses for it:
+`AFancyCharacter`, `FVector`. Matching a dump against a Dumper-7 SDK no longer means rebuilding
+the prefix rule by hand.
+
+### Confidence that reflects what was checked
+
+A version string alone is capped at 60%, on purpose: it is corroboration, not proof. But the cap
+stayed after the memory had confirmed it. Now, once the layout is derived from the running game,
+the property model, name pool shape and object array shape are compared against what that
+version should have. All three agreeing raises confidence to 90% and says so in the evidence;
+any disagreeing lowers it to 40% and names which one. `fingerprint` runs the same check on a live
+target.
+
+### Still open
+
+- Ready Or Not has two classes claiming `/Script/OnlineSubsystemUtils.OnlineEngineInterfaceImpl`,
+  which `validate --strict` reports. 0.9.0 does the same; it is not new here.
+
 ## 0.9.0 — 2026-09-26
 
 Unity has two scripting backends. Zircon supported one of them.

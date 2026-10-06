@@ -5,6 +5,7 @@
 #include "engine/ClassLayout.h"
 #include "engine/EnumLayout.h"
 #include "engine/FunctionLayout.h"
+#include "engine/Globals.h"
 #include "engine/NamePool.h"
 #include "engine/ObjectArray.h"
 #include "engine/ObjectLayout.h"
@@ -38,6 +39,7 @@ struct Reflection {
     // everything else here it cannot be read, only confirmed by calling, so it is filled in
     // separately and only when someone asks. See engine/ProcessEvent.h.
     int process_event_index{-1};
+    GlobalsInfo globals;
 
     ResolveContext Context() const;
     bool Valid() const;

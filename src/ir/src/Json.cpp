@@ -180,8 +180,8 @@ void WriteProperty(Writer& writer, const Property& property) {
     writer.Key("name"); writer.String(property.name);
     writer.Key("type"); WriteTypeRef(writer, property.type);
 
-    if (property.offset    != defaults.offset)    { writer.Key("offset");    writer.Int(property.offset); }
-    if (property.size      != defaults.size)      { writer.Key("size");      writer.Int(property.size); }
+    if (!property.offset_unresolved) { writer.Key("offset"); writer.Int(property.offset); }
+    if (!property.offset_unresolved || property.size != defaults.size) { writer.Key("size"); writer.Int(property.size); }
     if (property.array_dim != defaults.array_dim) { writer.Key("array_dim"); writer.Int(property.array_dim); }
     if (property.flags     != defaults.flags)     { writer.Key("flags");     writer.UInt(property.flags); }
     WriteStringArray(writer, "flag_names", property.flag_names);
@@ -221,8 +221,10 @@ void WriteFunction(Writer& writer, const Function& function) {
             writer.BeginObject();
             writer.Key("name"); writer.String(param.name);
             writer.Key("type"); WriteTypeRef(writer, param.type);
-            if (param.offset != param_defaults.offset) { writer.Key("offset"); writer.Int(param.offset); }
-            if (param.size   != param_defaults.size)   { writer.Key("size");   writer.Int(param.size); }
+            if (param.size != param_defaults.size || param.offset != param_defaults.offset) {
+                writer.Key("offset"); writer.Int(param.offset);
+                writer.Key("size");   writer.Int(param.size);
+            }
             if (param.is_return) { writer.Key("is_return"); writer.Bool(true); }
             if (param.is_out)    { writer.Key("is_out");    writer.Bool(true); }
             if (param.is_const)  { writer.Key("is_const");  writer.Bool(true); }
@@ -285,6 +287,8 @@ void WriteStruct(Writer& writer, const Struct& record) {
     if (record.cpp_prefix != defaults.cpp_prefix) {
         writer.Key("cpp_prefix");
         writer.String(std::string(1, record.cpp_prefix));
+        writer.Key("cpp_name");
+        writer.String(std::string(1, record.cpp_prefix) + record.name);
     }
     WriteStringArray(writer, "interfaces", record.interfaces);
 

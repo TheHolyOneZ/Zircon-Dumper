@@ -1824,19 +1824,45 @@ int CommandFingerprint(const TargetSpec& spec, bool as_json) {
         return 0;
     }
 
-    const auto profile = zircon::engine::FingerprintEngine(*mem);
+    auto profile = zircon::engine::FingerprintEngine(*mem);
+
+    std::vector<std::string> globals;
+    if (mem->Caps().live_objects) {
+        const auto previous_level = GetLogLevel();
+        if (previous_level < LogLevel::Warn) SetLogLevel(LogLevel::Warn);
+        const auto reflection = zircon::engine::Reflect(*mem);
+        SetLogLevel(previous_level);
+        if (reflection.Valid()) {
+            profile = reflection.profile;
+            const auto* main_module = mem->MainModule();
+            const std::uint64_t base = main_module ? Raw(main_module->base) : 0;
+            const auto rva = [&](Address a) { return std::format("0x{:x}", Raw(a) - base); };
+            globals.push_back("GObjects=" + rva(reflection.array.gobjects));
+            globals.push_back("ObjObjects=" + rva(reflection.array.inner));
+            globals.push_back("FNamePool=" + rva(reflection.pool.blocks));
+            const auto& found = reflection.globals;
+            if (!IsNull(found.gworld)) globals.push_back("GWorld=" + rva(found.gworld));
+            if (!IsNull(found.process_event)) {
+                globals.push_back("ProcessEvent=" + rva(found.process_event));
+                globals.push_back(std::format("ProcessEventIdx=0x{:x}", found.process_event_slot));
+            }
+            if (!IsNull(found.append_string))
+                globals.push_back("AppendString=" + rva(found.append_string));
+        }
+    }
 
     if (as_json) {
         std::printf("{\"ok\": true, \"runtime\": \"unreal\", \"version\": %s, "
                     "\"known\": %s, \"confidence\": %.2f, \"fproperty\": %s, "
                     "\"chunked_name_pool\": %s, \"chunked_gobjects\": %s, "
-                    "\"evidence\": %s}\n",
+                    "\"globals\": %s, \"evidence\": %s}\n",
                     JsonQuote(profile.VersionString()).c_str(),
                     profile.Known() ? "true" : "false",
                     profile.confidence,
                     profile.uses_fproperty ? "true" : "false",
                     profile.chunked_name_pool ? "true" : "false",
                     profile.chunked_gobjects ? "true" : "false",
+                    JsonList(globals).c_str(),
                     JsonList(profile.evidence).c_str());
         return profile.Known() ? 0 : 3;
     }
@@ -1846,6 +1872,10 @@ int CommandFingerprint(const TargetSpec& spec, bool as_json) {
     Field("property model", profile.uses_fproperty ? "FProperty" : "UProperty");
     Field("name pool", profile.chunked_name_pool ? "FNamePool" : "TNameEntryArray");
     Field("object array", profile.chunked_gobjects ? "chunked" : "fixed");
+    for (const auto& line : globals) {
+        const auto eq = line.find('=');
+        Field(line.substr(0, eq), line.substr(eq + 1));
+    }
     Evidence(profile.evidence);
 
     // Non-zero when no version could be determined, so scripts can branch on it.

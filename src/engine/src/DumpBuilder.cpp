@@ -139,6 +139,27 @@ Reflection Reflect(core::IMemorySource& memory) {
         reflection.struct_layout);
     if (!reflection.property_layout.Valid()) return reflection;
 
+    if (reflection.profile.Known() && memory.Caps().live_objects) {
+        auto& profile = reflection.profile;
+        const bool fproperty_ok = profile.uses_fproperty == !reflection.property_layout.uproperty;
+        const bool pool_ok      = profile.chunked_name_pool == reflection.pool.chunked_pool;
+        const bool array_ok     = profile.chunked_gobjects == reflection.array.chunked;
+        if (fproperty_ok && pool_ok && array_ok) {
+            profile.confidence = std::max(profile.confidence, 0.9f);
+            profile.evidence.push_back(std::format(
+                "memory layout confirms {}: {}, {}, {} GObjects", profile.VersionString(),
+                reflection.property_layout.uproperty ? "UProperty" : "FProperty",
+                reflection.pool.chunked_pool ? "FNamePool" : "TNameEntryArray",
+                reflection.array.chunked ? "chunked" : "fixed"));
+        } else {
+            profile.confidence = std::min(profile.confidence, 0.4f);
+            profile.evidence.push_back(std::format(
+                "memory layout disagrees with {}:{}{}{}", profile.VersionString(),
+                fproperty_ok ? "" : " property model", pool_ok ? "" : " name pool",
+                array_ok ? "" : " object array"));
+        }
+    }
+
     reflection.class_layout = DeriveClassLayout(memory, reflection.array, reflection.pool,
                                                 reflection.object_layout,
                                                 reflection.struct_layout);
@@ -157,6 +178,13 @@ Reflection Reflect(core::IMemorySource& memory) {
     reflection.script_layout = DeriveScriptLayout(memory, reflection.array, reflection.pool,
                                                    reflection.object_layout,
                                                    reflection.struct_layout);
+
+    if (memory.Caps().live_objects && reflection.function_layout.Valid()) {
+        reflection.globals = FindGlobals(memory, reflection.array, reflection.object_layout,
+                                         reflection.pool, reflection.function_layout);
+        if (reflection.process_event_index < 0)
+            reflection.process_event_index = reflection.globals.process_event_slot;
+    }
     return reflection;
 }
 
@@ -227,8 +255,18 @@ ir::Dump BuildDump(const Reflection& reflection, const BuildOptions& options) {
 
     dump.header.globals = {
         std::format("GObjects=0x{:x}", Raw(reflection.array.gobjects) - base),
+        std::format("GObjects.ObjObjects=0x{:x}", Raw(reflection.array.inner) - base),
         std::format("FNamePool=0x{:x}", Raw(reflection.pool.blocks) - base),
     };
+    const auto& found = reflection.globals;
+    if (!IsNull(found.gworld))
+        dump.header.globals.push_back(std::format("GWorld=0x{:x}", Raw(found.gworld) - base));
+    if (!IsNull(found.process_event))
+        dump.header.globals.push_back(
+            std::format("ProcessEvent=0x{:x}", Raw(found.process_event) - base));
+    if (!IsNull(found.append_string))
+        dump.header.globals.push_back(
+            std::format("AppendString=0x{:x}", Raw(found.append_string) - base));
 
     if (options.include_names) {
         for (std::uint32_t id = 0, misses = 0; misses < 4096; ++id) {
@@ -269,6 +307,7 @@ ir::Dump BuildDump(const Reflection& reflection, const BuildOptions& options) {
 
         const std::string path = GetObjectPathName(memory, ol, reflection.pool, object);
         if (path.empty()) { ++skipped_unnamed; continue; }
+        if (LeafOf(path).starts_with("Default__")) continue;
         if (!options.package_filter.empty() &&
             path.find(options.package_filter) == std::string::npos)
             continue;
